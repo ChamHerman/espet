@@ -31,3 +31,13 @@ idf_component_register(
         esp_https_ota esp_event json spiffs console vfs app_update esp-tls
         esp_timer esp_websocket_client esp_driver_gpio
 )
+
+# Dynamically get the host laptop's IP address
+execute_process(
+    COMMAND python -c "import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(('8.8.8.8', 80)); print(s.getsockname()[0]); s.close()"
+    OUTPUT_VARIABLE HOST_IP
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+
+# Pass it as a macro to the C code
+target_compile_definitions(${COMPONENT_LIB} PUBLIC "HOST_IP=\"${HOST_IP}\"")
