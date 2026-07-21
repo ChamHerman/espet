@@ -83,8 +83,8 @@
 #define MIMI_TIMEZONE                "PST8PDT,M3.2.0,M11.1.0"
 
 /* LLM */
-#define MIMI_LLM_DEFAULT_MODEL       "claude-opus-4-5"
-#define MIMI_LLM_PROVIDER_DEFAULT    "anthropic"
+#define MIMI_LLM_DEFAULT_MODEL       "local-model"
+#define MIMI_LLM_PROVIDER_DEFAULT    "openai"
 #define MIMI_LLM_MAX_TOKENS          4096
 #define MIMI_LLM_API_URL             "https://api.anthropic.com/v1/messages"
 /* #define MIMI_OPENAI_API_URL          "https://api.openai.com/v1/chat/completions" */
