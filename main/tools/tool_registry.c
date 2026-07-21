@@ -5,6 +5,7 @@
 #include "tools/tool_files.h"
 #include "tools/tool_cron.h"
 #include "tools/tool_gpio.h"
+#include "tools/tool_oled.h"
 
 #include <string.h>
 #include "esp_log.h"
@@ -213,6 +214,9 @@ esp_err_t tool_registry_init(void)
         .execute = tool_gpio_read_all_execute,
     };
     register_tool(&ga);
+
+    /* Register OLED tool */
+    register_tool(&oled_tool);
 
     build_tools_json();
 
