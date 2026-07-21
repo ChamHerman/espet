@@ -83,12 +83,15 @@
 #define MIMI_TIMEZONE                "PST8PDT,M3.2.0,M11.1.0"
 
 /* LLM */
-#define MIMI_LLM_DEFAULT_MODEL       "local-model"
+#define MIMI_LLM_DEFAULT_MODEL       "gemma-4-e2b-it"
 #define MIMI_LLM_PROVIDER_DEFAULT    "openai"
 #define MIMI_LLM_MAX_TOKENS          4096
 #define MIMI_LLM_API_URL             "https://api.anthropic.com/v1/messages"
 /* #define MIMI_OPENAI_API_URL          "https://api.openai.com/v1/chat/completions" */
-#define MIMI_OPENAI_API_URL          "http://26.199.213.49:1234/v1/chat/completions"
+#ifndef HOST_IP
+#define HOST_IP "127.0.0.1" /* Fallback */
+#endif
+#define MIMI_OPENAI_API_URL          "http://" HOST_IP ":1234/v1/chat/completions"
 #define MIMI_LLM_API_VERSION         "2023-06-01"
 #define MIMI_LLM_STREAM_BUF_SIZE     (32 * 1024)
 #define MIMI_LLM_LOG_VERBOSE_PAYLOAD 0
