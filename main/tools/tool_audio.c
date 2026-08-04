@@ -3,6 +3,8 @@
 #include "cJSON.h"
 #include "driver/i2s_std.h"
 #include "driver/gpio.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <math.h>
 #include <string.h>
 #include <stdio.h>
@@ -12,7 +14,7 @@ static const char *TAG = "tool_audio";
 static i2s_chan_handle_t tx_handle = NULL;
 static i2s_chan_handle_t rx_handle = NULL;
 static bool audio_initialized = false;
-static bool ptt_recording = false;
+static volatile bool ptt_recording = false;
 
 esp_err_t tool_audio_init(void)
 {
@@ -153,11 +155,38 @@ static esp_err_t tool_audio_record_test_execute(const char *input_json, char *ou
     return ESP_OK;
 }
 
+static void ptt_record_task(void *arg)
+{
+    int32_t buf[256];
+    size_t bytes_read = 0;
+    size_t total_bytes = 0;
+    
+    ESP_LOGI(TAG, "PTT record task reading loop started...");
+
+    while (ptt_recording) {
+        esp_err_t res = i2s_channel_read(rx_handle, buf, sizeof(buf), &bytes_read, pdMS_TO_TICKS(100));
+        if (res == ESP_OK) {
+            total_bytes += bytes_read;
+        } else if (res == ESP_ERR_TIMEOUT) {
+            ESP_LOGW(TAG, "I2S read timeout");
+        } else {
+            ESP_LOGE(TAG, "I2S read failed: %s", esp_err_to_name(res));
+        }
+    }
+    
+    ESP_LOGI(TAG, "PTT Recording complete: Captured %u bytes total. (Fake sending to LLM...)", (unsigned int)total_bytes);
+    
+    vTaskDelete(NULL);
+}
+
 void tool_audio_ptt_record_start(void)
 {
     if (tool_audio_init() == ESP_OK) {
-        ptt_recording = true;
-        ESP_LOGI(TAG, "PTT Recording started (INMP441 GPIO 1)");
+        if (!ptt_recording) {
+            ptt_recording = true;
+            ESP_LOGI(TAG, "PTT Recording started (INMP441 GPIO 1)");
+            xTaskCreate(ptt_record_task, "ptt_rec_task", 4096, NULL, 5, NULL);
+        }
     }
 }
 

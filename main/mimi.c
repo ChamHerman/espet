@@ -27,6 +27,7 @@
 #include "skills/skill_loader.h"
 #include "onboard/wifi_onboard.h"
 #include "tools/button_handler.h"
+#include "tools/tool_audio.h"
 
 static const char *TAG = "mimi";
 
@@ -40,9 +41,10 @@ static void on_green_button_ptt(bool is_pressed)
 {
     if (is_pressed) {
         ESP_LOGI(TAG, "[GREEN BUTTON] Pressed (GPIO 39) - Input working!");
-        telegram_send_to_last_chat("[GREEN BUTTON] Pressed (GPIO 39) - Input is working!");
+        tool_audio_ptt_record_start();
     } else {
         ESP_LOGI(TAG, "[GREEN BUTTON] Released (GPIO 39)");
+        tool_audio_ptt_record_stop();
     }
 }
 
