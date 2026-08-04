@@ -664,8 +664,10 @@ esp_err_t llm_chat_tools(const char *system_prompt,
                         llm_tool_call_t *call = &resp->calls[resp->call_count];
                         cJSON *id = cJSON_GetObjectItem(tc, "id");
                         cJSON *func = cJSON_GetObjectItem(tc, "function");
-                        if (id && cJSON_IsString(id)) {
+                        if (id && cJSON_IsString(id) && id->valuestring[0] != '\0') {
                             strncpy(call->id, id->valuestring, sizeof(call->id) - 1);
+                        } else {
+                            snprintf(call->id, sizeof(call->id), "call_%d", resp->call_count + 1);
                         }
                         if (func) {
                             cJSON *name = cJSON_GetObjectItem(func, "name");

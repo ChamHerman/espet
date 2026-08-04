@@ -123,6 +123,15 @@
 
 /* GPIO */
 #define MIMI_GPIO_CONFIG_SECTION     1   /* enable GPIO tools */
+#define MIMI_GPIO_OLED_SCL           21  /* SSD1306 OLED SCL/SCK */
+#define MIMI_GPIO_OLED_SDA           47  /* SSD1306 OLED SDA */
+#define MIMI_GPIO_BTN_GREEN          39  /* Green Push Button (Input Pull-Up) */
+#define MIMI_GPIO_BTN_WHITE          38  /* White Push Button (Input Pull-Up) */
+#define MIMI_GPIO_LED_WHITE          40  /* White LED Output */
+#define MIMI_GPIO_I2S_BCLK           41  /* Shared Audio BCLK / SCK (Mic + Amp) */
+#define MIMI_GPIO_I2S_WS             42  /* Shared Audio WS / LRC (Mic + Amp) */
+#define MIMI_GPIO_I2S_DOUT           2   /* MAX98357A Amp DIN */
+#define MIMI_GPIO_I2S_DIN            1   /* INMP441 Mic SD */
 
 /* Skills */
 #define MIMI_SKILLS_PREFIX           MIMI_SPIFFS_BASE "/skills/"

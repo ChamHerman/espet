@@ -16,6 +16,7 @@
 static const char *TAG = "telegram";
 
 static char s_bot_token[128] = MIMI_SECRET_TG_TOKEN;
+static char s_last_chat_id[64] = {0};
 static int64_t s_update_offset = 0;
 static int64_t s_last_saved_offset = -1;
 static int64_t s_last_offset_save_us = 0;
@@ -343,6 +344,9 @@ static void process_updates(const char *json_str)
             continue;
         }
 
+        /* Store last active chat ID for outbound debug/event messages */
+        strncpy(s_last_chat_id, chat_id_str, sizeof(s_last_chat_id) - 1);
+
         if (msg_id_val >= 0) {
             uint64_t msg_key = make_msg_key(chat_id_str, msg_id_val);
             if (seen_msg_contains(msg_key)) {
@@ -443,6 +447,11 @@ esp_err_t telegram_bot_start(void)
 
 esp_err_t telegram_send_message(const char *chat_id, const char *text)
 {
+    if (!chat_id || chat_id[0] == '\0') {
+        ESP_LOGW(TAG, "Skipping Telegram send: chat_id is empty");
+        return ESP_OK;
+    }
+
     if (s_bot_token[0] == '\0') {
         ESP_LOGW(TAG, "Cannot send: no bot token");
         return ESP_ERR_INVALID_STATE;
@@ -559,5 +568,14 @@ esp_err_t telegram_set_token(const char *token)
 
     strncpy(s_bot_token, token, sizeof(s_bot_token) - 1);
     ESP_LOGI(TAG, "Telegram bot token saved");
+    return ESP_OK;
+}
+
+esp_err_t telegram_send_to_last_chat(const char *text)
+{
+    if (s_last_chat_id[0] != '\0') {
+        return telegram_send_message(s_last_chat_id, text);
+    }
+    ESP_LOGW(TAG, "Skipping Telegram send for button event: no active Telegram chat ID yet");
     return ESP_OK;
 }

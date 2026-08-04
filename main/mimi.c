@@ -26,8 +26,25 @@
 #include "heartbeat/heartbeat.h"
 #include "skills/skill_loader.h"
 #include "onboard/wifi_onboard.h"
+#include "tools/button_handler.h"
 
 static const char *TAG = "mimi";
+
+static void on_white_button_snap(void)
+{
+    ESP_LOGI(TAG, "[WHITE BUTTON] Pressed (GPIO 38) - Input working!");
+    telegram_send_to_last_chat("[WHITE BUTTON] Pressed (GPIO 38) - Input is working!");
+}
+
+static void on_green_button_ptt(bool is_pressed)
+{
+    if (is_pressed) {
+        ESP_LOGI(TAG, "[GREEN BUTTON] Pressed (GPIO 39) - Input working!");
+        telegram_send_to_last_chat("[GREEN BUTTON] Pressed (GPIO 39) - Input is working!");
+    } else {
+        ESP_LOGI(TAG, "[GREEN BUTTON] Released (GPIO 39)");
+    }
+}
 
 static esp_err_t init_nvs(void)
 {
@@ -74,11 +91,15 @@ static void outbound_dispatch_task(void *arg)
         ESP_LOGI(TAG, "Dispatching response to %s:%s", msg.channel, msg.chat_id);
 
         if (strcmp(msg.channel, MIMI_CHAN_TELEGRAM) == 0) {
-            esp_err_t send_err = telegram_send_message(msg.chat_id, msg.content);
-            if (send_err != ESP_OK) {
-                ESP_LOGE(TAG, "Telegram send failed for %s: %s", msg.chat_id, esp_err_to_name(send_err));
+            if (msg.chat_id[0] == '\0') {
+                ESP_LOGW(TAG, "Skipping Telegram send: chat_id is empty");
             } else {
-                ESP_LOGI(TAG, "Telegram send success for %s (%d bytes)", msg.chat_id, (int)strlen(msg.content));
+                esp_err_t send_err = telegram_send_message(msg.chat_id, msg.content);
+                if (send_err != ESP_OK) {
+                    ESP_LOGE(TAG, "Telegram send failed for %s: %s", msg.chat_id, esp_err_to_name(send_err));
+                } else {
+                    ESP_LOGI(TAG, "Telegram send success for %s (%d bytes)", msg.chat_id, (int)strlen(msg.content));
+                }
             }
         } else if (strcmp(msg.channel, MIMI_CHAN_FEISHU) == 0) {
             esp_err_t send_err = feishu_send_message(msg.chat_id, msg.content);
@@ -133,6 +154,7 @@ void app_main(void)
     ESP_ERROR_CHECK(feishu_bot_init());
     ESP_ERROR_CHECK(llm_proxy_init());
     ESP_ERROR_CHECK(tool_registry_init());
+    ESP_ERROR_CHECK(button_handler_init(on_white_button_snap, on_green_button_ptt));
     ESP_ERROR_CHECK(cron_service_init());
     ESP_ERROR_CHECK(heartbeat_init());
     ESP_ERROR_CHECK(agent_loop_init());

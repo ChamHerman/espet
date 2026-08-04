@@ -5,6 +5,8 @@
 #include "tools/tool_files.h"
 #include "tools/tool_cron.h"
 #include "tools/tool_gpio.h"
+#include "tools/tool_oled.h"
+#include "tools/tool_audio.h"
 
 #include <string.h>
 #include "esp_log.h"
@@ -182,11 +184,11 @@ esp_err_t tool_registry_init(void)
 
     mimi_tool_t gw = {
         .name = "gpio_write",
-        .description = "Set a GPIO pin HIGH or LOW. Controls LEDs, relays, and other digital outputs.",
+        .description = "Set a GPIO pin HIGH (1) or LOW (0). Fixed hardware pins: GPIO 40 = WHITE LED.",
         .input_schema_json =
             "{\"type\":\"object\","
-            "\"properties\":{\"pin\":{\"type\":\"integer\",\"description\":\"GPIO pin number\"},"
-            "\"state\":{\"type\":\"integer\",\"description\":\"1 for HIGH, 0 for LOW\"}},"
+            "\"properties\":{\"pin\":{\"type\":\"integer\",\"description\":\"GPIO pin number (e.g. 40 for WHITE LED)\"},"
+            "\"state\":{\"type\":\"integer\",\"description\":\"1 for HIGH (ON), 0 for LOW (OFF)\"}},"
             "\"required\":[\"pin\",\"state\"]}",
         .execute = tool_gpio_write_execute,
     };
@@ -194,10 +196,10 @@ esp_err_t tool_registry_init(void)
 
     mimi_tool_t gr = {
         .name = "gpio_read",
-        .description = "Read a GPIO pin state. Returns HIGH or LOW. Use for checking switches, sensors, and digital inputs.",
+        .description = "Read a GPIO pin state (returns 1 for HIGH, 0 for LOW). Fixed hardware pins: GPIO 39 = GREEN Button, GPIO 38 = WHITE Button.",
         .input_schema_json =
             "{\"type\":\"object\","
-            "\"properties\":{\"pin\":{\"type\":\"integer\",\"description\":\"GPIO pin number\"}},"
+            "\"properties\":{\"pin\":{\"type\":\"integer\",\"description\":\"GPIO pin number (e.g. 39 for GREEN Button, 38 for WHITE Button)\"}},"
             "\"required\":[\"pin\"]}",
         .execute = tool_gpio_read_execute,
     };
@@ -205,7 +207,7 @@ esp_err_t tool_registry_init(void)
 
     mimi_tool_t ga = {
         .name = "gpio_read_all",
-        .description = "Read all allowed GPIO pin states in a single call. Returns each pin's HIGH/LOW state.",
+        .description = "Read all allowed GPIO pin states at once (GPIO 1, 2, 21, 38, 39, 40, 41, 42, 47).",
         .input_schema_json =
             "{\"type\":\"object\","
             "\"properties\":{},"
@@ -213,6 +215,14 @@ esp_err_t tool_registry_init(void)
         .execute = tool_gpio_read_all_execute,
     };
     register_tool(&ga);
+
+    /* Register OLED tool */
+    register_tool(&oled_tool);
+
+    /* Register Audio tools */
+    tool_audio_init();
+    register_tool(&audio_play_tone_tool);
+    register_tool(&audio_record_test_tool);
 
     build_tools_json();
 

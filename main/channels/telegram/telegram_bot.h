@@ -25,3 +25,9 @@ esp_err_t telegram_send_message(const char *chat_id, const char *text);
  */
 esp_err_t telegram_set_token(const char *token);
 
+/**
+ * Send a text message to the most recent active Telegram chat.
+ */
+esp_err_t telegram_send_to_last_chat(const char *text);
+
+
