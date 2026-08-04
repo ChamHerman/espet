@@ -47,14 +47,14 @@ esp_err_t tool_audio_init(void)
         },
     };
 
-    /* RX Configuration for INMP441 Microphone */
+    /* RX Configuration for INMP441 Microphone (Shares BCLK/WS with TX) */
     i2s_std_config_t rx_std_cfg = {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(I2S_SAMPLE_RATE),
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO),
         .gpio_cfg = {
             .mclk = I2S_GPIO_UNUSED,
-            .bclk = (gpio_num_t)I2S_SHARED_BCLK_IO,
-            .ws = (gpio_num_t)I2S_SHARED_WS_IO,
+            .bclk = I2S_GPIO_UNUSED, /* Shared with TX */
+            .ws = I2S_GPIO_UNUSED,   /* Shared with TX */
             .dout = I2S_GPIO_UNUSED,
             .din = (gpio_num_t)I2S_MIC_SD_IO,
             .invert_flags = {
