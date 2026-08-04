@@ -8,9 +8,14 @@
 #include "mimi_config.h"
 
 /**
- * Initialize the LLM proxy. Reads API key and model from build-time secrets, then NVS.
+ * Initialize the LLM proxy. Reads model from build-time secrets (mimi_secrets.h) or defaults, and API key / provider from secrets / NVS.
  */
 esp_err_t llm_proxy_init(void);
+
+/**
+ * Get the current LLM model identifier.
+ */
+const char *llm_get_model(void);
 
 /**
  * Save the LLM API key to NVS.
@@ -23,7 +28,7 @@ esp_err_t llm_set_api_key(const char *api_key);
 esp_err_t llm_set_provider(const char *provider);
 
 /**
- * Save the model identifier to NVS.
+ * Save the model identifier.
  */
 esp_err_t llm_set_model(const char *model);
 

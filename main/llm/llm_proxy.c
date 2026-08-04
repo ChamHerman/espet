@@ -202,33 +202,37 @@ static const char *llm_api_path(void)
     return provider_is_openai() ? "/v1/chat/completions" : "/v1/messages";
 }
 
+const char *llm_get_model(void)
+{
+    return s_model;
+}
+
 /* ── Init ─────────────────────────────────────────────────────── */
 
 esp_err_t llm_proxy_init(void)
 {
-    /* Start with build-time defaults */
-    if (MIMI_SECRET_API_KEY[0] != '\0') {
-        safe_copy(s_api_key, sizeof(s_api_key), MIMI_SECRET_API_KEY);
-    }
+    /* Model is strictly determined by build-time secrets (mimi_secrets.h), falling back to default */
     if (MIMI_SECRET_MODEL[0] != '\0') {
         safe_copy(s_model, sizeof(s_model), MIMI_SECRET_MODEL);
+    } else {
+        safe_copy(s_model, sizeof(s_model), MIMI_LLM_DEFAULT_MODEL);
+    }
+
+    /* Start with build-time defaults for API key & provider */
+    if (MIMI_SECRET_API_KEY[0] != '\0') {
+        safe_copy(s_api_key, sizeof(s_api_key), MIMI_SECRET_API_KEY);
     }
     if (MIMI_SECRET_MODEL_PROVIDER[0] != '\0') {
         safe_copy(s_provider, sizeof(s_provider), MIMI_SECRET_MODEL_PROVIDER);
     }
 
-    /* NVS overrides take highest priority (set via CLI) */
+    /* NVS overrides take priority for API key & provider */
     nvs_handle_t nvs;
     if (nvs_open(MIMI_NVS_LLM, NVS_READONLY, &nvs) == ESP_OK) {
         char tmp[LLM_API_KEY_MAX_LEN] = {0};
         size_t len = sizeof(tmp);
         if (nvs_get_str(nvs, MIMI_NVS_KEY_API_KEY, tmp, &len) == ESP_OK && tmp[0]) {
             safe_copy(s_api_key, sizeof(s_api_key), tmp);
-        }
-        char model_tmp[LLM_MODEL_MAX_LEN] = {0};
-        len = sizeof(model_tmp);
-        if (nvs_get_str(nvs, MIMI_NVS_KEY_MODEL, model_tmp, &len) == ESP_OK && model_tmp[0]) {
-            safe_copy(s_model, sizeof(s_model), model_tmp);
         }
         char provider_tmp[16] = {0};
         len = sizeof(provider_tmp);

@@ -86,12 +86,7 @@ mimi> config_reset
 
 ### The build-time provider/model do not show up
 
-If the device already has `model` or `provider` saved in NVS, the saved values win over `main/mimi_secrets.h`.
-
-To return to build-time defaults:
-
-- clear those fields in the portal and save, or
-- run `config_reset`
+Model selection strictly follows build-time secrets in `main/mimi_secrets.h` (`MIMI_SECRET_MODEL`), falling back to `MIMI_LLM_DEFAULT_MODEL` if omitted. NVS values do not override the model. Provider configuration still supports NVS overrides.
 
 ## Notes
 
