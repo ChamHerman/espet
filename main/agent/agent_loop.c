@@ -190,8 +190,6 @@ static void agent_loop_task(void *arg) {
     return;
   }
 
-  const char *tools_json = tool_registry_get_tools_json();
-
   while (1) {
     mimi_msg_t msg;
     esp_err_t err = message_bus_pop_inbound(&msg, UINT32_MAX);
@@ -201,10 +199,13 @@ static void agent_loop_task(void *arg) {
     ESP_LOGI(TAG, "Processing message from %s:%s", msg.channel, msg.chat_id);
 
     /* 1. Build system prompt */
+    /* Refresh tools_json every turn so remote tools fetched after boot are included */
+    const char *tools_json = tool_registry_get_tools_json();
     context_build_system_prompt(system_prompt, MIMI_CONTEXT_BUF_SIZE);
     append_turn_context_prompt(system_prompt, MIMI_CONTEXT_BUF_SIZE, &msg);
-    ESP_LOGI(TAG, "LLM turn context: channel=%s chat_id=%s", msg.channel,
-             msg.chat_id);
+    ESP_LOGI(TAG, "LLM turn context: channel=%s chat_id=%s, tools=%d bytes",
+             msg.channel, msg.chat_id,
+             tools_json ? (int)strlen(tools_json) : 0);
 
     /* 2. Load session history into cJSON array */
     session_get_history_json(msg.chat_id, history_json,

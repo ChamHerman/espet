@@ -49,13 +49,12 @@ class MCPServerConnection:
         """
         headers = {
             "Content-Type": "application/json",
-            "Accept": "application/json",
+            "Accept": "application/json, text/event-stream",
         }
         if access_token:
             headers["Authorization"] = f"Bearer {access_token}"
 
         self._http_client = httpx.AsyncClient(
-            base_url=self.url,
             headers=headers,
             timeout=30.0,
         )
@@ -63,7 +62,7 @@ class MCPServerConnection:
         try:
             # MCP Streamable HTTP: POST with JSON-RPC to list tools
             response = await self._http_client.post(
-                "",
+                self.url,
                 json={
                     "jsonrpc": "2.0",
                     "id": 1,
@@ -81,8 +80,22 @@ class MCPServerConnection:
                 self.connected = False
                 return
 
-            response.raise_for_status()
+            # NOTE: Google's MCP servers return HTTP 403 even for successful
+            # responses — the actual result is always in the JSON body.
+            # Only raise on truly fatal errors (5xx, network errors).
+            if response.status_code >= 500:
+                response.raise_for_status()
+
             data = response.json()
+
+            # Check if we got a valid JSON-RPC result
+            if "result" not in data and "error" in data:
+                logger.error(
+                    f"MCP server '{self.name}' returned JSON-RPC error: "
+                    f"{data['error']}"
+                )
+                self.connected = False
+                return
 
             # Extract tools from JSON-RPC result
             result = data.get("result", {})
@@ -128,7 +141,7 @@ class MCPServerConnection:
             headers["Authorization"] = f"Bearer {access_token}"
 
         response = await self._http_client.post(
-            "",
+            self.url,
             json={
                 "jsonrpc": "2.0",
                 "id": 2,
@@ -140,7 +153,9 @@ class MCPServerConnection:
             },
             headers=headers,
         )
-        response.raise_for_status()
+        # Google MCP returns HTTP 403 even on success — check JSON body
+        if response.status_code >= 500:
+            response.raise_for_status()
         data = response.json()
 
         # Check for JSON-RPC error
