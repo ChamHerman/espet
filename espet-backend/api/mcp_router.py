@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 
 from auth.device_auth import verify_device_key
 from mcp.client import mcp_client_manager
+from api.custom_tools import CUSTOM_TOOLS
 
 router = APIRouter(prefix="/api", tags=["mcp"])
 logger = logging.getLogger("espet-backend.api.mcp")
@@ -122,6 +123,11 @@ async def execute_tool(
     )
 
     try:
+        if request.tool_name in CUSTOM_TOOLS:
+            logger.info(f"Executing custom backend tool: {request.tool_name}")
+            result = await CUSTOM_TOOLS[request.tool_name]["executor"](request.arguments)
+            return MCPExecuteResponse(success=True, result=result)
+
         result = await mcp_client_manager.call_tool(
             request.tool_name, request.arguments
         )

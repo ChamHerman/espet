@@ -14,6 +14,7 @@ from fastapi import APIRouter, Depends
 
 from auth.device_auth import verify_device_key
 from mcp.client import mcp_client_manager
+from api.custom_tools import CUSTOM_TOOLS
 
 router = APIRouter(prefix="/api", tags=["tools"])
 logger = logging.getLogger("espet-backend.api.tools")
@@ -38,6 +39,14 @@ async def list_tools(
     schemas can be directly injected into the LLM system prompt.
     """
     tools = mcp_client_manager.registry.get_all_tools()
+    
+    for name, tool in CUSTOM_TOOLS.items():
+        tools.append({
+            "name": name,
+            "description": tool["description"],
+            "input_schema": tool["input_schema"],
+            "server": tool["server"]
+        })
 
     logger.info(f"Returning {len(tools)} tool(s) to ESP32")
 
