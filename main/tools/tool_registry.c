@@ -287,11 +287,17 @@ static esp_err_t tool_remote_execute(const char *name, const char *input_json,
         return ESP_ERR_NO_MEM;
     }
 
-    char response_buf[4096] = {0};
+    char *response_buf = calloc(1, 4096);
+    if (!response_buf) {
+        free(post_data);
+        snprintf(output, output_size, "Error: out of memory");
+        return ESP_ERR_NO_MEM;
+    }
+
     http_resp_buf_t resp_ctx = {
         .buf = response_buf,
         .len = 0,
-        .max_len = sizeof(response_buf),
+        .max_len = 4096,
     };
 
     char auth_hdr[128];
@@ -321,6 +327,7 @@ static esp_err_t tool_remote_execute(const char *name, const char *input_json,
     if (err != ESP_OK || status_code != 200) {
         ESP_LOGE(TAG, "Backend HTTP failed: err=%d status=%d", err, status_code);
         snprintf(output, output_size, "Error: backend server returned HTTP %d (err %d)", status_code, err);
+        free(response_buf);
         return ESP_FAIL;
     }
 
@@ -328,8 +335,10 @@ static esp_err_t tool_remote_execute(const char *name, const char *input_json,
     cJSON *resp_json = cJSON_Parse(response_buf);
     if (!resp_json) {
         snprintf(output, output_size, "%s", response_buf);
+        free(response_buf);
         return ESP_OK;
     }
+    free(response_buf);
 
     cJSON *error = cJSON_GetObjectItem(resp_json, "error");
     cJSON *result = cJSON_GetObjectItem(resp_json, "result");
@@ -356,11 +365,16 @@ esp_err_t tool_registry_fetch_remote_tools(void)
 {
     ESP_LOGI(TAG, "Fetching remote tools from backend (%s/api/tools)...", MIMI_BACKEND_URL);
 
-    char response_buf[8192] = {0};
+    char *response_buf = calloc(1, 8192);
+    if (!response_buf) {
+        ESP_LOGE(TAG, "Failed to allocate buffer for remote tools");
+        return ESP_ERR_NO_MEM;
+    }
+
     http_resp_buf_t resp_ctx = {
         .buf = response_buf,
         .len = 0,
-        .max_len = sizeof(response_buf),
+        .max_len = 8192,
     };
 
     char auth_hdr[128];
@@ -386,10 +400,12 @@ esp_err_t tool_registry_fetch_remote_tools(void)
 
     if (err != ESP_OK || status_code != 200) {
         ESP_LOGW(TAG, "Failed to fetch remote tools: HTTP %d (err %d)", status_code, err);
+        free(response_buf);
         return ESP_FAIL;
     }
 
     cJSON *resp_json = cJSON_Parse(response_buf);
+    free(response_buf);
     if (!resp_json) {
         ESP_LOGW(TAG, "Invalid JSON from /api/tools");
         return ESP_FAIL;
@@ -419,7 +435,7 @@ esp_err_t tool_registry_fetch_remote_tools(void)
                         .name = strdup(name->valuestring),
                         .description = desc && desc->valuestring ? strdup(desc->valuestring) : "Remote MCP tool",
                         .input_schema_json = schema_str,
-                        .execute = tool_remote_execute,
+                        .execute = NULL,
                     };
                     register_tool(&rt);
                     added++;
@@ -444,6 +460,8 @@ esp_err_t tool_registry_execute(const char *name, const char *input_json,
             ESP_LOGI(TAG, "Executing tool: %s", name);
             if (s_tools[i].execute) {
                 return s_tools[i].execute(input_json, output, output_size);
+            } else {
+                return tool_remote_execute(name, input_json, output, output_size);
             }
         }
     }
