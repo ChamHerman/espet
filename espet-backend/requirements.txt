@@ -1,0 +1,30 @@
+# ESPET Backend Server — Dependencies
+# Python 3.11+ required
+
+# Web Framework
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+
+# MCP SDK (Model Context Protocol)
+mcp>=2.0.0
+
+# HTTP Client (async)
+httpx>=0.27.0
+
+# Google OAuth & APIs
+google-auth>=2.35.0
+google-auth-oauthlib>=1.2.0
+google-auth-httplib2>=0.2.0
+google-api-python-client>=2.150.0
+
+# Database
+aiosqlite>=0.20.0
+
+# Security
+cryptography>=43.0.0
+
+# Utilities
+python-dotenv>=1.0.0
+python-multipart>=0.0.9
+pydantic>=2.9.0
+pydantic-settings>=2.5.0

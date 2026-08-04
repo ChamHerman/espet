@@ -1,0 +1,36 @@
+# Environment & secrets
+.env
+*.pem
+*.key
+
+# Database
+db/*.db
+db/*.db-journal
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Google OAuth tokens (sensitive!)
+token.json
+credentials.json

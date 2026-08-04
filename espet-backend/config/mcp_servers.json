@@ -1,0 +1,32 @@
+{
+  "servers": [
+    {
+      "name": "gmail",
+      "url": "https://gmailmcp.googleapis.com/mcp/v1",
+      "description": "Google Gmail — send, read, search emails",
+      "scopes": [
+        "https://www.googleapis.com/auth/gmail.modify",
+        "https://www.googleapis.com/auth/gmail.readonly",
+        "https://www.googleapis.com/auth/gmail.send"
+      ]
+    },
+    {
+      "name": "google-calendar",
+      "url": "https://calendarmcp.googleapis.com/mcp/v1",
+      "description": "Google Calendar — create, list, delete events",
+      "scopes": [
+        "https://www.googleapis.com/auth/calendar",
+        "https://www.googleapis.com/auth/calendar.events"
+      ]
+    },
+    {
+      "name": "google-drive",
+      "url": "https://drivemcp.googleapis.com/mcp/v1",
+      "description": "Google Drive — read, list, search files",
+      "scopes": [
+        "https://www.googleapis.com/auth/drive.readonly",
+        "https://www.googleapis.com/auth/drive.file"
+      ]
+    }
+  ]
+}

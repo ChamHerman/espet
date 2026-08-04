@@ -32,3 +32,9 @@ const char *tool_registry_get_tools_json(void);
  */
 esp_err_t tool_registry_execute(const char *name, const char *input_json,
                                 char *output, size_t output_size);
+
+/**
+ * Fetch remote MCP tools from the backend server (/api/tools)
+ * and register them in the tool registry.
+ */
+esp_err_t tool_registry_fetch_remote_tools(void);

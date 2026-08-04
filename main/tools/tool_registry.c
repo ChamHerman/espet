@@ -10,11 +10,12 @@
 
 #include <string.h>
 #include "esp_log.h"
+#include "esp_http_client.h"
 #include "cJSON.h"
 
 static const char *TAG = "tools";
 
-#define MAX_TOOLS 16
+#define MAX_TOOLS 32
 
 static mimi_tool_t s_tools[MAX_TOOLS];
 static int s_tool_count = 0;
@@ -235,17 +236,220 @@ const char *tool_registry_get_tools_json(void)
     return s_tools_json;
 }
 
+/* ---------------------------------------------------------------------------
+ * Remote Tool Execution via Backend Server (/api/mcp/execute)
+ * --------------------------------------------------------------------------- */
+
+typedef struct {
+    char *buf;
+    size_t len;
+    size_t max_len;
+} http_resp_buf_t;
+
+static esp_err_t http_event_handler(esp_http_client_event_t *evt)
+{
+    if (evt->event_id == HTTP_EVENT_ON_DATA) {
+        http_resp_buf_t *r = (http_resp_buf_t *)evt->user_data;
+        if (r && r->buf && evt->data_len > 0) {
+            size_t copy_len = evt->data_len;
+            if (r->len + copy_len >= r->max_len) {
+                copy_len = r->max_len - r->len - 1;
+            }
+            if (copy_len > 0) {
+                memcpy(r->buf + r->len, evt->data, copy_len);
+                r->len += copy_len;
+                r->buf[r->len] = '\0';
+            }
+        }
+    }
+    return ESP_OK;
+}
+
+static esp_err_t tool_remote_execute(const char *name, const char *input_json,
+                                      char *output, size_t output_size)
+{
+    ESP_LOGI(TAG, "Dispatching remote tool '%s' to backend...", name);
+
+    cJSON *payload = cJSON_CreateObject();
+    cJSON_AddStringToObject(payload, "tool_name", name);
+
+    cJSON *args = cJSON_Parse(input_json);
+    if (!args) {
+        args = cJSON_CreateObject();
+    }
+    cJSON_AddItemToObject(payload, "arguments", args);
+
+    char *post_data = cJSON_PrintUnformatted(payload);
+    cJSON_Delete(payload);
+
+    if (!post_data) {
+        snprintf(output, output_size, "Error: failed to build JSON payload");
+        return ESP_ERR_NO_MEM;
+    }
+
+    char response_buf[4096] = {0};
+    http_resp_buf_t resp_ctx = {
+        .buf = response_buf,
+        .len = 0,
+        .max_len = sizeof(response_buf),
+    };
+
+    char auth_hdr[128];
+    snprintf(auth_hdr, sizeof(auth_hdr), "Bearer %s", MIMI_BACKEND_API_KEY);
+
+    char url[256];
+    snprintf(url, sizeof(url), "%s/api/mcp/execute", MIMI_BACKEND_URL);
+
+    esp_http_client_config_t config = {
+        .url = url,
+        .event_handler = http_event_handler,
+        .user_data = &resp_ctx,
+        .timeout_ms = 15000,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    esp_http_client_set_method(client, HTTP_METHOD_POST);
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_header(client, "Authorization", auth_hdr);
+    esp_http_client_set_post_field(client, post_data, strlen(post_data));
+
+    esp_err_t err = esp_http_client_perform(client);
+    int status_code = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+    free(post_data);
+
+    if (err != ESP_OK || status_code != 200) {
+        ESP_LOGE(TAG, "Backend HTTP failed: err=%d status=%d", err, status_code);
+        snprintf(output, output_size, "Error: backend server returned HTTP %d (err %d)", status_code, err);
+        return ESP_FAIL;
+    }
+
+    /* Parse JSON response: {"success": true, "result": {...}, "error": "..."} */
+    cJSON *resp_json = cJSON_Parse(response_buf);
+    if (!resp_json) {
+        snprintf(output, output_size, "%s", response_buf);
+        return ESP_OK;
+    }
+
+    cJSON *error = cJSON_GetObjectItem(resp_json, "error");
+    cJSON *result = cJSON_GetObjectItem(resp_json, "result");
+
+    if (error && error->valuestring) {
+        snprintf(output, output_size, "Error: %s", error->valuestring);
+    } else if (result) {
+        char *printed = cJSON_PrintUnformatted(result);
+        if (printed) {
+            snprintf(output, output_size, "%s", printed);
+            free(printed);
+        } else {
+            snprintf(output, output_size, "Success");
+        }
+    } else {
+        snprintf(output, output_size, "Tool executed successfully.");
+    }
+
+    cJSON_Delete(resp_json);
+    return ESP_OK;
+}
+
+esp_err_t tool_registry_fetch_remote_tools(void)
+{
+    ESP_LOGI(TAG, "Fetching remote tools from backend (%s/api/tools)...", MIMI_BACKEND_URL);
+
+    char response_buf[8192] = {0};
+    http_resp_buf_t resp_ctx = {
+        .buf = response_buf,
+        .len = 0,
+        .max_len = sizeof(response_buf),
+    };
+
+    char auth_hdr[128];
+    snprintf(auth_hdr, sizeof(auth_hdr), "Bearer %s", MIMI_BACKEND_API_KEY);
+
+    char url[256];
+    snprintf(url, sizeof(url), "%s/api/tools", MIMI_BACKEND_URL);
+
+    esp_http_client_config_t config = {
+        .url = url,
+        .event_handler = http_event_handler,
+        .user_data = &resp_ctx,
+        .timeout_ms = 10000,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    esp_http_client_set_method(client, HTTP_METHOD_GET);
+    esp_http_client_set_header(client, "Authorization", auth_hdr);
+
+    esp_err_t err = esp_http_client_perform(client);
+    int status_code = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+
+    if (err != ESP_OK || status_code != 200) {
+        ESP_LOGW(TAG, "Failed to fetch remote tools: HTTP %d (err %d)", status_code, err);
+        return ESP_FAIL;
+    }
+
+    cJSON *resp_json = cJSON_Parse(response_buf);
+    if (!resp_json) {
+        ESP_LOGW(TAG, "Invalid JSON from /api/tools");
+        return ESP_FAIL;
+    }
+
+    cJSON *tools_arr = cJSON_GetObjectItem(resp_json, "tools");
+    if (cJSON_IsArray(tools_arr)) {
+        int added = 0;
+        int count = cJSON_GetArraySize(tools_arr);
+        for (int i = 0; i < count; i++) {
+            cJSON *item = cJSON_GetArrayItem(tools_arr, i);
+            cJSON *name = cJSON_GetObjectItem(item, "name");
+            cJSON *desc = cJSON_GetObjectItem(item, "description");
+            cJSON *schema = cJSON_GetObjectItem(item, "input_schema");
+
+            if (name && name->valuestring) {
+                bool exists = false;
+                for (int j = 0; j < s_tool_count; j++) {
+                    if (strcmp(s_tools[j].name, name->valuestring) == 0) {
+                        exists = true;
+                        break;
+                    }
+                }
+                if (!exists && s_tool_count < MAX_TOOLS) {
+                    char *schema_str = schema ? cJSON_PrintUnformatted(schema) : strdup("{}");
+                    mimi_tool_t rt = {
+                        .name = strdup(name->valuestring),
+                        .description = desc && desc->valuestring ? strdup(desc->valuestring) : "Remote MCP tool",
+                        .input_schema_json = schema_str,
+                        .execute = tool_remote_execute,
+                    };
+                    register_tool(&rt);
+                    added++;
+                }
+            }
+        }
+        if (added > 0) {
+            build_tools_json();
+            ESP_LOGI(TAG, "Added %d remote tools from backend", added);
+        }
+    }
+
+    cJSON_Delete(resp_json);
+    return ESP_OK;
+}
+
 esp_err_t tool_registry_execute(const char *name, const char *input_json,
                                 char *output, size_t output_size)
 {
     for (int i = 0; i < s_tool_count; i++) {
         if (strcmp(s_tools[i].name, name) == 0) {
             ESP_LOGI(TAG, "Executing tool: %s", name);
-            return s_tools[i].execute(input_json, output, output_size);
+            if (s_tools[i].execute) {
+                return s_tools[i].execute(input_json, output, output_size);
+            }
         }
     }
 
-    ESP_LOGW(TAG, "Unknown tool: %s", name);
-    snprintf(output, output_size, "Error: unknown tool '%s'", name);
-    return ESP_ERR_NOT_FOUND;
+    /* Fallback: try remote execution if tool name wasn't registered locally */
+    ESP_LOGI(TAG, "Tool '%s' not registered locally, trying remote execution...", name);
+    return tool_remote_execute(name, input_json, output, output_size);
 }
+

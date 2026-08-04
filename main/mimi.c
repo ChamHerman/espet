@@ -172,6 +172,8 @@ void app_main(void)
         if (wifi_manager_wait_connected(30000) == ESP_OK) {
             wifi_ok = true;
             ESP_LOGI(TAG, "WiFi connected: %s", wifi_manager_get_ip());
+            /* Fetch remote MCP tools from backend server */
+            tool_registry_fetch_remote_tools();
         } else {
             ESP_LOGW(TAG, "WiFi connection timeout");
         }

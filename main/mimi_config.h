@@ -92,6 +92,8 @@
 #define HOST_IP "127.0.0.1" /* Fallback */
 #endif
 #define MIMI_OPENAI_API_URL          "http://" HOST_IP ":1234/v1/chat/completions"
+#define MIMI_BACKEND_URL             "http://" HOST_IP ":8000"
+#define MIMI_BACKEND_API_KEY         "espet_secret_device_key_2026"
 #define MIMI_LLM_API_VERSION         "2023-06-01"
 #define MIMI_LLM_STREAM_BUF_SIZE     (32 * 1024)
 #define MIMI_LLM_LOG_VERBOSE_PAYLOAD 0
