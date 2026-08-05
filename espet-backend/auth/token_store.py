@@ -11,6 +11,7 @@ the OAuth credentials remain protected.
 import json
 import logging
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from base64 import b64encode, b64decode
 
@@ -26,7 +27,7 @@ class TokenStore:
     SQLite-backed token storage for Google OAuth credentials.
 
     Stores access_token, refresh_token, token_uri, client_id, client_secret,
-    and scopes. Auto-creates the database and table on first use.
+    scopes, and expiry. Auto-creates the database and table on first use.
     """
 
     def __init__(self):
@@ -56,6 +57,7 @@ class TokenStore:
 
         Called after a successful OAuth flow (user authorized the app).
         """
+        expiry_str = credentials.expiry.isoformat() if getattr(credentials, "expiry", None) else None
         token_data = {
             "token": credentials.token,
             "refresh_token": credentials.refresh_token,
@@ -63,6 +65,7 @@ class TokenStore:
             "client_id": credentials.client_id,
             "client_secret": credentials.client_secret,
             "scopes": list(credentials.scopes) if credentials.scopes else [],
+            "expiry": expiry_str,
         }
 
         data_json = json.dumps(token_data)
@@ -102,6 +105,16 @@ class TokenStore:
 
             token_data = json.loads(row[0])
 
+            expiry_dt = None
+            expiry_str = token_data.get("expiry")
+            if expiry_str:
+                try:
+                    expiry_dt = datetime.fromisoformat(expiry_str)
+                    if expiry_dt.tzinfo is not None:
+                        expiry_dt = expiry_dt.astimezone(timezone.utc).replace(tzinfo=None)
+                except Exception:
+                    expiry_dt = None
+
             credentials = Credentials(
                 token=token_data.get("token"),
                 refresh_token=token_data.get("refresh_token"),
@@ -109,6 +122,7 @@ class TokenStore:
                 client_id=token_data.get("client_id", settings.google_client_id),
                 client_secret=token_data.get("client_secret", settings.google_client_secret),
                 scopes=token_data.get("scopes"),
+                expiry=expiry_dt,
             )
 
             return credentials
@@ -118,6 +132,23 @@ class TokenStore:
             return None
         finally:
             conn.close()
+
+    async def get_valid_credentials(self) -> Credentials | None:
+        """
+        Retrieve stored Google OAuth credentials, automatically refreshing them
+        if they are expired or lack an expiration timestamp.
+        """
+        credentials = await self.get_credentials()
+        if not credentials:
+            return None
+
+        if (credentials.expired or credentials.expiry is None) and credentials.refresh_token:
+            logger.info("Token expired or missing expiry timestamp, refreshing automatically...")
+            try:
+                await self.refresh_credentials(credentials)
+            except Exception as e:
+                logger.warning(f"Auto-refresh failed: {e}")
+        return credentials
 
     async def refresh_credentials(self, credentials: Credentials):
         """

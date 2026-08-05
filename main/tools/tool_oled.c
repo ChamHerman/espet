@@ -60,6 +60,24 @@ static esp_err_t init_oled(void) {
   return ESP_OK;
 }
 
+void oled_display_status(const char *line1, const char *line2) {
+  if (init_oled() != ESP_OK) {
+    return;
+  }
+  ssd1306_clear_screen(ssd1306_dev, 0x00);
+  if (line1 && line1[0]) {
+    char buf1[17];
+    snprintf(buf1, sizeof(buf1), "%.16s", line1);
+    ssd1306_draw_string(ssd1306_dev, 0, 0, (const uint8_t *)buf1, 16, 1);
+  }
+  if (line2 && line2[0]) {
+    char buf2[17];
+    snprintf(buf2, sizeof(buf2), "%.16s", line2);
+    ssd1306_draw_string(ssd1306_dev, 0, 24, (const uint8_t *)buf2, 16, 1);
+  }
+  ssd1306_refresh_gram(ssd1306_dev);
+}
+
 static esp_err_t tool_oled_print_execute(const char *input_json, char *output,
                                          size_t output_size) {
   cJSON *root = cJSON_Parse(input_json);

@@ -10,6 +10,7 @@ tokens are stored, and all future MCP requests use them automatically.
 """
 
 import logging
+import httpx
 
 from fastapi import APIRouter, HTTPException, status
 from fastapi.responses import RedirectResponse, HTMLResponse
@@ -143,25 +144,47 @@ async def google_callback(code: str, state: str | None = None):
 )
 async def auth_status():
     """
-    Check if the backend has valid Google OAuth credentials.
-
-    The ESP32 or admin can call this to check if auth setup is needed.
+    Check if the backend has valid Google OAuth credentials and return signed-in email.
     """
     has_creds = await token_store.has_credentials()
 
     if has_creds:
         credentials = await token_store.get_credentials()
+        email = None
+        try:
+            if credentials and credentials.token:
+                async with httpx.AsyncClient() as client:
+                    res = await client.get(
+                        "https://gmail.googleapis.com/gmail/v1/users/me/profile",
+                        headers={"Authorization": f"Bearer {credentials.token}"},
+                        timeout=5.0,
+                    )
+                    if res.status_code == 200:
+                        email = res.json().get("emailAddress")
+                    else:
+                        res2 = await client.get(
+                            "https://www.googleapis.com/oauth2/v2/userinfo",
+                            headers={"Authorization": f"Bearer {credentials.token}"},
+                            timeout=5.0,
+                        )
+                        if res2.status_code == 200:
+                            email = res2.json().get("email")
+        except Exception as e:
+            logger.warning(f"Could not fetch Google email profile: {e}")
+
         return {
             "authenticated": True,
+            "email": email or "Google Account Signed In",
             "has_refresh_token": bool(
                 credentials.refresh_token if credentials else False
             ),
             "token_valid": bool(credentials.valid if credentials else False),
-            "message": "Google OAuth credentials are stored and ready.",
+            "message": f"Google OAuth credentials are stored and ready ({email or 'Connected'}).",
         }
     else:
         return {
             "authenticated": False,
+            "email": None,
             "has_refresh_token": False,
             "token_valid": False,
             "message": (

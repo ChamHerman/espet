@@ -17,6 +17,7 @@ from api.health import router as health_router
 from api.mcp_router import router as mcp_router
 from api.tools_router import router as tools_router
 from api.auth_router import router as auth_router
+from api.ui_router import router as ui_router
 from mcp.client import mcp_client_manager
 
 # ---------------------------------------------------------------------------
@@ -89,6 +90,7 @@ app.add_middleware(
 )
 
 # Mount routers
+app.include_router(ui_router)
 app.include_router(health_router)
 app.include_router(mcp_router)
 app.include_router(tools_router)

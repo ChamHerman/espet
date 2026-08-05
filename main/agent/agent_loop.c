@@ -5,6 +5,7 @@
 #include "memory/session_mgr.h"
 #include "mimi_config.h"
 #include "tools/tool_registry.h"
+#include "tools/tool_oled.h"
 
 
 #include "cJSON.h"
@@ -198,6 +199,20 @@ static void agent_loop_task(void *arg) {
 
     ESP_LOGI(TAG, "Processing message from %s:%s", msg.channel, msg.chat_id);
 
+    /* Check for /clear or /reset command */
+    if (msg.content && (strcmp(msg.content, "/clear") == 0 || strcmp(msg.content, "/reset") == 0)) {
+      session_clear(msg.chat_id);
+      mimi_msg_t out = {0};
+      strncpy(out.channel, msg.channel, sizeof(out.channel) - 1);
+      strncpy(out.chat_id, msg.chat_id, sizeof(out.chat_id) - 1);
+      out.content = strdup("Chat memory cleared! I'm ready for a fresh start.");
+      if (out.content) {
+        message_bus_push_outbound(&out);
+      }
+      free(msg.content);
+      continue;
+    }
+
     /* 1. Build system prompt */
     /* Refresh tools_json every turn so remote tools fetched after boot are included */
     const char *tools_json = tool_registry_get_tools_json();
@@ -245,6 +260,7 @@ static void agent_loop_task(void *arg) {
       }
 #endif
 
+      oled_display_status("ESPeting...", "Thinking...");
       llm_response_t resp;
       err = llm_chat_tools(system_prompt, messages, tools_json, &resp);
 
@@ -331,6 +347,8 @@ static void agent_loop_task(void *arg) {
         }
       }
     }
+
+    oled_display_status("MimiClaw Ready", "Waiting input...");
 
     /* Free inbound message content */
     free(msg.content);

@@ -218,15 +218,7 @@ esp_err_t llm_proxy_init(void)
         safe_copy(s_model, sizeof(s_model), MIMI_LLM_DEFAULT_MODEL);
     }
 
-    /* Start with build-time defaults for API key & provider */
-    if (MIMI_SECRET_API_KEY[0] != '\0') {
-        safe_copy(s_api_key, sizeof(s_api_key), MIMI_SECRET_API_KEY);
-    }
-    if (MIMI_SECRET_MODEL_PROVIDER[0] != '\0') {
-        safe_copy(s_provider, sizeof(s_provider), MIMI_SECRET_MODEL_PROVIDER);
-    }
-
-    /* NVS overrides take priority for API key & provider */
+    /* Check NVS first as fallback */
     nvs_handle_t nvs;
     if (nvs_open(MIMI_NVS_LLM, NVS_READONLY, &nvs) == ESP_OK) {
         char tmp[LLM_API_KEY_MAX_LEN] = {0};
@@ -240,6 +232,14 @@ esp_err_t llm_proxy_init(void)
             safe_copy(s_provider, sizeof(s_provider), provider_tmp);
         }
         nvs_close(nvs);
+    }
+
+    /* Build-time secrets from mimi_secrets.h ALWAYS take priority over NVS */
+    if (MIMI_SECRET_API_KEY[0] != '\0') {
+        safe_copy(s_api_key, sizeof(s_api_key), MIMI_SECRET_API_KEY);
+    }
+    if (MIMI_SECRET_MODEL_PROVIDER[0] != '\0') {
+        safe_copy(s_provider, sizeof(s_provider), MIMI_SECRET_MODEL_PROVIDER);
     }
 
     if (s_api_key[0]) {

@@ -317,12 +317,8 @@ class MCPClientManager:
         Returns None if no token is available (user hasn't authenticated yet).
         """
         try:
-            credentials = await token_store.get_credentials()
-            if credentials and credentials.valid:
-                return credentials.token
-            elif credentials and credentials.expired and credentials.refresh_token:
-                # Auto-refresh expired token
-                await token_store.refresh_credentials(credentials)
+            credentials = await token_store.get_valid_credentials()
+            if credentials and credentials.token:
                 return credentials.token
             else:
                 logger.warning(
