@@ -30,4 +30,18 @@ esp_err_t telegram_set_token(const char *token);
  */
 esp_err_t telegram_send_to_last_chat(const char *text);
 
+/**
+ * Send a photo to a Telegram chat using multipart/form-data.
+ * @param chat_id    Telegram chat ID
+ * @param jpeg_data  Pointer to the JPEG bytes
+ * @param jpeg_len   Length of the JPEG bytes
+ * @param caption    Optional text caption (can be NULL)
+ */
+esp_err_t telegram_send_photo(const char *chat_id, const uint8_t *jpeg_data, size_t jpeg_len, const char *caption);
+
+/**
+ * Send a photo to the most recent active Telegram chat.
+ */
+esp_err_t telegram_send_photo_to_last_chat(const uint8_t *jpeg_data, size_t jpeg_len, const char *caption);
+
 

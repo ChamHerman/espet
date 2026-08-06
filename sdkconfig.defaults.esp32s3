@@ -1,9 +1,11 @@
 # MimiClaw - ESP32-S3 Target Configuration
 CONFIG_IDF_TARGET="esp32s3"
 
-# Flash 16MB + QIO
+# Flash 16MB + QIO (ESP32-S3-WROOM-1-N16R8 uses QIO Flash + Octal PSRAM on dedicated SPI buses)
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_BAUD_2MB=y
+CONFIG_ESPTOOLPY_BAUD=2000000
 
 # CPU 240MHz
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
@@ -35,7 +37,10 @@ CONFIG_HTTPD_WS_SUPPORT=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
-# Console: USB Serial/JTAG primary (supports both input and output via USB)
-# ESP-IDF v5.5+ has TX timeout protection (50ms) so device won't hang
-# when no USB host is connected.
-CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+# Console: Default UART0 primary (TX GPIO43, RX GPIO44) so serial monitor works on COM/UART port
+# and USB_SERIAL_JTAG secondary so both ports work without hanging the bootloader
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y
+
+# Fix I2C driver conflict between esp32-camera (new driver default) and ssd1306 (legacy driver)
+CONFIG_SCCB_HARDWARE_I2C_DRIVER_LEGACY=y

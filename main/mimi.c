@@ -27,22 +27,53 @@
 #include "skills/skill_loader.h"
 #include "onboard/wifi_onboard.h"
 #include "tools/button_handler.h"
+#include "tools/tool_audio.h"
+#include "tools/tool_oled.h"
+#include "tools/tool_camera.h"
 
 static const char *TAG = "mimi";
 
-static void on_white_button_snap(void)
+extern char s_last_chat_id[64]; // Quick hack to get chat id for camera if needed, or we just rely on telegram_send_to_last_chat logic inside telegram_bot.c
+// But telegram_send_photo needs chat_id. Let's just expose a getter in telegram_bot.h ideally.
+// For now, we'll just log if chat_id isn't known, or we'll send a system event.
+
+static void on_white_button_short_press(void)
 {
-    ESP_LOGI(TAG, "[WHITE BUTTON] Pressed (GPIO 38) - Input working!");
-    telegram_send_to_last_chat("[WHITE BUTTON] Pressed (GPIO 38) - Input is working!");
+    ESP_LOGI(TAG, "[WHITE BUTTON] Short Press: Capturing Image!");
+    camera_fb_t *fb = tool_camera_take_picture();
+    if (fb) {
+        ESP_LOGI(TAG, "Image Captured! Size: %zu. Sending to Telegram...", fb->len);
+        
+        esp_err_t err = telegram_send_photo_to_last_chat(fb->buf, fb->len, "What do you want to know about this picture?");
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "Photo sent successfully!");
+        } else {
+            ESP_LOGE(TAG, "Failed to send photo: %d", err);
+        }
+        
+        tool_camera_return_picture(fb);
+    }
+}
+
+static void on_white_button_long_press(bool is_starting)
+{
+    if (is_starting) {
+        ESP_LOGI(TAG, "[WHITE BUTTON] Long Press: Starting Video Capture");
+        tool_camera_video_start();
+    } else {
+        ESP_LOGI(TAG, "[WHITE BUTTON] Long Press Released: Stopping Video Capture");
+        tool_camera_video_stop();
+    }
 }
 
 static void on_green_button_ptt(bool is_pressed)
 {
     if (is_pressed) {
         ESP_LOGI(TAG, "[GREEN BUTTON] Pressed (GPIO 39) - Input working!");
-        telegram_send_to_last_chat("[GREEN BUTTON] Pressed (GPIO 39) - Input is working!");
+        tool_audio_ptt_record_start();
     } else {
         ESP_LOGI(TAG, "[GREEN BUTTON] Released (GPIO 39)");
+        tool_audio_ptt_record_stop();
     }
 }
 
@@ -154,7 +185,8 @@ void app_main(void)
     ESP_ERROR_CHECK(feishu_bot_init());
     ESP_ERROR_CHECK(llm_proxy_init());
     ESP_ERROR_CHECK(tool_registry_init());
-    ESP_ERROR_CHECK(button_handler_init(on_white_button_snap, on_green_button_ptt));
+    ESP_ERROR_CHECK(tool_camera_init());
+    ESP_ERROR_CHECK(button_handler_init(on_white_button_short_press, on_white_button_long_press, on_green_button_ptt));
     ESP_ERROR_CHECK(cron_service_init());
     ESP_ERROR_CHECK(heartbeat_init());
     ESP_ERROR_CHECK(agent_loop_init());
@@ -172,6 +204,8 @@ void app_main(void)
         if (wifi_manager_wait_connected(30000) == ESP_OK) {
             wifi_ok = true;
             ESP_LOGI(TAG, "WiFi connected: %s", wifi_manager_get_ip());
+            /* Fetch remote MCP tools from backend server */
+            tool_registry_fetch_remote_tools();
         } else {
             ESP_LOGW(TAG, "WiFi connection timeout");
         }
@@ -198,6 +232,7 @@ void app_main(void)
             ? ESP_OK : ESP_FAIL);
 
         /* Start network-dependent services */
+        tool_oled_init_animation();
         ESP_ERROR_CHECK(agent_loop_start());
         ESP_ERROR_CHECK(telegram_bot_start());
         ESP_ERROR_CHECK(feishu_bot_start());
