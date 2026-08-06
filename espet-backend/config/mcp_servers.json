@@ -27,6 +27,14 @@
         "https://www.googleapis.com/auth/drive.readonly",
         "https://www.googleapis.com/auth/drive.file"
       ]
+    },
+    {
+      "name": "google-docs",
+      "url": "https://docsmcp.googleapis.com/mcp/v1",
+      "description": "Google Docs — read, create, write documents",
+      "scopes": [
+        "https://www.googleapis.com/auth/documents"
+      ]
     }
   ]
 }

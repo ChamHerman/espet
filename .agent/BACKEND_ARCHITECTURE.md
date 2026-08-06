@@ -560,3 +560,25 @@ if (tool_exists_locally(tool_name)) {
 | **Phase 8** | Connect Google Docs MCP server | P1 |
 | **Phase 9** | Connect ESP32 → Backend pipeline (test full loop) | P0 |
 | **Phase 10** | Add more MCP servers as needed | P2 |
+
+---
+
+## 14. Starting the Server
+
+When developing or testing locally, here is the procedure to start the backend server:
+
+```bash
+# 1. Navigate to the backend directory
+cd /Users/jeffwg/Documents/Project/espet/espet-backend
+
+# 2. Activate the virtual environment
+source venv/bin/activate
+
+# 3. (Optional) Install/Update requirements if needed
+pip install -r requirements.txt
+
+# 4. Start the server (with hot-reload enabled)
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Once running, the backend will listen on port 8000. Ensure the ESP32 `BACKEND_IP` is configured correctly to point to this machine.

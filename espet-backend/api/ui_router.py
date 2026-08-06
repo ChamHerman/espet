@@ -649,6 +649,7 @@ DASHBOARD_HTML = """
                     <button class="filter-btn active" data-filter="all">All</button>
                     <button class="filter-btn" data-filter="gmail">Gmail</button>
                     <button class="filter-btn" data-filter="calendar">Calendar</button>
+                    <button class="filter-btn" data-filter="docs">Docs</button>
                     <button class="filter-btn" data-filter="drive">Drive</button>
                 </div>
             </div>
@@ -710,11 +711,13 @@ DASHBOARD_HTML = """
             mcpListEl.innerHTML = '';
             for (const [srvName, info] of Object.entries(serversObj)) {
                 const srvTitle = srvName.replace('google-', 'Google ');
-                const icon = srvName.includes('gmail') ? '📧' : srvName.includes('calendar') ? '📅' : '📁';
+                const icon = srvName.includes('gmail') ? '📧' : srvName.includes('calendar') ? '📅' : srvName.includes('doc') ? '📝' : '📁';
+                const statusText = info.connected ? 'Connected' : 'Auth Required';
+                const color = info.connected ? '' : 'color: #ef4444;';
                 mcpListEl.innerHTML += `
                     <div class="mcp-item">
                         <span class="mcp-name"><span>${icon}</span> <span>${srvTitle}</span></span>
-                        <span class="mcp-badge">${info.tool_count} tools • Connected</span>
+                        <span class="mcp-badge" style="${color}">${info.tool_count} tools • ${statusText}</span>
                     </div>
                 `;
             }
@@ -741,6 +744,9 @@ DASHBOARD_HTML = """
         }
         if (toolName.includes('event') || toolName.includes('calendar') || toolName.includes('time')) {
             return 'calendar';
+        }
+        if (toolName.includes('doc') || toolName.includes('document')) {
+            return 'docs';
         }
         if (toolName.includes('file') || toolName.includes('drive')) {
             return 'drive';

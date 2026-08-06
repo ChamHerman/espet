@@ -28,6 +28,7 @@
 #include "onboard/wifi_onboard.h"
 #include "tools/button_handler.h"
 #include "tools/tool_audio.h"
+#include "tools/tool_oled.h"
 
 static const char *TAG = "mimi";
 
@@ -202,6 +203,7 @@ void app_main(void)
             ? ESP_OK : ESP_FAIL);
 
         /* Start network-dependent services */
+        tool_oled_init_animation();
         ESP_ERROR_CHECK(agent_loop_start());
         ESP_ERROR_CHECK(telegram_bot_start());
         ESP_ERROR_CHECK(feishu_bot_start());

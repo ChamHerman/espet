@@ -43,4 +43,7 @@ execute_process(
 )
 
 # Pass it as a macro to the C code
-target_compile_definitions(${COMPONENT_LIB} PUBLIC "HOST_IP=\"${HOST_IP}\"")
+target_compile_definitions(${COMPONENT_LIB} PUBLIC 
+    "HOST_IP=\"${HOST_IP}\""
+    "BACKEND_IP=\"${HOST_IP}\""
+)

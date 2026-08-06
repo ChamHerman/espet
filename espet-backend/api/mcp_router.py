@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 from auth.device_auth import verify_device_key
 from mcp.client import mcp_client_manager
 from api.custom_tools import CUSTOM_TOOLS
+from api.mcp_normalizer import normalize_arguments, auto_recover_arguments
 
 router = APIRouter(prefix="/api", tags=["mcp"])
 logger = logging.getLogger("espet-backend.api.mcp")
@@ -128,10 +129,28 @@ async def execute_tool(
             result = await CUSTOM_TOOLS[request.tool_name]["executor"](request.arguments)
             return MCPExecuteResponse(success=True, result=result)
 
-        result = await mcp_client_manager.call_tool(
-            request.tool_name, request.arguments
-        )
-        return MCPExecuteResponse(success=True, result=result)
+        # 1. Preprocess & Normalize
+        normalized_args = normalize_arguments(request.tool_name, request.arguments, mcp_client_manager.registry)
+
+        try:
+            # 2. Try clean execution
+            result = await mcp_client_manager.call_tool(
+                request.tool_name, normalized_args
+            )
+            return MCPExecuteResponse(success=True, result=result)
+        except RuntimeError as e:
+            logger.warning(f"MCP tool '{request.tool_name}' failed. Attempting auto-recovery. Error: {e}")
+            # 3. Auto-Recovery Loop
+            recovered_args = auto_recover_arguments(normalized_args, str(e), request.tool_name, mcp_client_manager.registry)
+            if recovered_args:
+                logger.info(f"Auto-recovery successful, retrying tool '{request.tool_name}' with args {list(recovered_args.keys())}")
+                result = await mcp_client_manager.call_tool(
+                    request.tool_name, recovered_args
+                )
+                return MCPExecuteResponse(success=True, result=result)
+            else:
+                # If we couldn't recover, raise the original error
+                raise e
 
     except ValueError as e:
         # Tool not found in registry
