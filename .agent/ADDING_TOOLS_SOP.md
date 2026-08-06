@@ -65,3 +65,32 @@ Custom tools do not automatically appear via the MCP `tools/list` endpoint. If y
 
 ---
 *Note: As of Aug 2026, the backend uses a Hybrid Normalizer/Auto-Recovery pipeline, which dramatically reduces the need for Type 2 custom wrappers.*
+
+---
+
+## Type 3: Adding a Local ESP32 C Tool
+*Use this for hardware-level capabilities that must run natively on the ESP32 (e.g. Camera, GPIO, I2C Sensors, Display).*
+
+### 1. Create the Tool Logic (`main/tools/`)
+Create a new header and source file for your tool, e.g., `tool_sensor.h` and `tool_sensor.c`.
+Implement your initialization and execution functions here.
+
+### 2. Update `CMakeLists.txt` (CRITICAL!)
+If you do not do this, your build will fail with an `undefined reference` error!
+Open `main/CMakeLists.txt` and add your new `.c` file to the `SRCS` list:
+```cmake
+idf_component_register(
+    SRCS
+        # ... existing files ...
+        "tools/tool_sensor.c" # <--- ADD YOUR FILE HERE
+    INCLUDE_DIRS
+        "."
+    # If your tool requires a new ESP-IDF component, add it to REQUIRES here or to idf_component.yml
+)
+```
+
+### 3. Register the Tool in the Agent (`tool_registry.c`)
+If the LLM needs to call this tool autonomously:
+1. Open `main/tools/tool_registry.c`.
+2. Add your tool schema and C execution wrapper to the `tool_registry_init()` function.
+3. If it's just a hardware initialization (like the camera), call its init function in `main/mimi.c`.

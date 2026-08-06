@@ -41,3 +41,6 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # and USB_SERIAL_JTAG secondary so both ports work without hanging the bootloader
 CONFIG_ESP_CONSOLE_UART_DEFAULT=y
 CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y
+
+# Fix I2C driver conflict between esp32-camera (new driver default) and ssd1306 (legacy driver)
+CONFIG_SCCB_HARDWARE_I2C_DRIVER_LEGACY=y
