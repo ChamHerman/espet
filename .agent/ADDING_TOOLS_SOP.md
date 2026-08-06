@@ -26,13 +26,20 @@ Append the new MCP server details to the `servers` array in `espet-backend/confi
 }
 ```
 
-### 3. Update the UI Dashboard (`api/ui_router.py`)
+### 3. Update Environment Variables & Config (`config.py` & `.env`)
+If the new MCP server requires specific environment variables (like its URL) or new Google OAuth scopes:
+1. **`.env` & `.env.example`**: Add the new MCP server URL or any necessary API keys.
+2. **`config.py`**:
+   - Add the new environment variables to the `Settings` class.
+   - If it's a Google Service, append the required scopes to the `google_scopes` list so they are requested during the OAuth login flow.
+
+### 4. Update the UI Dashboard (`api/ui_router.py`)
 To ensure the new tools show up correctly in the Web UI:
 1. **Filter Button**: Add a `<button class="filter-btn" data-filter="docs">Docs</button>` inside the `.filter-pills` div.
 2. **Category Mapper**: In the `<script>` tag, update the `getCategory(toolName)` JavaScript function to map the new tool names to your category filter name.
 3. **Icon**: In the `renderTools()` / MCP list iteration, add an emoji icon mapping for the new server name.
 
-### 4. Restart Backend
+### 5. Restart Backend
 Restart the backend server. The `mcp_client_manager` will automatically discover the new tools on boot and populate the global registry. No C-code updates on the ESP32 are needed!
 
 ---
