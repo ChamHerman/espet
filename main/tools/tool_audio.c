@@ -32,7 +32,7 @@ esp_err_t tool_audio_init(void)
     /* TX Configuration for MAX98357A Speaker */
     i2s_std_config_t tx_std_cfg = {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(I2S_SAMPLE_RATE),
-        .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO),
         .gpio_cfg = {
             .mclk = I2S_GPIO_UNUSED,
             .bclk = (gpio_num_t)I2S_SHARED_BCLK_IO,
@@ -53,8 +53,8 @@ esp_err_t tool_audio_init(void)
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO),
         .gpio_cfg = {
             .mclk = I2S_GPIO_UNUSED,
-            .bclk = I2S_GPIO_UNUSED, /* Shared with TX */
-            .ws = I2S_GPIO_UNUSED,   /* Shared with TX */
+            .bclk = (gpio_num_t)I2S_SHARED_BCLK_IO, /* Same BCLK pin as TX (required: RX slave must have a clock input path) */
+            .ws = (gpio_num_t)I2S_SHARED_WS_IO,     /* Same WS pin as TX */
             .dout = I2S_GPIO_UNUSED,
             .din = (gpio_num_t)I2S_MIC_SD_IO,
             .invert_flags = {
@@ -77,8 +77,17 @@ esp_err_t tool_audio_init(void)
         return err;
     }
 
-    i2s_channel_enable(tx_handle);
-    i2s_channel_enable(rx_handle);
+    err = i2s_channel_enable(tx_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "I2S TX enable failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    err = i2s_channel_enable(rx_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "I2S RX enable failed: %s", esp_err_to_name(err));
+        return err;
+    }
 
     audio_initialized = true;
     ESP_LOGI(TAG, "I2S Audio driver initialized (BCLK=%d, WS=%d, AMP_DIN=%d, MIC_SD=%d)",
@@ -98,7 +107,7 @@ static esp_err_t tool_audio_play_tone_execute(const char *input_json, char *outp
     #define TONE_FREQ_HZ 444
     #define DURATION_S 1.5
     size_t total_samples = (size_t)(I2S_SAMPLE_RATE * DURATION_S);
-    int16_t *buf = malloc(sizeof(int16_t) * 1024);
+    int32_t *buf = malloc(sizeof(int32_t) * 1024);
     if (!buf) {
         snprintf(output, output_size, "{\"error\": \"Memory allocation failed\"}");
         return ESP_OK;
@@ -111,9 +120,10 @@ static esp_err_t tool_audio_play_tone_execute(const char *input_json, char *outp
         size_t chunk = (total_samples - samples_written > 1024) ? 1024 : (total_samples - samples_written);
         for (size_t i = 0; i < chunk; i++) {
             double t = (double)(samples_written + i) / I2S_SAMPLE_RATE;
-            buf[i] = (int16_t)(sin(2.0 * M_PI * TONE_FREQ_HZ * t) * 12000.0);
+            /* Left-justify 16-bit tone into 32-bit I2S slot */
+            buf[i] = (int32_t)(sin(2.0 * M_PI * TONE_FREQ_HZ * t) * 12000.0 * 65536.0);
         }
-        i2s_channel_write(tx_handle, buf, chunk * sizeof(int16_t), &bytes_written, 1000);
+        i2s_channel_write(tx_handle, buf, chunk * sizeof(int32_t), &bytes_written, 1000);
         samples_written += chunk;
     }
 
