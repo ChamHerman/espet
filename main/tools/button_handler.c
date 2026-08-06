@@ -7,7 +7,8 @@
 
 static const char *TAG = "button_handler";
 
-static button_snap_cb_t s_snap_cb = NULL;
+static button_short_press_cb_t s_short_cb = NULL;
+static button_long_press_cb_t s_long_cb = NULL;
 static button_ptt_cb_t s_ptt_cb = NULL;
 static QueueHandle_t s_btn_evt_queue = NULL;
 
@@ -35,44 +36,80 @@ static void button_task(void *arg)
 {
     btn_evt_t evt;
     bool last_green_state = false;
+    
+    // State variables for the dual-action white button
+    int64_t press_time = 0;
+    bool is_pressed = false;
+    bool is_long_pressing = false;
+    const int64_t LONG_PRESS_THRESHOLD_MS = 600; // 600ms hold required
 
     while (1) {
-        if (xQueueReceive(s_btn_evt_queue, &evt, portMAX_DELAY)) {
+        // Use a 50ms timeout so we can periodically check the hold duration
+        if (xQueueReceive(s_btn_evt_queue, &evt, pdMS_TO_TICKS(50))) {
             int64_t now = esp_timer_get_time() / 1000;
 
             if (evt.pin == GPIO_BTN_WHITE_SNAP) {
-                if (!evt.level) { /* Press (LOW) */
-                    if (now - s_last_snap_time > 1500) { /* 1.5s holdoff period */
-                        s_last_snap_time = now;
-                        ESP_LOGI(TAG, "White Button Pressed (GPIO 38): Single action triggered");
-                        if (s_snap_cb) {
-                            s_snap_cb();
+                bool current_level_pressed = !evt.level; // LOW means pressed
+                
+                if (current_level_pressed && !is_pressed) {
+                    // Pressed
+                    is_pressed = true;
+                    is_long_pressing = false;
+                    press_time = now;
+                    // Purge bounce events
+                    xQueueReset(s_btn_evt_queue);
+                } else if (!current_level_pressed && is_pressed) {
+                    // Released
+                    is_pressed = false;
+                    
+                    if (is_long_pressing) {
+                        ESP_LOGI(TAG, "White Button (GPIO 38): Long Press Released");
+                        if (s_long_cb) {
+                            s_long_cb(false); // Stop
                         }
-                        /* Purge any stale bounce events queued during callback execution */
-                        xQueueReset(s_btn_evt_queue);
+                    } else {
+                        ESP_LOGI(TAG, "White Button (GPIO 38): Short Click Detected");
+                        if (s_short_cb) {
+                            s_short_cb();
+                        }
                     }
+                    // Purge bounce events
+                    xQueueReset(s_btn_evt_queue);
                 }
             } else if (evt.pin == GPIO_BTN_GREEN_PTT) {
-                bool is_pressed = !evt.level; /* Pressed when LOW */
-                if (is_pressed != last_green_state) {
+                bool is_green_pressed = !evt.level;
+                if (is_green_pressed != last_green_state) {
                     if (now - s_last_ptt_time > 300) { /* 300ms debounce */
                         s_last_ptt_time = now;
-                        last_green_state = is_pressed;
-                        ESP_LOGI(TAG, "Green Button (GPIO 39): %s", is_pressed ? "Pressed" : "Released");
+                        last_green_state = is_green_pressed;
+                        ESP_LOGI(TAG, "Green Button (GPIO 39): %s", is_green_pressed ? "Pressed" : "Released");
                         if (s_ptt_cb) {
-                            s_ptt_cb(is_pressed);
+                            s_ptt_cb(is_green_pressed);
                         }
                         xQueueReset(s_btn_evt_queue);
                     }
                 }
             }
         }
+
+        // --- TIMEOUT CHECK for White Button ---
+        if (is_pressed && !is_long_pressing) {
+            int64_t now = esp_timer_get_time() / 1000;
+            if ((now - press_time) >= LONG_PRESS_THRESHOLD_MS) {
+                is_long_pressing = true;
+                ESP_LOGI(TAG, "White Button (GPIO 38): Long Press Triggered");
+                if (s_long_cb) {
+                    s_long_cb(true); // Start
+                }
+            }
+        }
     }
 }
 
-esp_err_t button_handler_init(button_snap_cb_t snap_cb, button_ptt_cb_t ptt_cb)
+esp_err_t button_handler_init(button_short_press_cb_t short_cb, button_long_press_cb_t long_cb, button_ptt_cb_t ptt_cb)
 {
-    s_snap_cb = snap_cb;
+    s_short_cb = short_cb;
+    s_long_cb = long_cb;
     s_ptt_cb = ptt_cb;
 
     s_btn_evt_queue = xQueueCreate(10, sizeof(btn_evt_t));
