@@ -32,6 +32,12 @@ esp_err_t llm_set_provider(const char *provider);
  */
 esp_err_t llm_set_model(const char *model);
 
+/**
+ * Provide a Base64-encoded image string to be injected into the next LLM payload.
+ * The proxy takes ownership of the string and will free it after use.
+ */
+void llm_proxy_set_pending_image(char *base64_img);
+
 /* ── Tool Use Support ──────────────────────────────────────────── */
 
 typedef struct {

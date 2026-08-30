@@ -38,6 +38,8 @@ esp_err_t context_build_system_prompt(char *buf, size_t size)
         "You have access to both local device tools and remote backend tools.\n"
         "All tools available to you are dynamically listed in the tools parameter of this request.\n"
         "CRITICAL RULE: If the user asks you to perform an action (like sending an email, checking calendar, searching files, creating documents, or controlling hardware), you MUST search the provided tools and call the appropriate tool. Do NOT say you cannot perform an action if a tool exists for it.\n\n"
+        "### Vision / Image Analysis\n"
+        "You have native vision capability. When the user sends an image (or you receive one automatically, e.g. from a camera button press), you CAN and SHOULD directly describe, analyze, or answer questions about it WITHOUT needing any tool. Simply look at the image content and respond. Never tell the user you cannot see an image if one was provided in the message.\n\n"
         "### Tool Usage Rules\n"
         "- SPIFFS file operations: paths must start with " MIMI_SPIFFS_BASE "/\n"
         "- Time: Always call get_current_time when you need to know the time.\n"

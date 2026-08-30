@@ -15,6 +15,7 @@
 #include "channels/telegram/telegram_bot.h"
 #include "channels/feishu/feishu_bot.h"
 #include "llm/llm_proxy.h"
+#include <mbedtls/base64.h>
 #include "agent/agent_loop.h"
 #include "memory/memory_store.h"
 #include "memory/session_mgr.h"
@@ -37,21 +38,49 @@ extern char s_last_chat_id[64]; // Quick hack to get chat id for camera if neede
 // But telegram_send_photo needs chat_id. Let's just expose a getter in telegram_bot.h ideally.
 // For now, we'll just log if chat_id isn't known, or we'll send a system event.
 
+static void photo_upload_task(void *arg)
+{
+    camera_fb_t *fb = (camera_fb_t *)arg;
+    ESP_LOGI(TAG, "Image Captured! Size: %zu. Sending to Telegram...", fb->len);
+    
+    esp_err_t err = telegram_send_photo_to_last_chat(fb->buf, fb->len, "What do you want to know about this picture?");
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Photo sent successfully!");
+    } else {
+        ESP_LOGE(TAG, "Failed to send photo: %d", err);
+    }
+    
+    // Base64 encode for LLM vision
+    size_t b64_len = 0;
+    mbedtls_base64_encode(NULL, 0, &b64_len, fb->buf, fb->len);
+    
+    // Allocate in PSRAM to save internal RAM
+    char *b64_str = heap_caps_malloc(b64_len + 1, MALLOC_CAP_SPIRAM);
+    if (b64_str) {
+        size_t written = 0;
+        if (mbedtls_base64_encode((unsigned char *)b64_str, b64_len, &written, fb->buf, fb->len) == 0) {
+            b64_str[written] = '\0';
+            llm_proxy_set_pending_image(b64_str); // Proxy takes ownership
+            ESP_LOGI(TAG, "Base64 encoded image for LLM vision context (size: %zu)", written);
+        } else {
+            free(b64_str);
+            ESP_LOGE(TAG, "Base64 encode failed");
+        }
+    } else {
+        ESP_LOGE(TAG, "Failed to allocate %zu bytes in PSRAM for Base64 image", b64_len);
+    }
+    
+    tool_camera_return_picture(fb);
+    vTaskDelete(NULL);
+}
+
 static void on_white_button_short_press(void)
 {
     ESP_LOGI(TAG, "[WHITE BUTTON] Short Press: Capturing Image!");
     camera_fb_t *fb = tool_camera_take_picture();
     if (fb) {
-        ESP_LOGI(TAG, "Image Captured! Size: %zu. Sending to Telegram...", fb->len);
-        
-        esp_err_t err = telegram_send_photo_to_last_chat(fb->buf, fb->len, "What do you want to know about this picture?");
-        if (err == ESP_OK) {
-            ESP_LOGI(TAG, "Photo sent successfully!");
-        } else {
-            ESP_LOGE(TAG, "Failed to send photo: %d", err);
-        }
-        
-        tool_camera_return_picture(fb);
+        // Spawn a background task so we don't block the button event loop
+        xTaskCreate(photo_upload_task, "photo_upload", 8192, fb, 5, NULL);
     }
 }
 

@@ -56,7 +56,7 @@ esp_err_t tool_camera_init(void)
         .jpeg_quality = 12,             // 0-63, lower is better quality
         .fb_count = 2,                  // Number of frame buffers
         .fb_location = CAMERA_FB_IN_PSRAM,
-        .grab_mode = CAMERA_GRAB_WHEN_EMPTY
+        .grab_mode = CAMERA_GRAB_LATEST
     };
 
     // Initialize the camera

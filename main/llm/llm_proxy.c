@@ -22,6 +22,19 @@ static char s_api_key[LLM_API_KEY_MAX_LEN] = {0};
 static char s_model[LLM_MODEL_MAX_LEN] = MIMI_LLM_DEFAULT_MODEL;
 static char s_provider[16] = MIMI_LLM_PROVIDER_DEFAULT;
 
+static char *s_pending_image_base64 = NULL;
+
+void llm_proxy_set_pending_image(char *base64_img)
+{
+    if (s_pending_image_base64) {
+        free(s_pending_image_base64);
+    }
+    s_pending_image_base64 = base64_img;
+    if (s_pending_image_base64) {
+        ESP_LOGI(TAG, "Stored pending image for next LLM request (size: %zu)", strlen(s_pending_image_base64));
+    }
+}
+
 static void llm_log_payload(const char *label, const char *payload)
 {
     if (!payload) {
@@ -422,7 +435,42 @@ static cJSON *convert_messages_openai(const char *system_prompt, cJSON *messages
         if (content && cJSON_IsString(content)) {
             cJSON *m = cJSON_CreateObject();
             cJSON_AddStringToObject(m, "role", role->valuestring);
-            cJSON_AddStringToObject(m, "content", content->valuestring);
+            
+            bool is_last_msg = (msg == cJSON_GetArrayItem(messages, cJSON_GetArraySize(messages) - 1));
+            
+            if (is_last_msg && strcmp(role->valuestring, "user") == 0 && s_pending_image_base64) {
+                /* Multimodal image injection */
+                cJSON *arr = cJSON_CreateArray();
+                
+                cJSON *tobj = cJSON_CreateObject();
+                cJSON_AddStringToObject(tobj, "type", "text");
+                cJSON_AddStringToObject(tobj, "text", content->valuestring);
+                cJSON_AddItemToArray(arr, tobj);
+                
+                cJSON *iobj = cJSON_CreateObject();
+                cJSON_AddStringToObject(iobj, "type", "image_url");
+                cJSON *iurl = cJSON_CreateObject();
+                
+                size_t url_len = strlen("data:image/jpeg;base64,") + strlen(s_pending_image_base64) + 1;
+                char *url_str = malloc(url_len);
+                if (url_str) {
+                    snprintf(url_str, url_len, "data:image/jpeg;base64,%s", s_pending_image_base64);
+                    cJSON_AddStringToObject(iurl, "url", url_str);
+                    free(url_str);
+                }
+                cJSON_AddItemToObject(iobj, "image_url", iurl);
+                cJSON_AddItemToArray(arr, iobj);
+                
+                cJSON_AddItemToObject(m, "content", arr);
+                
+                /* Clear the image so it's not sent again */
+                free(s_pending_image_base64);
+                s_pending_image_base64 = NULL;
+                ESP_LOGI(TAG, "Injected pending image into LLM payload");
+            } else {
+                cJSON_AddStringToObject(m, "content", content->valuestring);
+            }
+            
             cJSON_AddItemToArray(out, m);
             continue;
         }

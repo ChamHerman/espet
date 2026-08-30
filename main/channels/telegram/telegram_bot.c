@@ -407,15 +407,11 @@ static void telegram_poll_task(void *arg)
 
 esp_err_t telegram_bot_init(void)
 {
-    /* NVS overrides take highest priority (set via CLI) */
+    /* NVS overrides take highest priority for offset */
     nvs_handle_t nvs;
     if (nvs_open(MIMI_NVS_TG, NVS_READONLY, &nvs) == ESP_OK) {
-        char tmp[128] = {0};
-        size_t len = sizeof(tmp);
-        if (nvs_get_str(nvs, MIMI_NVS_KEY_TG_TOKEN, tmp, &len) == ESP_OK && tmp[0]) {
-            strncpy(s_bot_token, tmp, sizeof(s_bot_token) - 1);
-        }
-
+        // We removed NVS token override here to always use mimi_secrets.h
+        
         int64_t offset = 0;
         if (nvs_get_i64(nvs, TG_OFFSET_NVS_KEY, &offset) == ESP_OK && offset > 0) {
             s_update_offset = offset;

@@ -41,7 +41,7 @@ static void button_task(void *arg)
     int64_t press_time = 0;
     bool is_pressed = false;
     bool is_long_pressing = false;
-    const int64_t LONG_PRESS_THRESHOLD_MS = 600; // 600ms hold required
+    const int64_t LONG_PRESS_THRESHOLD_MS = 3000; // 3000ms hold required
 
     while (1) {
         // Use a 50ms timeout so we can periodically check the hold duration
@@ -51,42 +51,43 @@ static void button_task(void *arg)
             if (evt.pin == GPIO_BTN_WHITE_SNAP) {
                 bool current_level_pressed = !evt.level; // LOW means pressed
                 
-                if (current_level_pressed && !is_pressed) {
-                    // Pressed
-                    is_pressed = true;
-                    is_long_pressing = false;
-                    press_time = now;
-                    // Purge bounce events
-                    xQueueReset(s_btn_evt_queue);
-                } else if (!current_level_pressed && is_pressed) {
-                    // Released
-                    is_pressed = false;
-                    
-                    if (is_long_pressing) {
-                        ESP_LOGI(TAG, "White Button (GPIO 38): Long Press Released");
-                        if (s_long_cb) {
-                            s_long_cb(false); // Stop
-                        }
-                    } else {
-                        ESP_LOGI(TAG, "White Button (GPIO 38): Short Click Detected");
-                        if (s_short_cb) {
-                            s_short_cb();
+                // If the hardware state differs from our debounced state
+                if (current_level_pressed != is_pressed) {
+                    // Accept the state change only if 50ms has passed since the last accepted change
+                    if (now - s_last_snap_time > 50) {
+                        s_last_snap_time = now;
+                        is_pressed = current_level_pressed;
+                        
+                        if (is_pressed) {
+                            // Pressed
+                            is_long_pressing = false;
+                            press_time = now;
+                        } else {
+                            // Released
+                            if (is_long_pressing) {
+                                ESP_LOGI(TAG, "White Button (GPIO 38): Long Press Released");
+                                if (s_long_cb) {
+                                    s_long_cb(false); // Stop
+                                }
+                            } else {
+                                ESP_LOGI(TAG, "White Button (GPIO 38): Short Click Detected");
+                                if (s_short_cb) {
+                                    s_short_cb();
+                                }
+                            }
                         }
                     }
-                    // Purge bounce events
-                    xQueueReset(s_btn_evt_queue);
                 }
             } else if (evt.pin == GPIO_BTN_GREEN_PTT) {
                 bool is_green_pressed = !evt.level;
                 if (is_green_pressed != last_green_state) {
-                    if (now - s_last_ptt_time > 300) { /* 300ms debounce */
+                    if (now - s_last_ptt_time > 50) { // 50ms debounce
                         s_last_ptt_time = now;
                         last_green_state = is_green_pressed;
                         ESP_LOGI(TAG, "Green Button (GPIO 39): %s", is_green_pressed ? "Pressed" : "Released");
                         if (s_ptt_cb) {
                             s_ptt_cb(is_green_pressed);
                         }
-                        xQueueReset(s_btn_evt_queue);
                     }
                 }
             }
