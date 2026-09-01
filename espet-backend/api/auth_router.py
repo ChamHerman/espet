@@ -172,6 +172,8 @@ async def auth_status():
         except Exception as e:
             logger.warning(f"Could not fetch Google email profile: {e}")
 
+        token_updated_at = await token_store.get_updated_at()
+
         return {
             "authenticated": True,
             "email": email or "Google Account Signed In",
@@ -179,6 +181,7 @@ async def auth_status():
                 credentials.refresh_token if credentials else False
             ),
             "token_valid": bool(credentials.valid if credentials else False),
+            "token_updated_at": token_updated_at,
             "message": f"Google OAuth credentials are stored and ready ({email or 'Connected'}).",
         }
     else:

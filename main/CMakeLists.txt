@@ -15,6 +15,7 @@ idf_component_register(
         "proxy/http_proxy.c"
         "cron/cron_service.c"
         "heartbeat/heartbeat.c"
+        "sync/config_sync.c"
         "tools/tool_registry.c"
         "tools/tool_cron.c"
         "tools/tool_web_search.c"

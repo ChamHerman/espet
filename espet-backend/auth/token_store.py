@@ -176,6 +176,17 @@ class TokenStore:
         credentials = await self.get_credentials()
         return credentials is not None
 
+    async def get_updated_at(self) -> str | None:
+        """Return the stored token's updated_at timestamp (or None)."""
+        conn = sqlite3.connect(str(self._db_path))
+        try:
+            row = conn.execute(
+                "SELECT updated_at FROM oauth_tokens WHERE id = 1"
+            ).fetchone()
+            return row[0] if row else None
+        finally:
+            conn.close()
+
     async def delete_credentials(self):
         """Remove stored credentials (for logout/re-auth)."""
         conn = sqlite3.connect(str(self._db_path))

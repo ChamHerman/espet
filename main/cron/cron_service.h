@@ -61,3 +61,10 @@ esp_err_t cron_remove_job(const char *job_id);
  * @param count     Output: number of jobs
  */
 void cron_list_jobs(const cron_job_t **jobs, int *count);
+
+/**
+ * Reload all jobs from MIMI_CRON_FILE (used by config sync after the web
+ * dashboard's job list is merged into the file).
+ * @return ESP_OK on success
+ */
+esp_err_t cron_reload_jobs(void);

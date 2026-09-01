@@ -60,3 +60,4 @@ Thumbs.db
 references/
 .venv/
 /.reasonix
+.playwright-mcp/

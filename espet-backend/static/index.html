@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ESPET Control Center</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css?v=7">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2310b981'/%3E%3Ctext x='16' y='22' font-family='sans-serif' font-size='16' font-weight='bold' fill='white' text-anchor='middle'%3EE%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+  <!-- Ambient background orbs (animated by anime.js, decorative only) -->
+  <div class="bg-orbs" aria-hidden="true">
+    <div class="orb orb-a"></div>
+    <div class="orb orb-b"></div>
+    <div class="orb orb-c"></div>
+  </div>
+
+  <div class="app">
+
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/></svg>
+        </div>
+        <div class="brand-text">
+          <div class="brand-name">ESPET</div>
+          <div class="brand-sub">Control Center</div>
+        </div>
+      </div>
+
+      <nav class="nav" id="nav" aria-label="Dashboard sections"></nav>
+
+      <div class="sidebar-foot">
+        <div>MCP Backend · <span class="mono">FastAPI</span></div>
+        <div>Device · <span class="mono">ESP32-S3</span></div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <h1 id="view-title">Overview</h1>
+          <div class="subtitle" id="view-subtitle"></div>
+        </div>
+        <div class="topbar-meta">
+          <span class="chip" id="chip-dirty" hidden><span class="dot pulse" style="background:var(--amber)"></span>Unsaved changes</span>
+          <span class="chip" id="chip-version" title="Config version the device will pull"><span class="dot ok"></span><span id="version-text">config v–</span></span>
+          <span class="chip" id="chip-server"><span class="dot" id="server-dot"></span><span id="server-text">Checking server…</span></span>
+        </div>
+      </header>
+
+      <div id="view-root" class="view"></div>
+    </main>
+  </div>
+
+  <!-- Reusable confirm dialog -->
+  <div class="modal-backdrop" id="confirm-backdrop">
+    <div class="modal" style="max-width:430px" role="alertdialog" aria-modal="true">
+      <div class="modal-head"><h3 id="confirm-title">Are you sure?</h3></div>
+      <div class="modal-body"><p id="confirm-message" style="font-size:0.9rem;color:var(--text-muted)"></p></div>
+      <div class="modal-foot">
+        <button class="btn" id="confirm-cancel">Cancel</button>
+        <button class="btn danger-ghost" id="confirm-ok">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Cron job editor -->
+  <div class="modal-backdrop" id="job-backdrop">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="job-modal-title">
+      <div class="modal-head">
+        <h3 id="job-modal-title">New scheduled job</h3>
+        <button class="icon-btn" id="job-close" aria-label="Close">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div class="field">
+          <label for="job-name">Job name</label>
+          <input type="text" id="job-name" maxlength="31" placeholder="Morning briefing">
+          <span class="hint">Max 31 characters — shown on the device.</span>
+        </div>
+
+        <div class="field">
+          <label>Trigger</label>
+          <div class="seg" id="job-kind">
+            <button type="button" data-kind="every" class="active">Recurring</button>
+            <button type="button" data-kind="at">One-time</button>
+          </div>
+        </div>
+
+        <div class="field" id="field-interval">
+          <label for="job-interval">Repeat every</label>
+          <select id="job-interval">
+            <option value="900">15 minutes</option>
+            <option value="1800">30 minutes</option>
+            <option value="3600">1 hour</option>
+            <option value="21600">6 hours</option>
+            <option value="43200">12 hours</option>
+            <option value="86400" selected>1 day</option>
+            <option value="604800">1 week</option>
+          </select>
+        </div>
+
+        <div class="field" id="field-at" hidden>
+          <label for="job-at">Run at (your local time)</label>
+          <input type="datetime-local" id="job-at">
+        </div>
+
+        <div class="field">
+          <label for="job-message">Message to the agent</label>
+          <textarea id="job-message" maxlength="255" rows="3" placeholder="Give me a summary of my day and unread emails"></textarea>
+          <span class="hint">Sent to MimiClaw like a normal message — it will act on it.</span>
+        </div>
+
+        <div class="grid cols-2">
+          <div class="field">
+            <label for="job-channel">Deliver reply via</label>
+            <select id="job-channel">
+              <option value="system">Device (OLED + voice)</option>
+              <option value="telegram">Telegram</option>
+            </select>
+          </div>
+          <div class="field" id="field-chat">
+            <label for="job-chat">Telegram chat ID</label>
+            <input type="text" id="job-chat" class="mono" placeholder="123456789">
+          </div>
+        </div>
+
+        <label class="checkbox-row">
+          <input type="checkbox" id="job-delete-after"> One-shot: remove after running
+        </label>
+        <label class="checkbox-row">
+          <input type="checkbox" id="job-enabled" checked> Enabled
+        </label>
+      </div>
+      <div class="modal-foot">
+        <button class="btn" id="job-cancel">Cancel</button>
+        <button class="btn primary" id="job-save">Save job</button>
+      </div>
+    </div>
+  </div>
+
+
+  <!-- Dress-up workbench (opened from Agent view) -->
+  <div class="modal-backdrop" id="dress-backdrop">
+    <div class="modal wide" role="dialog" aria-modal="true" aria-labelledby="dress-modal-title">
+      <div class="modal-head">
+        <h3 id="dress-modal-title">Dress-up workbench</h3>
+        <button class="icon-btn" id="dress-close" aria-label="Close">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+        </button>
+      </div>
+      <div class="modal-body"><div class="dress-grid" id="av-dress"></div></div>
+    </div>
+  </div>
+
+  <!-- Tool schema -->
+
+  <div class="modal-backdrop" id="schema-backdrop">
+    <div class="modal" role="dialog" aria-modal="true">
+      <div class="modal-head">
+        <h3 id="schema-title" class="mono" style="font-size:0.9rem">Schema</h3>
+        <button class="icon-btn" id="schema-close" aria-label="Close">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+        </button>
+      </div>
+      <div class="modal-body"><pre id="schema-json">{}</pre></div>
+    </div>
+  </div>
+
+  <div class="toast-wrap" id="toast-wrap" aria-live="polite"></div>
+
+  <script src="/static/vendor/anime.iife.min.js"></script>
+  <script src="/static/vendor/toy.bundle.js?v=2"></script>
+  <script src="/static/app.js?v=13"></script>
+</body>
+</html>

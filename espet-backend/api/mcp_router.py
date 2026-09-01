@@ -88,6 +88,31 @@ def _check_rate_limit():
 
 
 # ---------------------------------------------------------------------------
+# Reconnect (triggered by the dashboard after Google re-auth)
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/mcp/reconnect",
+    summary="Reconnect all MCP servers",
+    description=(
+        "Re-runs the MCP startup discovery with the current OAuth token. "
+        "The dashboard calls this after a Google login/relink so the "
+        "connected servers update without restarting the backend."
+    ),
+)
+async def reconnect_mcp(_key: str = Depends(verify_device_key)):
+    await mcp_client_manager.initialize()
+    return {
+        "ok": True,
+        "connected": {
+            name: server.connected
+            for name, server in mcp_client_manager.servers.items()
+        },
+        "total_tools": len(mcp_client_manager.registry.get_all_tools()),
+    }
+
+
+# ---------------------------------------------------------------------------
 # THE Endpoint
 # ---------------------------------------------------------------------------
 

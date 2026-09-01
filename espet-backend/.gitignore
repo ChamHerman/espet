@@ -7,6 +7,9 @@
 db/*.db
 db/*.db-journal
 
+# Device config store (user data, seeded on first run)
+data/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -19,6 +22,9 @@ build/
 venv/
 .venv/
 env/
+
+# Node (front-end vendor deps; built output is committed to static/vendor)
+node_modules/
 
 # IDE
 .vscode/

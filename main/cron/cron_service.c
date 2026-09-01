@@ -438,3 +438,9 @@ void cron_list_jobs(const cron_job_t **jobs, int *count)
     *jobs = s_jobs;
     *count = s_job_count;
 }
+
+esp_err_t cron_reload_jobs(void)
+{
+    /* config sync has already merged the new job list into the file */
+    return cron_load_jobs();
+}

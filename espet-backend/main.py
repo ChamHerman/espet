@@ -8,17 +8,22 @@ and exposes a single generic endpoint for tool execution.
 
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from config import settings
 from api.health import router as health_router
 from api.mcp_router import router as mcp_router
 from api.tools_router import router as tools_router
 from api.auth_router import router as auth_router
+from api.config_router import router as config_router
 from api.ui_router import router as ui_router
 from mcp.client import mcp_client_manager
+
+STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -95,6 +100,10 @@ app.include_router(health_router)
 app.include_router(mcp_router)
 app.include_router(tools_router)
 app.include_router(auth_router)
+app.include_router(config_router)
+
+# Dashboard assets (css/js) — GET / itself is served by ui_router
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
 # ---------------------------------------------------------------------------

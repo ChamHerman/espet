@@ -24,6 +24,7 @@
 #include "tools/tool_registry.h"
 #include "cron/cron_service.h"
 #include "heartbeat/heartbeat.h"
+#include "sync/config_sync.h"
 #include "skills/skill_loader.h"
 #include "onboard/wifi_onboard.h"
 #include "tools/button_handler.h"
@@ -189,6 +190,7 @@ void app_main(void)
     ESP_ERROR_CHECK(button_handler_init(on_white_button_short_press, on_white_button_long_press, on_green_button_ptt));
     ESP_ERROR_CHECK(cron_service_init());
     ESP_ERROR_CHECK(heartbeat_init());
+    ESP_ERROR_CHECK(config_sync_init());
     ESP_ERROR_CHECK(agent_loop_init());
 
     /* Start Serial CLI first (works without WiFi) */
@@ -239,6 +241,7 @@ void app_main(void)
         cron_service_start();
         heartbeat_start();
         ESP_ERROR_CHECK(ws_server_start());
+        config_sync_start();
 
         ESP_LOGI(TAG, "All services started!");
     }

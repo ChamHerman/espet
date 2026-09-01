@@ -126,6 +126,14 @@
 #define MIMI_HEARTBEAT_FILE MIMI_SPIFFS_BASE "/HEARTBEAT.md"
 #define MIMI_HEARTBEAT_INTERVAL_MS (30 * 60 * 1000)
 
+/* Config Sync (device pulls USER/SOUL/MEMORY/cron/timezone from backend) */
+#define MIMI_SYNC_STATE_FILE MIMI_SPIFFS_CONFIG_DIR "/sync_state.json"
+#define MIMI_CONFIG_SYNC_ENABLED 1
+#define MIMI_CONFIG_SYNC_STACK (12 * 1024)
+#define MIMI_CONFIG_SYNC_PRIO 4
+#define MIMI_CONFIG_SYNC_CORE 0
+#define MIMI_CONFIG_SYNC_INTERVAL_S 300 /* default; overridden by web device settings */
+
 /* GPIO */
 #define MIMI_GPIO_CONFIG_SECTION 1 /* enable GPIO tools */
 #define MIMI_GPIO_OLED_SCL 21      /* SSD1306 OLED SCL/SCK */
