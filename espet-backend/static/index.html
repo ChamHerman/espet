@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/style.css?v=7">
+  <link rel="stylesheet" href="/static/style.css?v=8">
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2310b981'/%3E%3Ctext x='16' y='22' font-family='sans-serif' font-size='16' font-weight='bold' fill='white' text-anchor='middle'%3EE%3C/text%3E%3C/svg%3E">
 </head>
 <body>
@@ -145,6 +145,40 @@
   </div>
 
 
+  <!-- Skill editor -->
+  <div class="modal-backdrop" id="skill-backdrop">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="skill-modal-title">
+      <div class="modal-head">
+        <h3 id="skill-modal-title">New skill</h3>
+        <button class="icon-btn" id="skill-close" aria-label="Close">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div class="field">
+          <label for="skill-name">Skill name</label>
+          <input type="text" id="skill-name" maxlength="48" placeholder="daily-briefing">
+          <span class="hint">Lowercase letters, numbers and hyphens. Becomes the filename on the device (<span class="mono">skills/&lt;name&gt;.md</span>).</span>
+        </div>
+        <div class="field">
+          <label for="skill-content">Content (markdown)</label>
+          <textarea id="skill-content" class="mono" rows="14" spellcheck="false" placeholder="# Daily Briefing&#10;&#10;Compile a personalized daily briefing for the user.&#10;&#10;## When to use&#10;..."></textarea>
+          <div class="editor-meta">
+            <span>Must start with <span class="mono"># Title</span> — that's what the device parses</span>
+            <span class="char-count"><span id="skill-count">0</span> / 8192 bytes</span>
+          </div>
+        </div>
+        <label class="checkbox-row">
+          <input type="checkbox" id="skill-enabled" checked> Enabled
+        </label>
+      </div>
+      <div class="modal-foot">
+        <button class="btn" id="skill-cancel">Cancel</button>
+        <button class="btn primary" id="skill-save">Save skill</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Dress-up workbench (opened from Agent view) -->
   <div class="modal-backdrop" id="dress-backdrop">
     <div class="modal wide" role="dialog" aria-modal="true" aria-labelledby="dress-modal-title">
@@ -176,6 +210,6 @@
 
   <script src="/static/vendor/anime.iife.min.js"></script>
   <script src="/static/vendor/toy.bundle.js?v=2"></script>
-  <script src="/static/app.js?v=13"></script>
+  <script src="/static/app.js?v=14"></script>
 </body>
 </html>

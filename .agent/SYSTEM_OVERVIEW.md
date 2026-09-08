@@ -92,8 +92,9 @@ cp .env.example .env              # edit .env with your Google OAuth client ID /
                                   # and set DEVICE_API_KEY to match the firmware
 
 # Every time:
-python main.py                    # starts on http://0.0.0.0:8000
-```
+npm run dev:win                   # Windows: uses venv\Scripts\python.exe + uvicorn --reload
+npm run dev:mac                   # macOS: activates venv, python main.py
+python main.py                    # or activate venv first and run directly
 
 The server auto-seeds `data/config.json` with the default SOUL.md, USER.md and
 MEMORY.md (mirrors `spiffs_data/`). The dashboard is just [http://localhost:8000](http://localhost:8000).
@@ -215,7 +216,7 @@ outbound dispatch task → OLED boot animation → agent_loop_start
 | `/spiffs/memory/MEMORY.md` | web dashboard **and** the agent (consolidation) | context builder | Long-term facts |
 | `/spiffs/memory/YYYY-MM-DD.md` | the agent | context builder (last N days) | Daily episodic notes |
 | `/spiffs/sessions/*` | session_mgr | agent loop | Rolling conversation history |
-| `/spiffs/skills/*.md` | flashed / skill_loader | context builder | Reusable skill playbooks |
+| `/spiffs/skills/*.md` | web dashboard (config sync) **and** the agent (`write_file`) | context builder | Reusable skill playbooks |
 
 ### 3.4 Proactive daemons
 
@@ -241,7 +242,14 @@ outbound dispatch task → OLED boot animation → agent_loop_start
   ```
 - **`heartbeat/heartbeat.c`** — every 30 min injects a heartbeat prompt so the
   agent can check for due context and act unprompted (Herman's proactive loop).
-- **`sync/config_sync.c`** — web-config pull (see §5).
+- **`sync/config_sync.c`** — web-config pull (see §5). Also syncs **skill
+  files**: when the `skills` config version advances, the device pulls
+  `GET /api/skills/sync` (separate endpoint — the bundle is far larger than
+  the 32 KB config buffer), writes each enabled skill to `/spiffs/skills/`,
+  and deletes previously-synced files that disappeared (disabled or removed
+  on the web). Skills flashed at build time or created by the agent via
+  `write_file` are never touched (filename-based ownership tracking in
+  `sync_state.json`, mirroring the cron `synced_ids` contract).
 
 ### 3.5 Channels (`channels/`)
 
@@ -290,6 +298,8 @@ first-boot setup from a phone). `ota/` for firmware updates.
 | `PUT` | `/api/ui/profile` · `/soul` · `/memory` | device key | Edit USER.md / SOUL.md / MEMORY.md |
 | `PUT` | `/api/ui/device` | device key | Name, timezone (IANA + generated POSIX TZ), sync interval |
 | `GET/POST/PUT/DELETE` | `/api/ui/jobs[/{id}]` | device key | Web-managed cron jobs |
+| `GET/POST/PUT/DELETE` | `/api/ui/skills[/{id}]` | device key | Web-managed skill markdown files |
+| `GET` | `/api/skills/sync` | device key | Skill bundle the device pulls when `versions.skills` advances (enabled skills only) |
 | `GET/PUT` | `/api/ui/avatar` | device key | Agent avatar dress-up state (dashboard-only) |
 
 Auth model: one shared **device API key** (`Bearer`, set in `.env` and
@@ -302,7 +312,7 @@ on LAN; put TLS in front before leaving the local network.
 
 ```json
 {
-  "versions": { "user": 2, "soul": 1, "memory": 1, "device": 2, "jobs": 3 },
+  "versions": { "user": 2, "soul": 1, "memory": 1, "device": 2, "jobs": 3, "skills": 4 },
   "user_md":   "# User Profile\n\n- Name: Jeff\n...",
   "soul_md":   "I am MimiClaw, a personal AI assistant...",
   "memory_md": "# Long-term Memory\n...",
@@ -315,6 +325,12 @@ on LAN; put TLS in front before leaving the local network.
   "jobs": [ { "...": "exact cron.json job schema, see §3.4" } ]
 }
 ```
+
+The bundle carries only the `skills` **version** — skill *content* is pulled
+separately from `GET /api/skills/sync` (`{version, skills:[{id, name,
+filename, content}]}`, enabled only) so the 32 KB config buffer is never at
+risk. Limits mirrored on both ends: max 16 skills, 8192 bytes content each,
+filename slug `skills/<name>.md`.
 
 ---
 
@@ -332,13 +348,17 @@ edit profile  ──PUT──▶  bump versions.user (n+1)
 version n+1 > applied n  ──▶  write USER.md to SPIFFS
                               save sync_state.json
                               (unchanged sections are NOT rewritten)
+edit skills   ──PUT──▶  bump versions.skills (n+1)
+                              │
+                              ◀── GET /api/skills/sync ──── only when version advanced
+                              write /spiffs/skills/*.md, unlink removed
 ```
 
 Rules implemented in `main/sync/config_sync.c`:
 
-1. **Per-section versions** (`user`, `soul`, `memory`, `device`, `jobs`) — a
-   section is applied only when its version is strictly greater than the last
-   applied value, persisted in `/spiffs/config/sync_state.json`.
+1. **Per-section versions** (`user`, `soul`, `memory`, `device`, `jobs`,
+   `skills`) — a section is applied only when its version is strictly greater
+   than the last applied value, persisted in `/spiffs/config/sync_state.json`.
 2. **Markdown sections** are overwritten on device (backend is source of truth).
 3. **Timezone**: backend converts the IANA zone to a POSIX TZ string; device
    applies it with `setenv("TZ") + tzset()` so cron "at" jobs and timestamps
@@ -350,9 +370,18 @@ Rules implemented in `main/sync/config_sync.c`:
    - local jobs **not** in `synced_ids` (agent-created via `cron_add`) are
      left untouched;
    - afterwards `cron_reload_jobs()` reloads the file into the running service.
-5. **Memory semantics**: a dashboard edit wins *once* (version bump), after
+5. **Skills ownership** (mirrors the cron contract, tracked by filename):
+   - the sync state remembers which skill filenames came from the web
+     (`synced_skills`); web skills are written/overwritten, web-deleted or
+     web-disabled skills are unlinked from `/spiffs/skills/`;
+   - skills flashed at build time (`spiffs_data/skills/`) or created on-device
+     by the agent (`write_file`) never enter that list and are never touched;
+   - skill content is pulled from `GET /api/skills/sync`, not the config
+     bundle (size); the section is applied in `sync_skills()`, outside the
+     generic `apply_section` loop.
+6. **Memory semantics**: a dashboard edit wins *once* (version bump), after
    which the agent freely consolidates memory again — the UI shows this warning.
-6. **Avatar is dashboard-only**: the `avatar` config section (3D agent look)
+7. **Avatar is dashboard-only**: the `avatar` config section (3D agent look)
    is version-tracked in the store but **excluded from the device bundle** —
    the ESP32 never pulls it.
 
@@ -375,6 +404,7 @@ for the agent showcase. Front-end vendor libraries are installed via npm
 | **Personality** | SOUL.md editor + reset to default |
 | **Memory** | MEMORY.md editor, quick-note append, clear-with-confirm |
 | **Schedule** | Cron job CRUD (recurring / one-time, device or Telegram delivery) |
+| **Skills** | Skill markdown CRUD (create/edit/enable/disable/delete); files sync to `/spiffs/skills/` — agent sees each enabled skill's title + summary in its prompt and reads the full file on demand |
 | **Device** | Name, timezone, sync interval, channel overview, sync explainer |
 | **Tools** | Searchable/filterable explorer of all discovered MCP tools + JSON schemas |
 
@@ -440,10 +470,11 @@ espet/
 │   ├── package.json           front-end vendor deps (animejs, three) + esbuild
 │   ├── tools/toy-entry.js     esbuild entry → static/vendor/toy.bundle.js (3D agent)
 │   ├── static/                index.html · style.css · app.js
-│   │                          vendor/: anime.iife.min.js (anime.js UMD) ·
 │   │                          toy.bundle.js (three.js) · models/robot.glb
 │   └── data/config.json       live config (gitignored, seeded on first run)
+├── DESIGN.MD                  dashboard design system doc (tokens, components, layout)
 ├── docs/ARCHITECTURE.md       firmware-deep architecture
+├── .agent/HERMAN_ROADMAP.MD   proactive-half gap analysis + prioritized roadmap
 └── .agent/ESPET_PINS.MD       wiring table
 ```
 
@@ -464,6 +495,9 @@ The web dashboard + config sync span both halves (it configures Jeff's
 tools/auth *and* Herman's schedules/memory) — treat it as shared platform
 infrastructure in the reports, like L0.
 
+Herman's full gap analysis and prioritized roadmap of needed tools/functions:
+[`.agent/HERMAN_ROADMAP.MD`](./HERMAN_ROADMAP.MD).
+
 ---
 
 ## 10. Known limitations / next steps
@@ -479,3 +513,33 @@ infrastructure in the reports, like L0.
   keep Device timezone and Profile timezone identical.
 - The device applies config only while powered + connected; offline queues
   are not persisted.
+
+---
+
+## Recent Changes
+
+Append-only session log. Newest first. One line per change:
+`- YYYY-MM-DD — summary (files: ...)`.
+
+- 2026-09-08 — Added skills management end-to-end: web CRUD (`/api/ui/skills`
+  + Skills dashboard view with editor modal), device sync (`GET /api/skills/sync`
+  pulled only when `versions.skills` advances; filename-based ownership in
+  `sync_state.json` protects agent-created and flashed skills), backend seeds
+  the 4 default skills, skills prompt buffer 2048→3072 bytes. Also added
+  `.agent/HERMAN_ROADMAP.MD` (proactive-half gap analysis + prioritized
+  roadmap) (files: espet-backend/config_store.py, espet-backend/api/config_router.py,
+  main/sync/config_sync.c, main/agent/context_builder.c,
+  espet-backend/static/app.js, espet-backend/static/index.html,
+  .agent/HERMAN_ROADMAP.MD, .agent/SYSTEM_OVERVIEW.md).
+- 2026-09-07 — Added `npm run dev:win` / `npm run dev:mac` launch scripts to
+  `espet-backend/package.json` (Windows: venv python + uvicorn --reload :8000;
+  macOS: source venv/bin/activate + python main.py); run from `espet-backend/`
+  (files: espet-backend/package.json, .agent/SYSTEM_OVERVIEW.md).
+- 2026-09-07 — Dashboard layout fix: `.main` now centers horizontally next to the
+  sidebar (`margin-inline: auto`; was flush-left leaving dead space) and cache
+  version bumped to style.css?v=8. Added DESIGN.MD documenting the dashboard
+  design system (tokens, components, layout, motion, a11y) (files:
+  espet-backend/static/style.css, espet-backend/static/index.html, DESIGN.MD).
+- 2026-09-07 — Added session memory rule: every feature/new implementation must
+  auto-update this file in the same change (log entry + touched sections);
+  rule added to AGENTS.md (files: AGENTS.md, .agent/SYSTEM_OVERVIEW.md).

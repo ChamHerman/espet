@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -22,10 +23,14 @@ static const char *TAG = "cfg_sync";
    (two markdown files + memory + up to 16 job objects). */
 #define SYNC_BUF_SIZE (32 * 1024)
 
-/* Section indexes */
-enum { SEC_USER = 0, SEC_SOUL, SEC_MEMORY, SEC_JOBS, SEC_DEVICE, SEC_COUNT };
+/* Buffer for the /api/skills/sync bundle: up to 16 skills x 8 KB content
+   plus JSON overhead. PSRAM-first, rejected on overflow. */
+#define SKILLS_BUF_SIZE (192 * 1024)
 
-static const char *SEC_NAMES[SEC_COUNT] = { "user", "soul", "memory", "jobs", "device" };
+/* Section indexes */
+enum { SEC_USER = 0, SEC_SOUL, SEC_MEMORY, SEC_JOBS, SEC_DEVICE, SEC_SKILLS, SEC_COUNT };
+
+static const char *SEC_NAMES[SEC_COUNT] = { "user", "soul", "memory", "jobs", "device", "skills" };
 
 /* Last-applied versions, persisted in MIMI_SYNC_STATE_FILE */
 static int64_t s_applied_version[SEC_COUNT];
@@ -34,6 +39,11 @@ static int64_t s_applied_version[SEC_COUNT];
    These are the only jobs a sync may replace or remove — jobs the agent
    created on-device never appear here and are therefore preserved. */
 static char s_synced_ids[512];
+
+/* Skill filenames received from the backend (comma-separated). Same
+   ownership contract as jobs: skills flashed at build time or written by
+   the agent (write_file) never appear here and are never touched by sync. */
+static char s_synced_skills[1280];
 
 static TaskHandle_t s_task = NULL;
 static volatile uint32_t s_interval_s = MIMI_CONFIG_SYNC_INTERVAL_S;
@@ -88,6 +98,7 @@ static esp_err_t save_state(void)
         cJSON_AddNumberToObject(root, SEC_NAMES[i], (double)s_applied_version[i]);
     }
     cJSON_AddStringToObject(root, "synced_ids", s_synced_ids);
+    cJSON_AddStringToObject(root, "synced_skills", s_synced_skills);
 
     char *json = cJSON_Print(root);
     cJSON_Delete(root);
@@ -120,13 +131,18 @@ static void load_state(void)
     if (ids) {
         strncpy(s_synced_ids, ids, sizeof(s_synced_ids) - 1);
     }
+    const char *skill_fns = cJSON_GetStringValue(cJSON_GetObjectItem(root, "synced_skills"));
+    if (skill_fns) {
+        strncpy(s_synced_skills, skill_fns, sizeof(s_synced_skills) - 1);
+    }
     cJSON_Delete(root);
-    ESP_LOGI(TAG, "Loaded sync state: user=%lld soul=%lld mem=%lld jobs=%lld dev=%lld",
+    ESP_LOGI(TAG, "Loaded sync state: user=%lld soul=%lld mem=%lld jobs=%lld dev=%lld skills=%lld",
              (long long)s_applied_version[SEC_USER],
              (long long)s_applied_version[SEC_SOUL],
              (long long)s_applied_version[SEC_MEMORY],
              (long long)s_applied_version[SEC_JOBS],
-             (long long)s_applied_version[SEC_DEVICE]);
+             (long long)s_applied_version[SEC_DEVICE],
+             (long long)s_applied_version[SEC_SKILLS]);
 }
 
 /* ── Cron merge ──────────────────────────────────────────────── */
@@ -323,6 +339,71 @@ static esp_err_t apply_jobs(cJSON *jobs_arr)
 
 /* ── Section appliers ────────────────────────────────────────── */
 
+/* Skill filenames from the backend are sanitized server-side, but never
+   trust a path component across the wire. */
+static bool skill_filename_safe(const char *fname)
+{
+    return fname && fname[0] && strlen(fname) < 64 &&
+           !strchr(fname, '/') && !strstr(fname, "..");
+}
+
+/**
+ * Apply the backend's skill list to /spiffs/skills/:
+ *   - files previously synced from the web but absent from the incoming
+ *     list (deleted or disabled on the dashboard) are unlinked
+ *   - every incoming skill is written (overwritten) as <filename>
+ *   - skills flashed at build time or created by the agent are preserved
+ *     (their filenames never enter s_synced_skills)
+ * Returns ESP_OK only if every incoming skill was written.
+ */
+static esp_err_t apply_skills(cJSON *skills_arr)
+{
+    char path[96];
+
+    /* 1) Remove web-managed files that are no longer in the payload */
+    const char *p = s_synced_skills;
+    while (p && *p) {
+        const char *comma = strchr(p, ',');
+        size_t len = comma ? (size_t)(comma - p) : strlen(p);
+        char fname[64];
+        if (len > 0 && len < sizeof(fname)) {
+            memcpy(fname, p, len);
+            fname[len] = '\0';
+
+            if (skill_filename_safe(fname)) {
+                bool still_present = false;
+                cJSON *item;
+                cJSON_ArrayForEach(item, skills_arr) {
+                    const char *fn = cJSON_GetStringValue(cJSON_GetObjectItem(item, "filename"));
+                    if (fn && strcmp(fn, fname) == 0) { still_present = true; break; }
+                }
+                if (!still_present) {
+                    snprintf(path, sizeof(path), MIMI_SKILLS_PREFIX "%s", fname);
+                    if (unlink(path) == 0) {
+                        ESP_LOGI(TAG, "Removed web skill %s", fname);
+                    }
+                }
+            }
+        }
+        p = comma ? comma + 1 : NULL;
+    }
+
+    /* 2) Write every incoming skill */
+    cJSON *item;
+    cJSON_ArrayForEach(item, skills_arr) {
+        const char *fname = cJSON_GetStringValue(cJSON_GetObjectItem(item, "filename"));
+        const char *content = cJSON_GetStringValue(cJSON_GetObjectItem(item, "content"));
+        if (!skill_filename_safe(fname) || !content) continue;
+        snprintf(path, sizeof(path), MIMI_SKILLS_PREFIX "%s", fname);
+        esp_err_t err = write_text_file(path, content);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed writing skill %s", fname);
+            return err;
+        }
+    }
+    return ESP_OK;
+}
+
 static esp_err_t apply_section(int sec, cJSON *bundle)
 {
     esp_err_t err = ESP_OK;
@@ -363,6 +444,11 @@ static esp_err_t apply_section(int sec, cJSON *bundle)
         }
         break;
     }
+    case SEC_SKILLS:
+        /* Applied separately in sync_skills() — never reached via
+           apply_section (sync_once skips it before the version would be
+           recorded as applied without the files being written). */
+        break;
     }
 
     if (err == ESP_OK) {
@@ -399,21 +485,21 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
     return ESP_OK;
 }
 
-static cJSON *fetch_config_bundle(void)
+static cJSON *fetch_json(const char *path, size_t buf_size)
 {
-    char *buf = heap_caps_malloc(SYNC_BUF_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!buf) buf = malloc(SYNC_BUF_SIZE);
+    char *buf = heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) buf = malloc(buf_size);
     if (!buf) {
-        ESP_LOGE(TAG, "No memory for sync buffer");
+        ESP_LOGE(TAG, "No memory for sync buffer (%u KB)", (unsigned)(buf_size / 1024));
         return NULL;
     }
     buf[0] = '\0';
 
-    http_body_t body = { .buf = buf, .used = 0, .cap = SYNC_BUF_SIZE - 1, .overflow = false };
+    http_body_t body = { .buf = buf, .used = 0, .cap = buf_size - 1, .overflow = false };
 
     char url[160];
     char auth_hdr[96];
-    snprintf(url, sizeof(url), "%s/api/config", MIMI_BACKEND_URL);
+    snprintf(url, sizeof(url), "%s%s", MIMI_BACKEND_URL, path);
     snprintf(auth_hdr, sizeof(auth_hdr), "Bearer %s", MIMI_BACKEND_API_KEY);
 
     esp_http_client_config_t config = {
@@ -440,18 +526,68 @@ static cJSON *fetch_config_bundle(void)
     if (err == ESP_OK && status == 200 && !body.overflow && body.used > 0) {
         result = cJSON_Parse(buf);
         if (!result) {
-            ESP_LOGE(TAG, "Invalid JSON from /api/config (len=%u)", (unsigned)body.used);
+            ESP_LOGE(TAG, "Invalid JSON from %s (len=%u)", path, (unsigned)body.used);
         }
     } else if (err == ESP_OK && status != 200) {
-        ESP_LOGW(TAG, "GET /api/config -> HTTP %d", status);
+        ESP_LOGW(TAG, "GET %s -> HTTP %d", path, status);
     } else if (body.overflow) {
-        ESP_LOGE(TAG, "Config bundle exceeds %d KB buffer", SYNC_BUF_SIZE / 1024);
+        ESP_LOGE(TAG, "%s response exceeds %u KB buffer", path, (unsigned)(buf_size / 1024));
     } else if (err != ESP_OK) {
-        ESP_LOGW(TAG, "GET /api/config failed: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "GET %s failed: %s", path, esp_err_to_name(err));
     }
 
     free(buf);
     return result;
+}
+
+static cJSON *fetch_config_bundle(void)
+{
+    return fetch_json("/api/config", SYNC_BUF_SIZE);
+}
+
+static cJSON *fetch_skills_bundle(void)
+{
+    return fetch_json("/api/skills/sync", SKILLS_BUF_SIZE);
+}
+
+/**
+ * Skills ride their own endpoint (content is far bigger than the config
+ * bundle), so they are applied outside the generic apply_section loop:
+ * fetch the bundle, apply it, record the version + synced filenames.
+ */
+static void sync_skills(int64_t incoming_version)
+{
+    cJSON *bundle = fetch_skills_bundle();
+    if (!bundle) return;
+
+    cJSON *skills = cJSON_GetObjectItem(bundle, "skills");
+    if (skills && cJSON_IsArray(skills)) {
+        if (apply_skills(skills) == ESP_OK) {
+            /* Rebuild the web-managed filename list from what we applied */
+            size_t off = 0;
+            s_synced_skills[0] = '\0';
+            cJSON *item;
+            cJSON_ArrayForEach(item, skills) {
+                const char *fname = cJSON_GetStringValue(cJSON_GetObjectItem(item, "filename"));
+                if (!fname) continue;
+                size_t len = strlen(fname);
+                if (off + len + 2 >= sizeof(s_synced_skills)) break;
+                if (off) s_synced_skills[off++] = ',';
+                memcpy(s_synced_skills + off, fname, len);
+                off += len;
+            }
+            s_synced_skills[off] = '\0';
+
+            s_applied_version[SEC_SKILLS] = incoming_version;
+            save_state();
+            ESP_LOGI(TAG, "Applied skills (v%lld, %d files)", (long long)incoming_version,
+                     cJSON_GetArraySize(skills));
+        }
+    } else {
+        ESP_LOGW(TAG, "Skills bundle missing 'skills' array");
+    }
+
+    cJSON_Delete(bundle);
 }
 
 /* ── Sync cycle & task ───────────────────────────────────────── */
@@ -469,6 +605,9 @@ static void sync_once(void)
 
     bool changed = false;
     for (int sec = 0; sec < SEC_COUNT; sec++) {
+        /* Skills need their own fetch (bundle too big for the config buffer) */
+        if (sec == SEC_SKILLS) continue;
+
         cJSON *v = cJSON_GetObjectItem(versions, SEC_NAMES[sec]);
         if (!v || !cJSON_IsNumber(v)) continue;
         if ((int64_t)v->valuedouble <= s_applied_version[sec]) continue;
@@ -476,6 +615,13 @@ static void sync_once(void)
         if (apply_section(sec, bundle) == ESP_OK) {
             changed = true;
         }
+    }
+
+    /* Skills: separate pull, only when the version actually advanced */
+    cJSON *sv = cJSON_GetObjectItem(versions, "skills");
+    if (sv && cJSON_IsNumber(sv) &&
+        (int64_t)sv->valuedouble > s_applied_version[SEC_SKILLS]) {
+        sync_skills((int64_t)sv->valuedouble);
     }
 
     if (changed) {

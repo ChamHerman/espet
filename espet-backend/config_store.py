@@ -22,6 +22,7 @@ Job merge contract with the device:
 """
 
 import json
+import re
 import secrets
 import threading
 from datetime import datetime, timezone
@@ -42,6 +43,14 @@ JOB_MAX_CHAT_ID = 95       # char chat_id[96]
 JOB_MAX_COUNT = 16         # MIMI_CRON_MAX_JOBS
 
 _VALID_CHANNELS = {"system", "telegram"}
+
+# Skill limits mirror the device's SPIFFS constraints:
+#   - 16 skills (same budget as cron jobs)
+#   - 8192 bytes content (device MAX_FILE_SIZE for agent-written files)
+#   - filename "skills/<slug>.md" must fit SPIFFS_OBJ_NAME_LEN=64
+SKILL_MAX_COUNT = 16
+SKILL_MAX_CONTENT = 8192
+SKILL_NAME_MAX = 48        # slug chars; +".md" + "skills/" stays under 64
 
 # Default seed content — mirrors spiffs_data/ in the firmware repo so a fresh
 # backend starts with the same state the device was flashed with.
@@ -74,6 +83,151 @@ _DEFAULT_MEMORY_MD = """# Long-term Memory
 (empty - MimiClaw will write memories here as it learns)
 """
 
+# Default skill files — mirrors spiffs_data/skills/ so the dashboard starts
+# populated with the same skills the device was flashed with.
+_DEFAULT_SKILLS = [
+    {
+        "name": "daily-briefing",
+        "content": """# Daily Briefing
+
+Compile a personalized daily briefing for the user.
+
+## When to use
+When the user asks for a daily briefing, morning update, or "what's new today".
+Also useful as a heartbeat/cron task.
+
+## How to use
+1. Use get_current_time for today's date
+2. Read /spiffs/memory/MEMORY.md for user preferences and context
+3. Read today's daily note if it exists
+4. Use web_search for relevant news based on user interests
+5. Compile a concise briefing covering:
+   - Date and time
+   - Weather (if location known from USER.md)
+   - Relevant news/updates based on user interests
+   - Any pending tasks from memory
+   - Any scheduled cron jobs
+
+## Format
+Keep it brief — 5-10 bullet points max. Use the user's preferred language.
+""",
+    },
+    {
+        "name": "gpio-control",
+        "content": """# GPIO Control
+
+Control and monitor GPIO pins on the ESP32-S3 for digital I/O.
+
+## Hardware Pin Mapping
+Hardware components are fixed to specific GPIO pins:
+- **GPIO 40**: WHITE LED (Output: 1 = ON, 0 = OFF)
+- **GPIO 39**: GREEN Push Button (Input Pull-Up: 0 = Pressed, 1 = Released)
+- **GPIO 38**: WHITE Push Button (Input Pull-Up: 0 = Pressed, 1 = Released)
+- **GPIO 21**: SSD1306 OLED SCL / SCK
+- **GPIO 47**: SSD1306 OLED SDA
+- **GPIO 41 & 42**: Shared I2S Clocks (BCLK=41, WS=42 for INMP441 Mic & MAX98357A Amp)
+- **GPIO 2**: MAX98357A Amp DIN
+- **GPIO 1**: INMP441 Mic SD
+
+## Rules & Tool Priority
+1. **TOOL FIRST MANDATE**: For any hardware action (e.g. "turn off LED", "turn on LED", "check green button"), call `gpio_write` or `gpio_read` FIRST before returning any text.
+2. **NEVER ask for pin numbers**. Pin mapping is fixed as listed above.
+3. When asked to "turn on the white LED", immediately execute tool call `gpio_write {"pin": 40, "state": 1}`.
+4. When asked to "turn off the white LED", immediately execute tool call `gpio_write {"pin": 40, "state": 0}`.
+5. When asked to check green button, immediately execute tool call `gpio_read {"pin": 39}`.
+6. When asked to check white button, immediately execute tool call `gpio_read {"pin": 38}`.
+
+## Examples
+
+### Example 1: Turn off White LED
+User: "Turn off the white LED light"
+→ FIRST STEP: Invoke tool `gpio_write {"pin": 40, "state": 0}`
+→ Output: `{"status":"success","pin":40,"state":0}`
+→ Response: "The white LED on GPIO 40 has been turned OFF."
+
+### Example 2: Turn on White LED
+User: "Open the white LED light"
+→ FIRST STEP: Invoke tool `gpio_write {"pin": 40, "state": 1}`
+→ Output: `{"status":"success","pin":40,"state":1}`
+→ Response: "The white LED on GPIO 40 has been turned ON."
+
+### Example 3: Check Green Button
+User: "Check if the green button is pressed"
+→ FIRST STEP: Invoke tool `gpio_read {"pin": 39}`
+→ Output: `{"status":"success","pin":39,"state":0}`
+→ Response: "The green button on GPIO 39 is currently PRESSED (LOW)."
+""",
+    },
+    {
+        "name": "weather",
+        "content": """# Weather
+
+Get current weather and forecasts using web_search.
+
+## When to use
+When the user asks about weather, temperature, or forecasts.
+
+## How to use
+1. Use get_current_time to know the current date
+2. Use web_search with a query like "weather in [city] today"
+3. Extract temperature, conditions, and forecast from results
+4. Present in a concise, friendly format
+
+## Example
+User: "What's the weather in Tokyo?"
+→ get_current_time
+→ web_search "weather Tokyo today February 2026"
+→ "Tokyo: 8°C, partly cloudy. High 12°C, low 4°C. Light wind from the north."
+""",
+    },
+    {
+        "name": "skill-creator",
+        "content": """# Skill Creator
+
+Create new skills for MimiClaw.
+
+## When to use
+When the user asks to create a new skill, teach the bot something, or add a new capability.
+
+## How to create a skill
+1. Choose a short, descriptive name (lowercase, hyphens ok)
+2. Write a SKILL.md file with this structure:
+   - `# Title` — clear name
+   - Brief description paragraph
+   - `## When to use` — trigger conditions
+   - `## How to use` — step-by-step instructions
+   - `## Example` — concrete example (optional but helpful)
+3. Save to `/spiffs/skills/<name>.md` using write_file
+4. The skill will be automatically available after the next conversation
+
+## Best practices
+- Keep skills concise — the context window is limited
+- Focus on WHAT to do, not HOW (the agent is smart)
+- Include specific tool calls the agent should use
+- Test by asking the agent to use the new skill
+
+## Example
+To create a "translate" skill:
+write_file path="/spiffs/skills/translate.md" content="# Translate\\n\\nTranslate text between languages.\\n\\n## When to use\\nWhen the user asks to translate text.\\n\\n## How to use\\n1. Identify source and target languages\\n2. Translate directly using your language knowledge\\n3. For specialized terms, use web_search to verify\\n"
+""",
+    },
+]
+
+
+def _seed_skills() -> list:
+    """Build the default skill records (same shape add_skill produces)."""
+    return [
+        {
+            "id": secrets.token_hex(4),
+            "name": s["name"],
+            "filename": _skill_filename(s["name"]),
+            "content": s["content"],
+            "enabled": True,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        for s in _DEFAULT_SKILLS
+    ]
+
 
 def _default_config() -> dict:
     return {
@@ -84,6 +238,7 @@ def _default_config() -> dict:
             "device": 1,
             "jobs": 1,
             "avatar": 1,
+            "skills": 1,
         },
         "user_md": _DEFAULT_USER_MD,
         "soul_md": _DEFAULT_SOUL_MD,
@@ -94,6 +249,7 @@ def _default_config() -> dict:
             "sync_interval_s": 300,
         },
         "jobs": [],
+        "skills": _seed_skills(),
         # Dashboard-only: the agent avatar's dress-up state. Intentionally
         # excluded from the device bundle (the ESP32 doesn't render it).
         "avatar": {
@@ -306,6 +462,136 @@ def delete_job(job_id: str) -> dict:
         _bump(cfg, "jobs")
         _save_unlocked(cfg)
         return cfg
+
+
+# ── Skills (web-managed skill markdown files) ─────────────────────
+#
+# Merge contract with the device (mirrors jobs): every skill stored here is
+# implicitly source="web". The device tracks which skill files it received
+# from this store and only replaces/removes those — skills the agent created
+# on-device (write_file to /spiffs/skills/) and skills from the flash image
+# are never touched. A disabled skill is simply excluded from the sync
+# payload, so the device deletes its file; the content stays here.
+
+_SLUG_RE = re.compile(r"[^a-z0-9-]+")
+
+
+def _skill_filename(name: str) -> str:
+    """Sanitize a skill name into a SPIFFS-safe filename slug."""
+    slug = _SLUG_RE.sub("-", name.strip().lower().replace("_", "-"))
+    slug = re.sub(r"-{2,}", "-", slug).strip("-")[:SKILL_NAME_MAX] or "skill"
+    return f"{slug}.md"
+
+
+def _validate_skill_payload(payload: dict, require_all: bool = True) -> str | None:
+    name = payload.get("name")
+    if require_all or name is not None:
+        if not (name or "").strip():
+            return "Skill name is required"
+        if len(name.strip()) > SKILL_NAME_MAX:
+            return f"Skill name must be at most {SKILL_NAME_MAX} characters"
+
+    content = payload.get("content")
+    if require_all or content is not None:
+        if not (content or "").strip():
+            return "Skill content is required"
+        if len(content.encode("utf-8")) > SKILL_MAX_CONTENT:
+            return f"Skill content must be at most {SKILL_MAX_CONTENT} bytes"
+        if not content.lstrip().startswith("#"):
+            return "Skill must start with a '# Title' heading"
+
+    if "enabled" in payload and not isinstance(payload["enabled"], bool):
+        return "enabled must be true or false"
+
+    return None
+
+
+def add_skill(payload: dict) -> tuple[dict, str | None]:
+    """Create a web-managed skill. Returns (config, error_string)."""
+    error = _validate_skill_payload(payload)
+    if error:
+        return get_config(), error
+
+    skill = {
+        "id": secrets.token_hex(4),
+        "name": payload["name"].strip()[:SKILL_NAME_MAX],
+        "filename": _skill_filename(payload["name"]),
+        "content": payload["content"],
+        "enabled": bool(payload.get("enabled", True)),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    with _lock:
+        cfg = _load_unlocked()
+        if len(cfg["skills"]) >= SKILL_MAX_COUNT:
+            return cfg, f"Skill limit reached ({SKILL_MAX_COUNT}). Delete a skill first."
+        if any(s["filename"] == skill["filename"] for s in cfg["skills"]):
+            return cfg, f"A skill named '{skill['name']}' already exists"
+        cfg["skills"].append(skill)
+        _bump(cfg, "skills")
+        _save_unlocked(cfg)
+        return cfg, None
+
+
+def update_skill(skill_id: str, payload: dict) -> tuple[dict, str | None]:
+    """Edit an existing web skill. Returns (config, error)."""
+    error = _validate_skill_payload(payload, require_all=False)
+    if error:
+        return get_config(), error
+
+    with _lock:
+        cfg = _load_unlocked()
+        skill = next((s for s in cfg["skills"] if s["id"] == skill_id), None)
+        if not skill:
+            return cfg, f"Skill {skill_id} not found"
+
+        if "name" in payload and payload["name"]:
+            new_name = payload["name"].strip()[:SKILL_NAME_MAX]
+            new_filename = _skill_filename(new_name)
+            if any(
+                s["filename"] == new_filename and s["id"] != skill_id
+                for s in cfg["skills"]
+            ):
+                return cfg, f"A skill named '{new_name}' already exists"
+            skill["name"] = new_name
+            skill["filename"] = new_filename
+        if "content" in payload and payload["content"] is not None:
+            skill["content"] = payload["content"]
+        if "enabled" in payload:
+            skill["enabled"] = bool(payload["enabled"])
+
+        _bump(cfg, "skills")
+        _save_unlocked(cfg)
+        return cfg, None
+
+
+def delete_skill(skill_id: str) -> tuple[dict, str | None]:
+    with _lock:
+        cfg = _load_unlocked()
+        remaining = [s for s in cfg["skills"] if s["id"] != skill_id]
+        if len(remaining) == len(cfg["skills"]):
+            return cfg, f"Skill {skill_id} not found"
+        cfg["skills"] = remaining
+        _bump(cfg, "skills")
+        _save_unlocked(cfg)
+        return cfg, None
+
+
+def skills_sync_bundle(cfg: dict) -> dict:
+    """Payload for GET /api/skills/sync (the ESP32). Enabled skills only —
+    a disabled skill's absence is what makes the device delete its file."""
+    return {
+        "version": cfg["versions"]["skills"],
+        "skills": [
+            {
+                "id": s["id"],
+                "name": s["name"],
+                "filename": s["filename"],
+                "content": s["content"],
+            }
+            for s in cfg["skills"] if s["enabled"]
+        ],
+    }
 
 
 # ── Validation / helpers ──────────────────────────────────────────

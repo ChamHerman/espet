@@ -91,8 +91,8 @@ esp_err_t context_build_system_prompt(char *buf, size_t size)
         off += snprintf(buf + off, size - off, "\n## Recent Notes\n\n%s\n", recent_buf);
     }
 
-    /* Skills */
-    char skills_buf[2048];
+    /* Skills — 3 KB so a 16-skill catalog isn't silently truncated */
+    char skills_buf[3072];
     size_t skills_len = skill_loader_build_summary(skills_buf, sizeof(skills_buf));
     if (skills_len > 0) {
         off += snprintf(buf + off, size - off,

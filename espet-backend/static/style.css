@@ -195,7 +195,7 @@ body {
 
 /* ── Main column ──────────────────────────────────────────── */
 
-.main { padding: 22px 30px 60px; max-width: 1080px; width: 100%; }
+.main { padding: 22px 30px 60px; max-width: 1080px; width: 100%; margin-inline: auto; }
 
 .topbar {
   display: flex;
