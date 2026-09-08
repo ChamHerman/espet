@@ -9,3 +9,17 @@ GPIO 2  | MAX98357A Amp (DIN)
 GPIO 1  | INMP441 Mic Data (SD)
 5V  | INMP441 Mic Data (VCC) 
 GND  | INMP441 Mic Data (GND + L/R) 
+
+
+GPIO 21 | SSD1306 OLED SCL ,2
+GPIO 47 | SSD1306 OLED SDA, 1
+GPIO 39  | GREEN Push Button (Trigger)     | GPIO (Input Pull-Up) , 41
+GPIO 40 | WHITE LED , 42 
+GPIO 41  | INMP441 Mic Data (SCK) + MAX98357A Amp (BCLK) , 38
+GPIO 42  | INMP441 Mic Data (WS) + MAX98357A Amp (LRC), 39
+GPIO 2  | MAX98357A Amp (DIN) , 21
+GPIO 1  | INMP441 Mic Data (SD) ,40  
+5V  | INMP441 Mic Data (VCC) 
+GND  | INMP441 Mic Data (GND + L/R) 
+
+
