@@ -1,18 +1,37 @@
 {
   "name": "espet-backend-assets",
   "private": true,
-  "description": "Front-end vendor assets for the ESPET dashboard (built with esbuild, output committed to static/vendor)",
+  "description": "Front-end assets for the ESPET dashboard (React + lobe-ui app and 3D toy bundle, output committed to static/vendor)",
   "type": "module",
   "scripts": {
+    "install:deps": "npm install --legacy-peer-deps --no-audit --no-fund",
     "dev:win": "venv\\Scripts\\python.exe -m uvicorn main:app --reload --host 0.0.0.0 --port 8000",
     "dev:mac": "source venv/bin/activate && python main.py",
-    "build:vendor": "esbuild tools/toy-entry.js --bundle --format=iife --global-name=ToyAgent --outfile=static/vendor/toy.bundle.js --minify"
+    "build:vendor": "esbuild tools/toy-entry.js --bundle --format=iife --global-name=ToyAgent --outfile=static/vendor/toy.bundle.js --minify",
+    "build:app": "node tools/build-app.mjs",
+    "build:app:stub": "node tools/build-app.mjs --stub",
+    "build": "npm run build:vendor && npm run build:app"
   },
   "dependencies": {
-    "animejs": "^4.1.1",
+    "@lobehub/charts": "^5.4.0",
+    "@lobehub/editor": "^4.26.2",
+    "@lobehub/fluent-emoji": "^4.1.1",
+    "@lobehub/icons": "^5.18.0",
+    "@lobehub/ui": "^5.40.1",
+    "antd": "^6.1.1",
+    "motion": "^12.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
     "three": "^0.185.1"
   },
   "devDependencies": {
-    "esbuild": "^0.25.0"
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.6.0"
+  },
+  "allowScripts": {
+    "esbuild@0.25.12": true,
+    "@lobehub/editor@4.27.0": true
   }
 }

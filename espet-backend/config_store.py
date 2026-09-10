@@ -61,7 +61,7 @@ _DEFAULT_USER_MD = """# User Profile
 - Timezone: (not set)
 """
 
-_DEFAULT_SOUL_MD = """I am MimiClaw, a personal AI assistant running on an ESP32-S3 microcontroller.
+_DEFAULT_SOUL_MD = """I am ESPET, a personal AI assistant running on an ESP32-S3 microcontroller.
 
 Personality:
 - Helpful and friendly
@@ -80,7 +80,7 @@ Behavior Rules:
 
 _DEFAULT_MEMORY_MD = """# Long-term Memory
 
-(empty - MimiClaw will write memories here as it learns)
+(empty - ESPET will write memories here as it learns)
 """
 
 # Default skill files — mirrors spiffs_data/skills/ so the dashboard starts
@@ -184,7 +184,7 @@ User: "What's the weather in Tokyo?"
         "name": "skill-creator",
         "content": """# Skill Creator
 
-Create new skills for MimiClaw.
+Create new skills for ESPET.
 
 ## When to use
 When the user asks to create a new skill, teach the bot something, or add a new capability.
@@ -244,7 +244,7 @@ def _default_config() -> dict:
         "soul_md": _DEFAULT_SOUL_MD,
         "memory_md": _DEFAULT_MEMORY_MD,
         "device": {
-            "name": "MimiClaw",
+            "name": "ESPET",
             "timezone": "Asia/Kuala_Lumpur",
             "sync_interval_s": 300,
         },
