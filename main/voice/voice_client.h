@@ -1,0 +1,56 @@
+/*
+ * voice_client.h — hands-free voice pipeline (WakeNet wake word + backend STT/TTS)
+ *
+ * Audio format contract with the backend (api/voice_router.py):
+ *   → STT: raw 16 kHz mono 16-bit PCM  (POST /api/voice/transcribe)
+ *   ← TTS: WAV 16 kHz mono 16-bit PCM  (POST /api/voice/tts)
+ *
+ * The ESP32 only moves bytes — Whisper and edge-tts run on the backend,
+ * and wake-word detection (esp-sr WakeNet, "Hi ESP") runs on-chip.
+ */
+
+#pragma once
+
+#include "esp_err.h"
+#include <stddef.h>
+#include <stdint.h>
+#include <stdbool.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * @brief Start the wake-word listener ("Hi ESP" → Yes? → command → reply).
+ *
+ * Loads the WakeNet model from the "model" partition, pre-caches the
+ * "Yes?" ack WAV from the backend, and spawns the listener task.
+ * Call once from app_main after WiFi is up (ack fetch needs the network;
+ * if it fails the ack falls back to a beep and retries are not needed).
+ */
+esp_err_t voice_client_start(void);
+
+/**
+ * @brief Stop the wake listener (task self-deletes on the next tick).
+ */
+void voice_client_stop(void);
+
+/**
+ * @brief Speak a reply: fetch TTS audio from the backend and play it.
+ *
+ * Called by the outbound dispatcher for system:"voice" replies. Blocking
+ * for the duration of fetch+playback (runs on the dispatcher's context);
+ * returns false if the pipeline is already busy.
+ */
+bool voice_client_speak(const char *text);
+
+/**
+ * @brief Legacy entry: open the command window directly (no wake word).
+ *
+ * Kept for manual/CLI triggering; not wired to any button.
+ */
+void voice_client_on_ptt_stop(void);
+
+#ifdef __cplusplus
+}
+#endif

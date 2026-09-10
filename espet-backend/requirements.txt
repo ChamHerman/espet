@@ -23,6 +23,11 @@ aiosqlite>=0.20.0
 # Security
 cryptography>=43.0.0
 
+# Voice pipeline (STT/TTS) — see api/voice_router.py
+faster-whisper>=1.0.0
+edge-tts>=6.1.0
+numpy>=1.26.0
+
 # Utilities
 python-dotenv>=1.0.0
 python-multipart>=0.0.9

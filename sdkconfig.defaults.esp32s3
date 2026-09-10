@@ -44,3 +44,15 @@ CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y
 
 # Fix I2C driver conflict between esp32-camera (new driver default) and ssd1306 (legacy driver)
 CONFIG_SCCB_HARDWARE_I2C_DRIVER_LEGACY=y
+
+# --- esp-sr WakeNet (voice wake word "Hi ESP") ---
+# WakeNet models live in the dedicated 2MB "model" partition (see partitions.csv)
+CONFIG_SR_WN_WN9_HIESP=y
+
+# Allow FreeRTOS task stacks in PSRAM (voice_wake task; internal heap too fragmented)
+CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
+
+# Software AES for TLS: the HW AES accelerator needs on-demand internal-RAM DMA
+# allocations that intermittently fail under memory pressure ("esp-aes: Failed
+# to allocate memory" -> LLM call fails). Payloads here are tiny; SW AES is fine.
+CONFIG_MBEDTLS_HARDWARE_AES=n

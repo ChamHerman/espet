@@ -66,6 +66,7 @@ static void event_handler(void *arg, esp_event_base_t event_base,
         ESP_LOGI(TAG, "Connected! IP: %s", s_ip_str);
         s_retry_count = 0;
         s_connected = true;
+        esp_wifi_set_ps(WIFI_PS_NONE);
 
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
@@ -127,6 +128,7 @@ esp_err_t wifi_manager_start(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
+    esp_wifi_set_ps(WIFI_PS_NONE);
 
     return ESP_OK;
 }

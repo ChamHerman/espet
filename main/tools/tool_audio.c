@@ -1,39 +1,46 @@
 /*
- * tool_audio.c — I2S Microphone Capture (INMP441)
+ * tool_audio.c — I2S Audio: INMP441 Microphone (RX) + MAX98357A Speaker (TX)
  *
- * Hardware (ESP32-S3, RX-only on I2S_NUM_0):
- *   GPIO 41 → BCLK  (INMP441 SCK  — clock driven by ESP32 as master)
- *   GPIO 42 → WS    (INMP441 WS   — word select / L/R clock)
- *   GPIO  1 ← DIN   (INMP441 SD   — mic serial data out → ESP32 RX)
- *   GPIO  2   DOUT  (MAX98357A DIN — not used, no speaker connected yet)
+ * Hardware (ESP32-S3, full-duplex TX+RX pair on I2S_NUM_0):
+ *   GPIO 38 → BCLK  (shared: INMP441 SCK + MAX98357A BCLK)
+ *   GPIO 39 → WS    (shared: INMP441 WS  + MAX98357A LRC)
+ *   GPIO 40 ← DIN   (INMP441 SD   → ESP32 RX data)
+ *   GPIO 21 → DOUT  (ESP32 TX data → MAX98357A DIN)
  *
- * NOTE: RX-only mode (NULL tx_handle) — no speaker, no full-duplex needed.
- *   Full-duplex mode required TX to be enabled for BCLK/WS to assert.
- *   RX-only is simpler and eliminates that dependency.
+ * Full-duplex notes:
+ *   Both channels are allocated as one TX+RX pair on I2S_NUM_0 (single
+ *   i2s_new_channel call) so they share BCLK/WS — the two chips are wired
+ *   to the same clock lines per .agent/ESPET_PINS.MD. Both channels stay
+ *   ENABLED from init and are never toggled at runtime:
+ *     - RX reads run continuously: the wake-word engine (voice_client.c)
+ *       consumes the stream; command capture funnels into s_pcm_buf.
+ *     - TX sits idle with auto_clear=true → outputs constant zeros (silence).
+ *   Disabling either side of a duplex pair tears down the shared clock,
+ *   so runtime enable/disable is avoided entirely.
  *
- * INMP441 I2S format:
+ * INMP441 (RX) I2S format:
  *   - Philips I2S standard
  *   - 24-bit audio data, MSB-justified, in a 32-bit I2S slot
  *   - L/R pin = GND → data appears on LEFT channel
  *   - Layout: [LEFT_32bit][RIGHT_32bit] per stereo frame
- *   - Valid bits: bits 31..8 (upper 24 bits of the 32-bit word)
- *   - We read 32-bit words and right-shift 8 to get signed 24-bit,
- *     or right-shift 16 to get signed 16-bit PCM for speech.
+ *   - Valid bits: bits 31..8; int16 extraction: raw >> 16
  *
- * DMA buffer sizing:
+ * MAX98357A (TX) I2S format:
+ *   - Philips I2S standard, 32-bit slot, stereo
+ *   - The SD pin selects L / R / (L+R)/2 mix depending on board wiring,
+ *     so every mono sample is written to BOTH slots (always audible).
+ *
+ * DMA sizing:
  *   data_bit_width = 32BIT, slot_mode = STEREO
  *   → i2s_channel_read returns: (frames × 2 slots × 4 bytes) per read
- *   → chunk_bytes = chunk_frames × 2 × sizeof(int32_t)   [FIXED from 16BIT bug]
  *
- * Current mode: Hardware Verification
- *   Hold green button → capture PCM
- *   Release           → dump stats + hex to serial
+ * Voice flow (hands-free, no button):
+ *   Say "Hi ESP" → wake → "Yes?" ack → speak command → STT → agent → TTS.
+ *   Implemented in voice/voice_client.c using tool_audio_rx_read().
  *
- * Future voice pipeline (TODO markers [PIPELINE-N]):
- *   [PIPELINE-1] POST PCM to /api/transcribe → transcript text
- *   [PIPELINE-2] Push transcript into agent_loop message bus
- *   [PIPELINE-3] Receive TTS WAV from /api/tts
- *   [PIPELINE-4] Play WAV via MAX98357A (add TX channel back, use full-duplex)
+ * Verification tools (serial REPL or LLM):
+ *   tool_exec audio_play_tone  "{}"   # speaker only: 440 Hz sine
+ *   tool_exec audio_record_test "{}"  # mic only: timed capture + stats
  */
 
 #include "tools/tool_audio.h"
@@ -46,10 +53,16 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "cJSON.h"
+#include "voice/voice_client.h"
 
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 static const char *TAG = "tool_audio";
 
@@ -67,9 +80,7 @@ static const char *TAG = "tool_audio";
 
 /* DMA sizing: 4 descriptors × 512 frames.
  * At 16 kHz stereo 32-bit: 1 frame = 8 bytes.
- * One descriptor holds 512×8 = 4096 bytes ≈ 32 ms of audio.
- * Smaller dma_frame_num → lower latency, more CPU interrupts.
- * Larger → higher latency, fewer interrupts. 512 is a good balance. */
+ * One descriptor holds 512×8 = 4096 bytes ≈ 32 ms of audio. */
 #define AUDIO_DMA_DESC_COUNT    4
 #define AUDIO_DMA_FRAME_COUNT   512
 
@@ -79,9 +90,7 @@ static const char *TAG = "tool_audio";
 /* Stereo 32-bit: 2 slots × 4 bytes per frame */
 #define AUDIO_READ_CHUNK_BYTES  (AUDIO_READ_CHUNK_FRAMES * 2 * sizeof(int32_t))
 
-/* Read timeout: wait up to 500 ms for DMA to fill one chunk.
- * At 16 kHz, 256 frames = 16 ms. 500 ms is very generous — if we still
- * timeout, the I2S peripheral is definitely not clocking. */
+/* Read timeout passed to i2s_channel_read (ms) */
 #define AUDIO_READ_TIMEOUT_MS   500
 
 /* Debug thresholds */
@@ -90,38 +99,86 @@ static const char *TAG = "tool_audio";
 #define AUDIO_RMS_THRESHOLD     500
 
 /* -----------------------------------------------------------------------
- * I2S channel handle — RX only (no speaker)
+ * TX playback constants (MAX98357A on GPIO 21)
  * --------------------------------------------------------------------- */
-static i2s_chan_handle_t s_rx_handle   = NULL;
+#define AUDIO_TX_CHUNK_FRAMES   256     /* 16 ms per write chunk */
+#define AUDIO_TX_CHUNK_BYTES    (AUDIO_TX_CHUNK_FRAMES * 2 * sizeof(int32_t))
+#define AUDIO_TX_WRITE_TIMEOUT_MS 1000
+
+#define TONE_DEFAULT_FREQ_HZ    440
+#define TONE_MIN_FREQ_HZ        20
+#define TONE_MAX_FREQ_HZ        8000
+#define TONE_DEFAULT_MS         500
+#define TONE_MAX_MS             5000
+#define TONE_DEFAULT_VOL        0.5f
+#define TONE_MAX_VOL            1.0f
+
+/* -----------------------------------------------------------------------
+ * I2S channel handles — full-duplex pair on I2S_NUM_0
+ * --------------------------------------------------------------------- */
+static i2s_chan_handle_t s_tx_handle       = NULL;
+static i2s_chan_handle_t s_rx_handle       = NULL;
 static bool              s_i2s_initialized = false;
 
 /* -----------------------------------------------------------------------
- * Capture state
+ * Capture / playback state
  * --------------------------------------------------------------------- */
-static volatile bool s_recording          = false;
-static TaskHandle_t  s_capture_task_handle = NULL;
-static int16_t      *s_pcm_buf            = NULL; /* PSRAM — mono 16-bit */
-static size_t        s_pcm_samples_captured = 0;
-static uint32_t      s_record_start_ms    = 0;
-static uint32_t      s_record_duration_ms = 0;
+static volatile bool s_recording              = false;
+static volatile bool s_playing                = false;
+/* Whole speaker-session gate: set BEFORE the TTS HTTP download and cleared
+ * after playback. The RX feeder parks for the entire session — racing only
+ * the playback phase still corrupted TX (field: noise burst instead of
+ * speech, "ESPeting..."). */
+static volatile bool s_speaker_busy           = false;
+static TaskHandle_t  s_capture_task_handle    = NULL;
+static int16_t      *s_pcm_buf                = NULL; /* PSRAM — mono 16-bit */
+static size_t        s_pcm_samples_captured   = 0;
+static size_t        s_capture_max            = 0; /* armed capture limit */
+
+/* ---- RX ring buffer (fed by the high-prio mic_feeder task) ---- */
+#define RX_RING_SAMPLES  65536   /* 4.096 s @16 kHz — MUST be a power of two */
+#define RX_RING_MASK     (RX_RING_SAMPLES - 1)
+static int16_t       *s_rx_ring      = NULL;    /* PSRAM */
+static volatile size_t s_rx_ring_w   = 0;       /* write index (feeder) */
+static volatile size_t s_rx_ring_r   = 0;       /* read index (consumers) */
+static TaskHandle_t   s_feeder_handle = NULL;
+static volatile bool  s_feeder_run    = false;
+/* debug: DMA->ring health (read by voice_task's 5 s report) */
+volatile uint32_t s_feeder_reads  = 0;   /* dma read calls with data */
+volatile uint32_t s_feeder_zeros  = 0;   /* all-zero reads (no mic data!) */
+volatile uint32_t s_ring_written  = 0;   /* samples pushed into ring */
+
+static void mic_feeder_task(void *arg);
+static uint32_t      s_record_start_ms        = 0;
+static uint32_t      s_record_duration_ms     = 0;
 
 /* -----------------------------------------------------------------------
  * Forward declarations
  * --------------------------------------------------------------------- */
 static esp_err_t audio_play_tone_execute(const char *in, char *out, size_t out_sz);
 static esp_err_t audio_record_test_execute(const char *in, char *out, size_t out_sz);
+static esp_err_t audio_spktest_execute(const char *in, char *out, size_t out_sz);
 static void      capture_task(void *arg);
 static void      dump_capture_stats(void);
 static void      log_gpio_states(void);
+static esp_err_t play_tone(uint32_t freq_hz, uint32_t duration_ms, float vol);
+static const char *mic_verdict(double rms);
 
 /* -----------------------------------------------------------------------
  * mimi_tool_t descriptors (extern in header)
  * --------------------------------------------------------------------- */
 mimi_tool_t audio_play_tone_tool = {
     .name        = "audio_play_tone",
-    .description = "Stub: speaker not connected. Returns an error message. "
-                   "[PIPELINE-4] Wire TX channel back when MAX98357A speaker is added.",
-    .input_schema_json = "{\"type\":\"object\",\"properties\":{},\"required\":[]}",
+    .description = "Play a tone through the MAX98357A speaker. Verifies audio output. "
+                   "Optional params: freq_hz (default 440, 20-8000), "
+                   "duration_ms (default 500, max 5000), volume (0.05-1.0, default 0.5).",
+    .input_schema_json =
+        "{\"type\":\"object\","
+        "\"properties\":{"
+        "\"freq_hz\":{\"type\":\"integer\",\"description\":\"Tone frequency Hz (default 440, 20-8000)\"},"
+        "\"duration_ms\":{\"type\":\"integer\",\"description\":\"Duration ms (default 500, max 5000)\"},"
+        "\"volume\":{\"type\":\"number\",\"description\":\"0.05-1.0 (default 0.5)\"}}"
+        ",\"required\":[]}",
     .execute = audio_play_tone_execute,
 };
 
@@ -138,50 +195,50 @@ mimi_tool_t audio_record_test_tool = {
     .execute = audio_record_test_execute,
 };
 
+mimi_tool_t audio_spktest_tool = {
+    .name        = "audio_spktest",
+    .description = "4-stage speaker diagnostic (listen and note each stage). "
+                   "1: 440 Hz full-volume tone (amp/wiring/power). "
+                   "2: locally generated 1 kHz WAV through the playback parser (no network). "
+                   "3: volume ramp 1.0/0.4/0.15 (audibility threshold — TTS speech sits at "
+                   "~6% full scale, quieter than any of these). "
+                   "4: full pipeline — server TTS 'Speaker test, one, two, three'.",
+    .input_schema_json = "{\"type\":\"object\",\"properties\":{},\"required\":[]}",
+    .execute = audio_spktest_execute,
+};
+
 /* =======================================================================
  * GPIO Diagnostics
  *
  * Logs the level of every audio-related pin so we can spot wiring issues
  * without an oscilloscope. Called at init and before each capture.
  *
- * Expected idle states:
- *   GPIO  1 (DIN/SD)  — floating or LOW when no I2S clock. Irrelevant at idle.
- *   GPIO 41 (BCLK)    — LOW before I2S is enabled; toggles at ~1 MHz when active.
- *   GPIO 42 (WS)      — LOW before I2S is enabled; toggles at ~16 kHz when active.
- *   GPIO 39 (BTN)     — HIGH (pull-up, not pressed).
+ * BCLK/WS are driven by the I2S controller and run permanently in
+ * full-duplex mode, so their idle level reads 0 or 1 depending on where
+ * in the waveform the read lands — neither is an error.
  * ===================================================================== */
 static void log_gpio_states(void)
 {
-    int din  = gpio_get_level((gpio_num_t)MIMI_GPIO_I2S_DIN);   /* GPIO  1 */
-    int dout = gpio_get_level((gpio_num_t)MIMI_GPIO_I2S_DOUT);  /* GPIO  2 */
-    int bclk = gpio_get_level((gpio_num_t)MIMI_GPIO_I2S_BCLK);  /* GPIO 41 */
-    int ws   = gpio_get_level((gpio_num_t)MIMI_GPIO_I2S_WS);    /* GPIO 42 */
-    int btn  = gpio_get_level((gpio_num_t)MIMI_GPIO_BTN_GREEN);  /* GPIO 39 */
+    int din  = gpio_get_level((gpio_num_t)MIMI_GPIO_I2S_DIN);
+    int dout = gpio_get_level((gpio_num_t)MIMI_GPIO_I2S_DOUT);
+    int bclk = gpio_get_level((gpio_num_t)MIMI_GPIO_I2S_BCLK);
+    int ws   = gpio_get_level((gpio_num_t)MIMI_GPIO_I2S_WS);
+    int btn  = -1;
+#if (MIMI_GPIO_BTN_CAM >= 0)
+    btn = gpio_get_level((gpio_num_t)MIMI_GPIO_BTN_CAM);
+#endif
 
     ESP_LOGI(TAG, "+------ GPIO STATE SNAPSHOT -------------------------+");
-    ESP_LOGI(TAG, "| GPIO  1 DIN  (INMP441 SD)   = %d  (0=LOW, 1=HIGH) |", din);
-    ESP_LOGI(TAG, "| GPIO  2 DOUT (MAX98357A DIN) = %d  (unused)        |", dout);
-    ESP_LOGI(TAG, "| GPIO 41 BCLK (shared clock)  = %d  (should be 0)   |", bclk);
-    ESP_LOGI(TAG, "| GPIO 42 WS   (word select)   = %d  (should be 0)   |", ws);
-    ESP_LOGI(TAG, "| GPIO 39 BTN  (green, active) = %d  (0=pressed)      |", btn);
+    ESP_LOGI(TAG, "| GPIO %2d DIN  (INMP441 SD)   = %d                  |", MIMI_GPIO_I2S_DIN, din);
+    ESP_LOGI(TAG, "| GPIO %2d DOUT (MAX98357A DIN) = %d                  |", MIMI_GPIO_I2S_DOUT, dout);
+    ESP_LOGI(TAG, "| GPIO %2d BCLK (shared clock)  = %d  (clock runs)    |", MIMI_GPIO_I2S_BCLK, bclk);
+    ESP_LOGI(TAG, "| GPIO %2d WS   (word select)   = %d  (clock runs)    |", MIMI_GPIO_I2S_WS, ws);
+    ESP_LOGI(TAG, "| GPIO %2d BTN  (cam, active)  = %d  (0=pressed)     |", MIMI_GPIO_BTN_CAM, btn);
     ESP_LOGI(TAG, "+-----------------------------------------------------+");
-
-    /* Warn on suspicious pin states */
-    if (bclk == 1) {
-        ESP_LOGW(TAG, "  !! GPIO 41 (BCLK) is HIGH at idle — unexpected. "
-                      "Check for conflict with another peripheral or driver.");
-    }
-    if (ws == 1) {
-        ESP_LOGW(TAG, "  !! GPIO 42 (WS) is HIGH at idle — unexpected.");
-    }
-    if (din == 1) {
-        ESP_LOGW(TAG, "  !! GPIO 1 (DIN) is HIGH at idle — INMP441 data line pulled high? "
-                      "Check VCC and GND connections.");
-    }
 }
 
 /* =======================================================================
- * I2S Initialization — RX-only (INMP441 capture, no TX)
+ * I2S Initialization — full-duplex (INMP441 RX + MAX98357A TX)
  * ===================================================================== */
 
 esp_err_t tool_audio_init(void)
@@ -191,13 +248,13 @@ esp_err_t tool_audio_init(void)
         return ESP_OK;
     }
 
-    ESP_LOGI(TAG, "=== tool_audio_init: INMP441 I2S RX-only ===");
+    ESP_LOGI(TAG, "=== tool_audio_init: full-duplex I2S (INMP441 RX + MAX98357A TX) ===");
     ESP_LOGI(TAG, "Pin map:");
-    ESP_LOGI(TAG, "  BCLK = GPIO %d  (ESP32 drives this — INMP441 SCK)", MIMI_GPIO_I2S_BCLK);
-    ESP_LOGI(TAG, "  WS   = GPIO %d  (ESP32 drives this — INMP441 WS)",  MIMI_GPIO_I2S_WS);
-    ESP_LOGI(TAG, "  DIN  = GPIO %d  (INMP441 SD → ESP32 receives)",     MIMI_GPIO_I2S_DIN);
-    ESP_LOGI(TAG, "  DOUT = GPIO %d  (unused — no speaker)",             MIMI_GPIO_I2S_DOUT);
-    ESP_LOGI(TAG, "Config: %d Hz | 32-bit slot | stereo | Philips std",  AUDIO_SAMPLE_RATE);
+    ESP_LOGI(TAG, "  BCLK = GPIO %d  (shared: INMP441 SCK + MAX98357A BCLK)", MIMI_GPIO_I2S_BCLK);
+    ESP_LOGI(TAG, "  WS   = GPIO %d  (shared: INMP441 WS  + MAX98357A LRC)",  MIMI_GPIO_I2S_WS);
+    ESP_LOGI(TAG, "  DIN  = GPIO %d  (INMP441 SD → ESP32 RX)",                MIMI_GPIO_I2S_DIN);
+    ESP_LOGI(TAG, "  DOUT = GPIO %d  (ESP32 TX → MAX98357A DIN)",             MIMI_GPIO_I2S_DOUT);
+    ESP_LOGI(TAG, "Config: %d Hz | 32-bit slot | stereo | Philips std",      AUDIO_SAMPLE_RATE);
     ESP_LOGI(TAG, "DMA: %d descriptors × %d frames (%d ms per desc)",
              AUDIO_DMA_DESC_COUNT, AUDIO_DMA_FRAME_COUNT,
              (AUDIO_DMA_FRAME_COUNT * 1000) / AUDIO_SAMPLE_RATE);
@@ -206,70 +263,55 @@ esp_err_t tool_audio_init(void)
     log_gpio_states();
 
     /* ------------------------------------------------------------------
-     * Step 1: Allocate RX-only channel.
-     *
-     * KEY FIX vs previous version: pass NULL for tx_handle.
-     * Full-duplex (both TX+RX) required TX to be enabled for BCLK/WS
-     * to assert on the shared bus. RX-only mode lets the ESP32 drive
-     * BCLK+WS purely from the RX channel in master mode — no TX needed.
+     * Step 1: Allocate the TX+RX pair on I2S_NUM_0 in one call.
+     * Passing both handles = full-duplex: both channels share the BCLK/WS
+     * signal generator, matching the shared-clock wiring of the two chips.
+     * auto_clear=true makes the TX channel output constant zeros whenever
+     * no data is queued → digital silence while idle.
      * ------------------------------------------------------------------ */
     i2s_chan_config_t chan_cfg = {
         .id            = I2S_NUM_0,
         .role          = I2S_ROLE_MASTER,   /* ESP32 generates BCLK + WS */
         .dma_desc_num  = AUDIO_DMA_DESC_COUNT,
         .dma_frame_num = AUDIO_DMA_FRAME_COUNT,
-        .auto_clear    = false,             /* RX: irrelevant */
+        .auto_clear    = true,
     };
 
-    ESP_LOGI(TAG, "[1/4] Allocating I2S_NUM_0 RX-only channel...");
-    esp_err_t err = i2s_new_channel(&chan_cfg,
-                                    NULL,          /* tx_handle = NULL → RX-only */
-                                    &s_rx_handle);
+    ESP_LOGI(TAG, "[1/4] Allocating I2S_NUM_0 TX+RX full-duplex pair...");
+    esp_err_t err = i2s_new_channel(&chan_cfg, &s_tx_handle, &s_rx_handle);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "i2s_new_channel FAILED: %s", esp_err_to_name(err));
         ESP_LOGE(TAG, "  Possible causes: another driver already using I2S_NUM_0, "
                       "or insufficient memory.");
         return err;
     }
-    ESP_LOGI(TAG, "[1/4] OK — RX handle: %p", (void *)s_rx_handle);
+    ESP_LOGI(TAG, "[1/4] OK — TX handle: %p | RX handle: %p",
+             (void *)s_tx_handle, (void *)s_rx_handle);
 
     /* ------------------------------------------------------------------
-     * Step 2: Configure Philips I2S standard mode.
-     *
-     * KEY FIX vs previous version:
-     *   Old: data_bit_width = 16BIT  ← BUG — DMA returns 2-byte samples,
-     *        but we read as int32_t (4 bytes) → buffer never fills → timeout
-     *   New: data_bit_width = 32BIT  ← CORRECT — DMA returns full 32-bit
-     *        words matching the INMP441's 32-bit slot width.
-     *
-     * INMP441 slot layout (Philips, L/R=GND → left channel only):
-     *   bit 31..8  = 24 valid audio bits (MSB first)
-     *   bit  7..0  = always zero (padding)
-     *   Frame: [LEFT_32b][RIGHT_32b] — right channel = 0x00000000
-     *
-     * Extraction: left_raw >> 8  → signed 24-bit
-     *             left_raw >> 16 → signed 16-bit (what we store)
+     * Step 2a: RX channel config — INMP441 capture (unchanged, proven).
+     *   32-bit slots, stereo frame, LEFT slot carries data (L/R=GND).
      * ------------------------------------------------------------------ */
-    i2s_std_config_t std_cfg = {
+    i2s_std_config_t rx_cfg = {
         .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(AUDIO_SAMPLE_RATE),
         .slot_cfg = {
-            .data_bit_width = I2S_DATA_BIT_WIDTH_32BIT, /* FIX: was 16BIT */
-            .slot_bit_width = I2S_SLOT_BIT_WIDTH_32BIT, /* Philips slot = 32 */
-            .slot_mode      = I2S_SLOT_MODE_STEREO,     /* INMP441 is a stereo I2S device */
-            .slot_mask      = I2S_STD_SLOT_LEFT,        /* L/R=GND → data on left */
-            .ws_width       = 32,                       /* WS high for 32 BCLK cycles */
-            .ws_pol         = false,                    /* WS low = left channel */
-            .bit_shift      = true,                     /* Philips: MSB 1 BCLK after WS edge */
+            .data_bit_width = I2S_DATA_BIT_WIDTH_32BIT,
+            .slot_bit_width = I2S_SLOT_BIT_WIDTH_32BIT,
+            .slot_mode      = I2S_SLOT_MODE_STEREO,
+            .slot_mask      = I2S_STD_SLOT_LEFT,   /* INMP441 L/R=GND → left */
+            .ws_width       = 32,
+            .ws_pol         = false,
+            .bit_shift      = true,
             .left_align     = false,
             .big_endian     = false,
             .bit_order_lsb  = false,
         },
         .gpio_cfg = {
             .mclk = I2S_GPIO_UNUSED,
-            .bclk = MIMI_GPIO_I2S_BCLK,   /* GPIO 41 — driven by ESP32 */
-            .ws   = MIMI_GPIO_I2S_WS,     /* GPIO 42 — driven by ESP32 */
-            .dout = I2S_GPIO_UNUSED,       /* No TX — was MIMI_GPIO_I2S_DOUT */
-            .din  = MIMI_GPIO_I2S_DIN,    /* GPIO  1 — received from INMP441 */
+            .bclk = MIMI_GPIO_I2S_BCLK,
+            .ws   = MIMI_GPIO_I2S_WS,
+            .dout = I2S_GPIO_UNUSED,
+            .din  = MIMI_GPIO_I2S_DIN,
             .invert_flags = {
                 .mclk_inv = false,
                 .bclk_inv = false,
@@ -278,15 +320,51 @@ esp_err_t tool_audio_init(void)
         },
     };
 
-    ESP_LOGI(TAG, "[2/4] Configuring I2S STD Philips mode...");
-    err = i2s_channel_init_std_mode(s_rx_handle, &std_cfg);
+    /* ------------------------------------------------------------------
+     * Step 2b: TX channel config — MAX98357A playback.
+     *   Same clocks/rate as RX; mono samples are duplicated into BOTH
+     *   slots at write time (SD pin may select L, R or (L+R)/2).
+     * ------------------------------------------------------------------ */
+    i2s_std_config_t tx_cfg = {
+        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(AUDIO_SAMPLE_RATE),
+        .slot_cfg = {
+            .data_bit_width = I2S_DATA_BIT_WIDTH_32BIT,
+            .slot_bit_width = I2S_SLOT_BIT_WIDTH_32BIT,
+            .slot_mode      = I2S_SLOT_MODE_STEREO,
+            .slot_mask      = I2S_STD_SLOT_BOTH,
+            .ws_width       = 32,
+            .ws_pol         = false,
+            .bit_shift      = true,
+            .left_align     = false,
+            .big_endian     = false,
+            .bit_order_lsb  = false,
+        },
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = MIMI_GPIO_I2S_BCLK,
+            .ws   = MIMI_GPIO_I2S_WS,
+            .dout = MIMI_GPIO_I2S_DOUT,
+            .din  = I2S_GPIO_UNUSED,
+            .invert_flags = {
+                .mclk_inv = false,
+                .bclk_inv = false,
+                .ws_inv   = false,
+            },
+        },
+    };
+
+    ESP_LOGI(TAG, "[2/4] Configuring I2S STD Philips mode (TX + RX)...");
+    err = i2s_channel_init_std_mode(s_tx_handle, &tx_cfg);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "i2s_channel_init_std_mode FAILED: %s", esp_err_to_name(err));
-        ESP_LOGE(TAG, "  Possible causes: invalid GPIO numbers, pin conflict,");
-        ESP_LOGE(TAG, "  or I2S peripheral not supported in this build config.");
+        ESP_LOGE(TAG, "TX i2s_channel_init_std_mode FAILED: %s", esp_err_to_name(err));
         goto fail;
     }
-    ESP_LOGI(TAG, "[2/4] OK — Philips 32-bit stereo configured");
+    err = i2s_channel_init_std_mode(s_rx_handle, &rx_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "RX i2s_channel_init_std_mode FAILED: %s", esp_err_to_name(err));
+        goto fail;
+    }
+    ESP_LOGI(TAG, "[2/4] OK — Philips 32-bit stereo configured on both channels");
 
     /* ------------------------------------------------------------------
      * Step 3: Allocate PSRAM capture buffer.
@@ -309,36 +387,130 @@ esp_err_t tool_audio_init(void)
     ESP_LOGI(TAG, "[3/4] OK — PCM buffer at %p (%u samples max)",
              (void *)s_pcm_buf, (unsigned)AUDIO_MAX_SAMPLES);
 
+    /* ------------------------------------------------------------------
+     * Step 4: Enable BOTH channels once. TX starts clocking immediately
+     * (outputs silence via auto_clear); RX DMA starts filling. Neither
+     * channel is ever disabled at runtime — see header comment.
+     * ------------------------------------------------------------------ */
+    err = i2s_channel_enable(s_tx_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "i2s_channel_enable(TX) FAILED: %s", esp_err_to_name(err));
+        goto fail;
+    }
+    err = i2s_channel_enable(s_rx_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "i2s_channel_enable(RX) FAILED: %s", esp_err_to_name(err));
+        i2s_channel_disable(s_tx_handle);
+        goto fail;
+    }
     s_i2s_initialized = true;
-    ESP_LOGI(TAG, "[4/4] tool_audio_init COMPLETE");
-    ESP_LOGI(TAG, "  Hold green button (GPIO 39) to capture voice.");
-    ESP_LOGI(TAG, "  Release to see amplitude stats in this console.");
+    ESP_LOGI(TAG, "[4/4] tool_audio_init COMPLETE — TX and RX enabled");
+    ESP_LOGI(TAG, "  Say \"Hi ESP\" to wake the voice assistant.");
+    ESP_LOGI(TAG, "  Serial REPL: tool_exec audio_play_tone \"{}\" to test the speaker.");
     return ESP_OK;
 
 fail:
     if (s_rx_handle) { i2s_del_channel(s_rx_handle); s_rx_handle = NULL; }
+    if (s_tx_handle) { i2s_del_channel(s_tx_handle); s_tx_handle = NULL; }
     if (s_pcm_buf)   { free(s_pcm_buf); s_pcm_buf = NULL; }
+    return err;
+}
+
+/* =======================================================================
+ * Tone generator helpers
+ * ===================================================================== */
+
+/* Fill a TX chunk with a stereo-duplicated sine. Mono sample goes to both
+ * slots so the MAX98357A hears it regardless of SD-pin channel select. */
+static void tone_fill_chunk(int32_t *chunk, size_t frames,
+                            double *phase, double inc, float vol)
+{
+    for (size_t f = 0; f < frames; f++) {
+        int32_t v = (int32_t)(sin(*phase) * (double)vol * 2147483000.0);
+        *phase += inc;
+        if (*phase >= 2.0 * M_PI) {
+            *phase -= 2.0 * M_PI;
+        }
+        chunk[f * 2]     = v;   /* left slot  */
+        chunk[f * 2 + 1] = v;   /* right slot */
+    }
+}
+
+/* Generate and play a sine tone. Blocking for duration_ms.
+ * Guarded by s_playing so concurrent callers can't interleave writes. */
+static esp_err_t play_tone(uint32_t freq_hz, uint32_t duration_ms, float vol)
+{
+    if (!s_i2s_initialized || !s_tx_handle) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_playing || s_recording) {
+        ESP_LOGW(TAG, "play_tone: busy (recording=%d playing=%d)", (int)s_recording, (int)s_playing);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (freq_hz < TONE_MIN_FREQ_HZ || freq_hz > TONE_MAX_FREQ_HZ) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (duration_ms == 0 || duration_ms > TONE_MAX_MS) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    s_playing = true;
+
+    int32_t *chunk = (int32_t *)malloc(AUDIO_TX_CHUNK_BYTES);
+    if (!chunk) {
+        s_playing = false;
+        return ESP_ERR_NO_MEM;
+    }
+
+    double inc   = 2.0 * M_PI * (double)freq_hz / (double)AUDIO_SAMPLE_RATE;
+    double phase = 0.0;
+    size_t total_frames = (size_t)((uint64_t)duration_ms * AUDIO_SAMPLE_RATE / 1000);
+    size_t played_frames = 0;
+    esp_err_t err = ESP_OK;
+
+    ESP_LOGI(TAG, "[SPK] Playing %lu Hz for %lu ms (vol %.2f) on GPIO %d",
+             (unsigned long)freq_hz, (unsigned long)duration_ms, vol, MIMI_GPIO_I2S_DOUT);
+
+    while (played_frames < total_frames) {
+        size_t frames = total_frames - played_frames;
+        if (frames > AUDIO_TX_CHUNK_FRAMES) {
+            frames = AUDIO_TX_CHUNK_FRAMES;
+        }
+        tone_fill_chunk(chunk, frames, &phase, inc, vol);
+
+        size_t written = 0;
+        err = i2s_channel_write(s_tx_handle, chunk,
+                                frames * 2 * sizeof(int32_t), &written,
+                                AUDIO_TX_WRITE_TIMEOUT_MS);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "i2s_channel_write FAILED: %s", esp_err_to_name(err));
+            break;
+        }
+        played_frames += written / (2 * sizeof(int32_t));
+    }
+
+    free(chunk);
+    s_playing = false;
+
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "[SPK] Tone done (%u frames)", (unsigned)played_frames);
+    }
     return err;
 }
 
 /* =======================================================================
  * PTT Capture Task
  *
- * Called by xTaskCreate in tool_audio_ptt_record_start().
+ * Called by xTaskCreate in timed_capture (audio_record_test).
  * Runs on Core 1, priority 7 (above agent loop at 6).
  *
+ * RX (and TX) channels are already enabled from tool_audio_init — this
+ * task only pumps i2s_channel_read into the PSRAM buffer.
+ *
  * Read layout from i2s_channel_read (32-bit data, stereo):
- *   buf[0] = LEFT  channel frame 0  ← INMP441 audio (24-bit in 32-bit word)
- *   buf[1] = RIGHT channel frame 0  ← always 0 (INMP441 L/R=GND sends left only)
- *   buf[2] = LEFT  channel frame 1
- *   buf[3] = RIGHT channel frame 1
- *   ...
- *
- * Extraction to int16_t:
- *   int32_t raw = buf[f*2];          raw = 0xSSSSSS00  (S=sign bits, 00=padding)
- *   int16_t s16 = (int16_t)(raw >> 16);  → upper 16 bits of 24-bit value
- *
- * TODO [PIPELINE-1]: Replace dump_capture_stats() with HTTP POST to backend.
+ *   buf[f*2] = LEFT  ← INMP441 audio (24-bit in 32-bit word)
+ *   buf[f*2+1] = RIGHT ← 0 (L/R=GND)
+ *   int16 = raw >> 16
  * ===================================================================== */
 static void capture_task(void *arg)
 {
@@ -348,36 +520,19 @@ static void capture_task(void *arg)
         ESP_LOGE(TAG, "capture_task: chunk buffer malloc FAILED (%u bytes)",
                  (unsigned)AUDIO_READ_CHUNK_BYTES);
         s_recording = false;
+        s_capture_task_handle = NULL;
         vTaskDelete(NULL);
         return;
     }
 
     ESP_LOGI(TAG, "capture_task: starting — chunk=%u bytes, timeout=%d ms",
              (unsigned)AUDIO_READ_CHUNK_BYTES, AUDIO_READ_TIMEOUT_MS);
-    log_gpio_states();  /* snapshot before enabling I2S */
-
-    /* Enable RX — this asserts BCLK + WS on the GPIO pins */
-    ESP_LOGI(TAG, "capture_task: enabling I2S RX (BCLK/WS will assert now)...");
-    esp_err_t err = i2s_channel_enable(s_rx_handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "capture_task: i2s_channel_enable FAILED: %s", esp_err_to_name(err));
-        ESP_LOGE(TAG, "  This means the I2S peripheral could not start clocking.");
-        free(dma_buf);
-        s_recording = false;
-        vTaskDelete(NULL);
-        return;
-    }
-    ESP_LOGI(TAG, "capture_task: I2S RX enabled — BCLK should now toggle on GPIO %d",
-             MIMI_GPIO_I2S_BCLK);
-
-    /* Short delay to let BCLK stabilise and INMP441 wake up */
-    vTaskDelay(pdMS_TO_TICKS(10));
-    log_gpio_states();  /* snapshot after enabling — BCLK might read 1 or 0 mid-toggle */
+    log_gpio_states();
 
     s_pcm_samples_captured = 0;
     s_record_start_ms = (uint32_t)(esp_timer_get_time() / 1000);
-    uint32_t read_count   = 0;
-    uint32_t error_count  = 0;
+    uint32_t read_count    = 0;
+    uint32_t error_count   = 0;
     uint32_t timeout_count = 0;
 
     ESP_LOGI(TAG, "[MIC] Recording started — max %d s, buf %u KB",
@@ -386,25 +541,24 @@ static void capture_task(void *arg)
 
     while (s_recording && s_pcm_samples_captured < AUDIO_MAX_SAMPLES) {
         size_t bytes_read = 0;
-        err = i2s_channel_read(s_rx_handle, dma_buf,
-                               AUDIO_READ_CHUNK_BYTES, &bytes_read,
-                               pdMS_TO_TICKS(AUDIO_READ_TIMEOUT_MS));
+        esp_err_t err = i2s_channel_read(s_rx_handle, dma_buf,
+                                         AUDIO_READ_CHUNK_BYTES, &bytes_read,
+                                         AUDIO_READ_TIMEOUT_MS);
 
         read_count++;
 
         if (err == ESP_ERR_TIMEOUT) {
             timeout_count++;
-            ESP_LOGW(TAG, "  [read #%u] TIMEOUT after %d ms — DMA empty.",
-                     (unsigned)read_count, AUDIO_READ_TIMEOUT_MS);
+            ESP_LOGW(TAG, "  [read #%u] TIMEOUT — DMA empty.", (unsigned)read_count);
             ESP_LOGW(TAG, "  Possible causes:");
-            ESP_LOGW(TAG, "    (a) BCLK/WS not reaching INMP441 — check wiring GPIO 41,42");
-            ESP_LOGW(TAG, "    (b) INMP441 DIN pin (GPIO 1) not connected to INMP441 SD");
+            ESP_LOGW(TAG, "    (a) BCLK/WS not reaching INMP441 — check wiring GPIO %d,%d",
+                     MIMI_GPIO_I2S_BCLK, MIMI_GPIO_I2S_WS);
+            ESP_LOGW(TAG, "    (b) INMP441 SD not connected to GPIO %d", MIMI_GPIO_I2S_DIN);
             ESP_LOGW(TAG, "    (c) INMP441 VCC not at 3.3V (check power)");
             ESP_LOGW(TAG, "    (d) INMP441 L/R pin not tied to GND (check wiring)");
             if (timeout_count >= 3) {
                 ESP_LOGE(TAG, "  !! %u consecutive timeouts — I2S clock almost certainly not "
                               "reaching INMP441. Stopping capture.", (unsigned)timeout_count);
-                /* Dump GPIO snapshot to help diagnose */
                 log_gpio_states();
                 break;
             }
@@ -424,10 +578,7 @@ static void capture_task(void *arg)
         timeout_count = 0;
 
         /* Convert stereo 32-bit frames → mono int16_t
-         * buf layout: [L0][R0][L1][R1]...
-         * L = INMP441 data (24-bit MSB-justified in 32-bit word)
-         * R = 0x00000000 (INMP441 L/R=GND outputs left only)
-         * int16 = raw >> 16  (upper 16 of 24 valid bits) */
+         * buf layout: [L0][R0][L1][R1]...  L = INMP441 data */
         size_t frames_read = bytes_read / (2 * sizeof(int32_t));
         for (size_t f = 0; f < frames_read && s_pcm_samples_captured < AUDIO_MAX_SAMPLES; f++) {
             int32_t raw_left = dma_buf[f * 2];
@@ -450,9 +601,6 @@ static void capture_task(void *arg)
 
     s_record_duration_ms = (uint32_t)(esp_timer_get_time() / 1000) - s_record_start_ms;
 
-    ESP_LOGI(TAG, "capture_task: disabling I2S RX...");
-    i2s_channel_disable(s_rx_handle);
-
     free(dma_buf);
 
     ESP_LOGI(TAG, "[MIC] Recording stopped — %u samples | %u ms | %u reads | %u errors",
@@ -464,66 +612,309 @@ static void capture_task(void *arg)
 }
 
 /* =======================================================================
- * PTT Public API
+ * Mic feeder task — drains the I2S DMA into the RX ring buffer.
+ *
+ * DMA holds only ~128 ms (4 × 512-frame descriptors); consumers that don't
+ * run continuously (voice_wake at low priority) overflow it and lose audio.
+ * This task runs at prio 7 on core 1 and only shovels bytes (each read is
+ * up to 32 ms of audio, immediately buffered), so other tasks are barely
+ * affected while the ring guarantees the wake engine a gap-free stream.
  * ===================================================================== */
+static void mic_feeder_task(void *arg)
+{
+    /* Descriptor-granular: the driver may return up to 4 DMA descriptors
+     * (~128 ms) per call. The old 256-frame clamp silently discarded 75%
+     * of the mic audio (field: ~4000 samples/s harvested vs 16000 made).
+     * 16 KB static internal buffer (DMA-capable). */
+    static int32_t dma_buf[4096];
+    while (s_feeder_run) {
+        /* Park during a speaker session (TTS download + playback): I2S TX
+         * needs the bus/CPU and racing it corrupted the audio (field: noise
+         * burst instead of speech). RX DMA overruns during the pause —
+         * inaudible; consumers flush the ring afterwards. */
+        if (s_playing || s_speaker_busy) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+        size_t bytes_read = 0;
+        esp_err_t err = i2s_channel_read(s_rx_handle, dma_buf, sizeof(dma_buf),
+                                         &bytes_read, pdMS_TO_TICKS(200));
+        if (err != ESP_OK || bytes_read == 0) {
+            vTaskDelay(1);
+            continue;
+        }
+        size_t frames = bytes_read / (2 * sizeof(int32_t));
+        s_feeder_reads++;
+        int32_t frame_energy = 0;
+        for (size_t f = 0; f < frames; f++) {
+            int16_t s = (int16_t)(dma_buf[f * 2] >> 16);
+            frame_energy += (s < 0 ? -s : s);
+            size_t used = (s_rx_ring_w - s_rx_ring_r) & RX_RING_MASK;
+            if (used >= RX_RING_SAMPLES - 1) {
+                break;   /* ring full — drop oldest implicitly by not writing */
+            }
+            s_rx_ring[s_rx_ring_w] = s;
+            s_rx_ring_w = (s_rx_ring_w + 1) & RX_RING_MASK;
+            s_ring_written++;
+        }
+        if (frame_energy == 0) {
+            s_feeder_zeros++;   /* whole read was exact zeros — mic not clocking! */
+        }
+        /* Pace: each read grabs ~32 ms of audio instantly (DMA is always
+         * full). Without a yield this task spins at prio 7 and starves
+         * IDLE1 (field WDT). One tick per 32 ms still consumes 3x realtime,
+         * and the 4 s ring absorbs the jitter. */
+        vTaskDelay(1);
+    }
+    s_feeder_handle = NULL;
+    vTaskDelete(NULL);
+}
 
-void tool_audio_ptt_record_start(void)
+esp_err_t tool_audio_rx_stream_start(void)
 {
     if (!s_i2s_initialized) {
-        ESP_LOGE(TAG, "ptt_record_start: not initialized — call tool_audio_init() first");
-        return;
+        return ESP_ERR_INVALID_STATE;
     }
-    if (s_recording) {
-        ESP_LOGW(TAG, "ptt_record_start: already recording — ignored");
-        return;
+    if (s_feeder_handle) {
+        return ESP_OK;   /* already running */
+    }
+    if (!s_rx_ring) {
+        s_rx_ring = heap_caps_calloc(RX_RING_SAMPLES, sizeof(int16_t),
+                                     MALLOC_CAP_SPIRAM);
+        if (!s_rx_ring) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    s_rx_ring_w = s_rx_ring_r = 0;
+    s_feeder_run = true;
+
+    /* Internal heap is too fragmented after WiFi/TLS/telegram for a dynamic
+     * task stack (field: xTaskCreate fails). Static task with a PSRAM stack.
+     * Size note: the first 8 KB attempt overflowed (kernel list corruption +
+     * StoreProhibited in vTaskDelay — i2s_channel_read's TLS/queue call chain
+     * is deep); 12 KB in PSRAM is cheap and safe. */
+    static StackType_t *feeder_stack = NULL;
+    static StaticTask_t feeder_tcb;
+    if (!feeder_stack) {
+        feeder_stack = heap_caps_malloc(3072 * sizeof(StackType_t),
+                                        MALLOC_CAP_SPIRAM);
+        if (!feeder_stack) {
+            s_feeder_run = false;
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    s_feeder_handle = xTaskCreateStatic(mic_feeder_task, "mic_feed",
+                                        3072, NULL, 7,
+                                        feeder_stack, &feeder_tcb);
+    if (!s_feeder_handle) {
+        s_feeder_run = false;
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "mic feeder started (4 s ring + 12 KB PSRAM stack)");
+    return ESP_OK;
+}
+
+void tool_audio_rx_stream_stop(void)
+{
+    s_feeder_run = false;
+    /* task self-deletes; do not wait here */
+}
+
+void tool_audio_speaker_session_begin(void)
+{
+    s_speaker_busy = true;
+}
+
+void tool_audio_speaker_session_end(void)
+{
+    s_speaker_busy = false;
+}
+
+/* Pull up to max_out samples from the ring. Returns samples written. */
+size_t tool_audio_ring_read(int16_t *out, size_t max_out, uint32_t timeout_ms)
+{
+    size_t got = 0;
+    int64_t deadline = (int64_t)(esp_timer_get_time() / 1000) + timeout_ms;
+    while (got < max_out) {
+        if (s_rx_ring_w == s_rx_ring_r) {
+            if (got > 0 ||
+                (int64_t)(esp_timer_get_time() / 1000) >= deadline) {
+                break;
+            }
+            vTaskDelay(1);
+            continue;
+        }
+        out[got++] = s_rx_ring[s_rx_ring_r];
+        s_rx_ring_r = (s_rx_ring_r + 1) & RX_RING_MASK;
+    }
+    return got;
+}
+
+size_t tool_audio_ring_available(void)
+{
+    return (s_rx_ring_w - s_rx_ring_r) & RX_RING_MASK;
+}
+
+void tool_audio_ring_flush(void)
+{
+    s_rx_ring_r = s_rx_ring_w;   /* drop everything buffered */
+}
+
+/* =======================================================================
+ * Timed capture helper — used by audio_record_test
+ *
+ * Starts capture_task, lets it run for duration_ms, stops it, and returns
+ * amplitude statistics of what was captured.
+ * ===================================================================== */
+static esp_err_t timed_capture(uint32_t duration_ms, size_t *out_n, uint32_t *out_dur,
+                               double *out_rms, int16_t *out_min, int16_t *out_max)
+{
+    if (!s_i2s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_recording || s_playing) {
+        return ESP_ERR_INVALID_STATE;
     }
 
-    ESP_LOGI(TAG, "[PTT] Green button pressed — starting capture...");
     s_recording = true;
-
     BaseType_t ret = xTaskCreatePinnedToCore(
-        capture_task, "audio_cap", 4096, NULL,
+        capture_task, "audio_cap_t", 4096, NULL,
         7,   /* prio 7: above agent loop (6) so DMA reads are never starved */
         &s_capture_task_handle,
         1);  /* Core 1: keep audio off WiFi core */
-
     if (ret != pdPASS) {
-        ESP_LOGE(TAG, "ptt_record_start: xTaskCreate FAILED — out of task slots or stack?");
         s_recording = false;
+        return ESP_FAIL;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(duration_ms));
+    s_recording = false;
+
+    uint32_t wait_ms = 0;
+    while (s_capture_task_handle != NULL && wait_ms < 1500) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        wait_ms += 10;
+    }
+
+    size_t n = s_pcm_samples_captured;
+    int16_t mn = INT16_MAX, mx = INT16_MIN;
+    int64_t ssq = 0;
+    for (size_t i = 0; i < n; i++) {
+        int16_t s = s_pcm_buf[i];
+        if (s < mn) mn = s;
+        if (s > mx) mx = s;
+        ssq += (int64_t)s * s;
+    }
+
+    if (out_n)   *out_n   = n;
+    if (out_dur) *out_dur = s_record_duration_ms;
+    if (out_min) *out_min = mn;
+    if (out_max) *out_max = mx;
+    if (out_rms) *out_rms = (n > 0) ? sqrt((double)ssq / (double)n) : 0.0;
+    return ESP_OK;
+}
+
+/* =======================================================================
+ * Capture control API (used by the wake-word voice flow, voice_client.c)
+ * ===================================================================== */
+
+bool tool_audio_is_busy(void)
+{
+    return s_recording || s_playing;
+}
+
+/* Drain any queued RX data so a command capture starts "now", not with
+ * audio buffered while the bus was idle. Call right before arming. */
+void tool_audio_rx_flush(void)
+{
+    if (!s_rx_handle) {
+        return;
+    }
+    int32_t scratch[AUDIO_READ_CHUNK_FRAMES * 2];
+    size_t bytes = 0;
+    while (i2s_channel_read(s_rx_handle, scratch, sizeof(scratch),
+                            &bytes, 0) == ESP_OK && bytes > 0) {
+        /* keep draining until dry */
     }
 }
 
-void tool_audio_ptt_record_stop(void)
+/* Start capturing into s_pcm_buf WITHOUT a worker task: the caller's task
+ * pumps tool_audio_rx_read() itself (the wake listener loop already exists,
+ * no need for a second task). Returns false if busy. */
+bool tool_audio_capture_arm(size_t max_samples)
 {
-    if (!s_recording && s_capture_task_handle == NULL) {
-        ESP_LOGW(TAG, "ptt_record_stop: not recording — ignored");
+    if (!s_i2s_initialized || s_recording || s_playing) {
+        return false;
+    }
+    s_pcm_samples_captured = 0;
+    s_capture_max = (max_samples > AUDIO_MAX_SAMPLES) ? AUDIO_MAX_SAMPLES : max_samples;
+    s_record_start_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    tool_audio_ring_flush();   /* stale buffered audio out; capture starts now */
+    s_recording = true;
+    return true;
+}
+
+/* Pump one RX chunk. Works in TWO modes:
+ *   - armed (s_recording): samples are copied to out AND accumulated into
+ *     s_pcm_buf until s_capture_max; returns false when the limit is hit.
+ *   - listening (!s_recording, wake-word mode): samples are only copied to
+ *     out; always returns true (nothing to fill). */
+bool tool_audio_rx_read(int16_t *out, size_t max_out, size_t *out_written,
+                        size_t *captured_total, bool *out_full, uint32_t timeout_ms)
+{
+    *out_written = 0;
+    if (out_full) *out_full = false;
+    if (!s_rx_ring) {
+        return s_recording;
+    }
+
+    /* Both modes consume the RING — the prio-7 feeder is the single DMA
+     * owner (direct DMA reads here used to race it: dual consumers each got
+     * half the audio). Armed mode additionally mirrors into s_pcm_buf. */
+    int64_t deadline = (int64_t)(esp_timer_get_time() / 1000) + timeout_ms;
+    while (*out_written < max_out) {
+        if (s_rx_ring_w == s_rx_ring_r) {
+            if (*out_written > 0 ||
+                (int64_t)(esp_timer_get_time() / 1000) >= deadline) {
+                break;
+            }
+            vTaskDelay(1);
+            continue;
+        }
+        int16_t s = s_rx_ring[s_rx_ring_r];
+        s_rx_ring_r = (s_rx_ring_r + 1) & RX_RING_MASK;
+        if (out) {
+            out[(*out_written)++] = s;
+        } else {
+            (*out_written)++;
+        }
+        if (s_recording) {
+            if (s_pcm_buf && s_pcm_samples_captured < s_capture_max) {
+                s_pcm_buf[s_pcm_samples_captured++] = s;
+            } else if (out_full) {
+                *out_full = true;
+                break;
+            }
+        } else if (captured_total) {
+            *captured_total = 0;
+        }
+    }
+    if (s_recording && captured_total) {
+        *captured_total = s_pcm_samples_captured;
+    }
+    return s_recording ? (s_pcm_samples_captured < s_capture_max) : true;
+}
+
+/* Stop an armed capture and stamp the duration (results available via
+ * tool_audio_get_last_capture). */
+void tool_audio_capture_disarm(void)
+{
+    if (!s_recording) {
         return;
     }
-
-    ESP_LOGI(TAG, "[PTT] Green button released — stopping capture...");
     s_recording = false;
-
-    /* Wait for capture task to self-delete (max 1.5 s) */
-    uint32_t waited_ms = 0;
-    while (s_capture_task_handle != NULL && waited_ms < 1500) {
-        vTaskDelay(pdMS_TO_TICKS(10));
-        waited_ms += 10;
-    }
-    if (s_capture_task_handle != NULL) {
-        ESP_LOGW(TAG, "ptt_record_stop: task did not exit — force killing");
-        vTaskDelete(s_capture_task_handle);
-        s_capture_task_handle = NULL;
-        i2s_channel_disable(s_rx_handle);
-    }
-
-    dump_capture_stats();
-
-    /* TODO [PIPELINE-1]: POST s_pcm_buf to backend transcription endpoint:
-     *   if (s_pcm_samples_captured > 0) {
-     *       audio_pipeline_post_to_backend(s_pcm_buf, s_pcm_samples_captured,
-     *                                      AUDIO_SAMPLE_RATE, s_record_duration_ms);
-     *   }
-     */
+    s_record_duration_ms = (uint32_t)(esp_timer_get_time() / 1000) - s_record_start_ms;
+    s_capture_max = AUDIO_MAX_SAMPLES;
 }
 
 /* =======================================================================
@@ -538,8 +929,15 @@ const int16_t *tool_audio_get_last_capture(size_t *out_samples, uint32_t *out_du
 }
 
 /* =======================================================================
- * Serial Diagnostic Dump — called on button release
+ * Serial Diagnostic Dump — called after mic tests
  * ===================================================================== */
+
+static const char *mic_verdict(double rms)
+{
+    if (rms < SILENCE_RMS_THRESHOLD) return "silence";
+    if (rms < AUDIO_RMS_THRESHOLD)   return "low_signal";
+    return "audio_detected";
+}
 
 static void dump_capture_stats(void)
 {
@@ -555,10 +953,10 @@ static void dump_capture_stats(void)
         ESP_LOGE(TAG, "  [ ] INMP441 VCC → 3.3V (NOT 5V — mic is 3.3V only)");
         ESP_LOGE(TAG, "  [ ] INMP441 GND → GND");
         ESP_LOGE(TAG, "  [ ] INMP441 L/R → GND (for left channel)");
-        ESP_LOGE(TAG, "  [ ] INMP441 SCK ← GPIO 41 (BCLK from ESP32)");
-        ESP_LOGE(TAG, "  [ ] INMP441 WS  ← GPIO 42 (WS from ESP32)");
-        ESP_LOGE(TAG, "  [ ] INMP441 SD  → GPIO 1  (data TO ESP32)");
-        ESP_LOGE(TAG, "  [ ] GPIO 41 and 42 shared with nothing else");
+        ESP_LOGE(TAG, "  [ ] INMP441 SCK ← GPIO %d (BCLK from ESP32)", MIMI_GPIO_I2S_BCLK);
+        ESP_LOGE(TAG, "  [ ] INMP441 WS  ← GPIO %d (WS from ESP32)", MIMI_GPIO_I2S_WS);
+        ESP_LOGE(TAG, "  [ ] INMP441 SD  → GPIO %d (data TO ESP32)", MIMI_GPIO_I2S_DIN);
+        ESP_LOGE(TAG, "  [ ] I2S pins not shared with another peripheral");
         return;
     }
 
@@ -633,22 +1031,53 @@ static void dump_capture_stats(void)
 }
 
 /* =======================================================================
- * mimi_tool_t Execute Stubs
+ * mimi_tool_t Execute functions
  * ===================================================================== */
 
-/* audio_play_tone — stub, no speaker connected */
+/* audio_play_tone — real sine playback through the MAX98357A */
 static esp_err_t audio_play_tone_execute(const char *input_json, char *output, size_t output_size)
 {
-    (void)input_json;
-    /* TODO [PIPELINE-4]: Re-add TX channel, generate sine, write to I2S TX */
-    snprintf(output, output_size,
-             "No speaker connected (MAX98357A TX not configured). "
-             "[PIPELINE-4] Add TX channel back when speaker is wired.");
-    ESP_LOGW(TAG, "audio_play_tone called but no speaker connected");
-    return ESP_OK;
+    uint32_t freq_hz = TONE_DEFAULT_FREQ_HZ;
+    uint32_t duration_ms = TONE_DEFAULT_MS;
+    float vol = TONE_DEFAULT_VOL;
+
+    if (input_json) {
+        cJSON *j = cJSON_Parse(input_json);
+        if (j) {
+            cJSON *f = cJSON_GetObjectItem(j, "freq_hz");
+            if (cJSON_IsNumber(f)) {
+                freq_hz = (uint32_t)f->valuedouble;
+            }
+            cJSON *d = cJSON_GetObjectItem(j, "duration_ms");
+            if (cJSON_IsNumber(d) && d->valuedouble > 0 && d->valuedouble <= TONE_MAX_MS) {
+                duration_ms = (uint32_t)d->valuedouble;
+            }
+            cJSON *v = cJSON_GetObjectItem(j, "volume");
+            if (cJSON_IsNumber(v) && v->valuedouble > 0.0 && v->valuedouble <= TONE_MAX_VOL) {
+                vol = (float)v->valuedouble;
+            }
+            cJSON_Delete(j);
+        }
+    }
+
+    esp_err_t err = play_tone(freq_hz, duration_ms, vol);
+    if (err == ESP_OK) {
+        snprintf(output, output_size,
+                 "Tone played: %lu Hz for %lu ms (volume %.2f) on MAX98357A (GPIO %d).",
+                 (unsigned long)freq_hz, (unsigned long)duration_ms, vol, MIMI_GPIO_I2S_DOUT);
+    } else if (err == ESP_ERR_INVALID_STATE) {
+        snprintf(output, output_size, "Error: audio busy (recording or another tone playing).");
+    } else if (err == ESP_ERR_INVALID_ARG) {
+        snprintf(output, output_size,
+                 "Error: freq_hz must be %d-%d, duration_ms 1-%d, volume 0.05-%.1f.",
+                 TONE_MIN_FREQ_HZ, TONE_MAX_FREQ_HZ, TONE_MAX_MS, TONE_MAX_VOL);
+    } else {
+        snprintf(output, output_size, "Error: playback failed: %s", esp_err_to_name(err));
+    }
+    return (err == ESP_OK) ? ESP_OK : ESP_FAIL;
 }
 
-/* audio_record_test — timed capture triggered by LLM */
+/* audio_record_test — timed capture triggered by LLM / serial */
 static esp_err_t audio_record_test_execute(const char *input_json, char *output, size_t output_size)
 {
     uint32_t duration_ms = 3000;
@@ -663,56 +1092,313 @@ static esp_err_t audio_record_test_execute(const char *input_json, char *output,
         }
     }
 
-    if (!s_i2s_initialized) {
-        snprintf(output, output_size, "Error: audio not initialized.");
-        return ESP_FAIL;
-    }
-    if (s_recording) {
-        snprintf(output, output_size, "Error: PTT recording already in progress.");
-        return ESP_ERR_INVALID_STATE;
-    }
+    ESP_LOGI(TAG, "[MIC-TEST] Triggered %lu ms timed recording", (unsigned long)duration_ms);
 
-    ESP_LOGI(TAG, "[MIC-TEST] LLM triggered %u ms timed recording", (unsigned)duration_ms);
-
-    s_recording = true;
-    BaseType_t ret = xTaskCreatePinnedToCore(
-        capture_task, "audio_cap_t", 4096, NULL, 7, &s_capture_task_handle, 1);
-    if (ret != pdPASS) {
-        s_recording = false;
-        snprintf(output, output_size, "Error: failed to start capture task.");
-        return ESP_FAIL;
+    size_t   n  = 0;
+    uint32_t dur = 0;
+    double   rms = 0.0;
+    int16_t  mn = 0, mx = 0;
+    esp_err_t err = timed_capture(duration_ms, &n, &dur, &rms, &mn, &mx);
+    if (err != ESP_OK) {
+        snprintf(output, output_size,
+                 "Error: capture failed to start (%s). Audio may be busy.",
+                 esp_err_to_name(err));
+        return err;
     }
-
-    vTaskDelay(pdMS_TO_TICKS(duration_ms));
-    s_recording = false;
-
-    uint32_t wait_ms = 0;
-    while (s_capture_task_handle != NULL && wait_ms < 1500) {
-        vTaskDelay(pdMS_TO_TICKS(10));
-        wait_ms += 10;
-    }
-
-    size_t   n   = s_pcm_samples_captured;
-    uint32_t dur = s_record_duration_ms;
-    int16_t  mn  = INT16_MAX, mx = INT16_MIN;
-    int64_t  ssq = 0;
-    for (size_t i = 0; i < n; i++) {
-        int16_t s = s_pcm_buf[i];
-        if (s < mn) mn = s;
-        if (s > mx) mx = s;
-        ssq += (int64_t)s * s;
-    }
-    double rms = (n > 0) ? sqrt((double)ssq / (double)n) : 0.0;
 
     snprintf(output, output_size,
              "{\"sample_count\":%u,\"duration_ms\":%u,\"sample_rate\":%d,"
              "\"rms\":%.1f,\"min\":%d,\"max\":%d,\"verdict\":\"%s\"}",
              (unsigned)n, (unsigned)dur, AUDIO_SAMPLE_RATE,
-             rms, (int)mn, (int)mx,
-             rms < SILENCE_RMS_THRESHOLD ? "silence" :
-             rms < AUDIO_RMS_THRESHOLD   ? "low_signal" : "audio_detected");
+             rms, (int)mn, (int)mx, mic_verdict(rms));
 
     dump_capture_stats();
     /* TODO [PIPELINE-1]: POST s_pcm_buf to backend here */
+    return ESP_OK;
+}
+
+/* =======================================================================
+ * WAV playback — voice pipeline [PIPELINE-4]
+ *
+ * Plays a full WAV blob (typically fetched from the backend /api/voice/tts
+ * endpoint, which returns 16 kHz mono 16-bit PCM). The header is parsed
+ * with a proper RIFF chunk walk (some encoders insert extra chunks before
+ * "data"). Frames are duplicated into both I2S slots like the tone path,
+ * so any MAX98357A SD-pin channel select hears the audio.
+ *
+ * The backend guarantees 16 kHz; if a different rate ever appears we log
+ * a warning and play anyway (pitch-shifted) rather than fail — the show
+ * must go on, but the log tells you why it sounds funny.
+ * ===================================================================== */
+
+esp_err_t tool_audio_play_wav(const uint8_t *wav, size_t len)
+{
+    if (!s_i2s_initialized || !s_tx_handle) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!wav || len < 44) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_playing || s_recording) {
+        ESP_LOGW(TAG, "play_wav: busy (recording=%d playing=%d)", (int)s_recording, (int)s_playing);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (memcmp(wav, "RIFF", 4) != 0 || memcmp(wav + 8, "WAVE", 4) != 0) {
+        ESP_LOGE(TAG, "play_wav: not a WAV blob (magic %c%c%c%c)",
+                 wav[0], wav[1], wav[2], wav[3]);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* --- RIFF chunk walk: find "fmt " and "data" --- */
+    uint32_t sample_rate = 16000;
+    uint16_t channels = 1, bits = 16;
+    size_t data_off = 0, data_len = 0;
+    size_t idx = 12;
+    while (idx + 8 <= len) {
+        uint32_t clen;
+        memcpy(&clen, wav + idx + 4, 4);
+        if (memcmp(wav + idx, "fmt ", 4) == 0 && idx + 16 + 4 <= len) {
+            uint16_t audio_fmt;
+            memcpy(&audio_fmt, wav + idx + 8, 2);
+            memcpy(&channels,  wav + idx + 10, 2);
+            memcpy(&sample_rate, wav + idx + 12, 4);
+            memcpy(&bits,      wav + idx + 22, 2);
+            if (audio_fmt != 1) {
+                ESP_LOGE(TAG, "play_wav: unsupported WAV format %u (need PCM)", audio_fmt);
+                return ESP_ERR_INVALID_ARG;
+            }
+        } else if (memcmp(wav + idx, "data", 4) == 0) {
+            data_off = idx + 8;
+            data_len = clen;
+            if (data_off + data_len > len) {
+                data_len = len - data_off;
+            }
+            break;
+        }
+        idx += 8 + clen + (clen & 1);   /* chunks are word-aligned */
+    }
+    if (data_off == 0 || data_len == 0) {
+        ESP_LOGE(TAG, "play_wav: no data chunk found");
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (bits != 16) {
+        ESP_LOGE(TAG, "play_wav: unsupported bit depth %u (need 16)", bits);
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (sample_rate != AUDIO_SAMPLE_RATE) {
+        ESP_LOGW(TAG, "play_wav: WAV is %lu Hz (expected %d) — playing pitch-shifted",
+                 (unsigned long)sample_rate, AUDIO_SAMPLE_RATE);
+    }
+
+    s_playing = true;
+    ESP_LOGI(TAG, "[SPK] WAV playback: data=%u bytes (~%lu ms), %lu Hz, %u ch, %u bit",
+             (unsigned)data_len,
+             (unsigned long)((uint64_t)data_len / (channels * 2) * 1000 / sample_rate),
+             (unsigned long)sample_rate, channels, bits);
+    ESP_LOGI(TAG, "[SPK] header check: RIFF ok, first data bytes %02X%02X %02X%02X %02X%02X %02X%02X",
+             wav[data_off], wav[data_off+1], wav[data_off+2], wav[data_off+3],
+             wav[data_off+4], wav[data_off+5], wav[data_off+6], wav[data_off+7]);
+
+    /* --- stream frames: mono duplicated to both slots, stereo → left --- */
+    int32_t *chunk = (int32_t *)malloc(AUDIO_TX_CHUNK_BYTES);
+    if (!chunk) {
+        s_playing = false;
+        return ESP_ERR_NO_MEM;
+    }
+
+    size_t played = 0;
+    esp_err_t err = ESP_OK;
+    while (played < data_len) {
+        size_t frames = AUDIO_TX_CHUNK_FRAMES;
+        size_t need;
+        if (channels == 2) {
+            need = frames * 2 * sizeof(int16_t);          /* stereo source */
+        } else {
+            need = frames * sizeof(int16_t);              /* mono source */
+        }
+        if (need > data_len - played) {
+            need = data_len - played;
+            frames = (channels == 2) ? need / (2 * sizeof(int16_t))
+                                     : need / sizeof(int16_t);
+        }
+        if (frames == 0) {
+            break;
+        }
+
+        const int16_t *src = (const int16_t *)(wav + data_off + played);
+        for (size_t f = 0; f < frames; f++) {
+            int32_t v = (channels == 2)
+                            ? ((int32_t)src[f * 2]) << 16          /* left slot */
+                            : ((int32_t)src[f]) << 16;
+            chunk[f * 2]     = v;
+            chunk[f * 2 + 1] = v;
+        }
+
+        size_t written = 0;
+        err = i2s_channel_write(s_tx_handle, chunk,
+                                frames * 2 * sizeof(int32_t), &written,
+                                AUDIO_TX_WRITE_TIMEOUT_MS);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "play_wav: i2s_channel_write FAILED: %s", esp_err_to_name(err));
+            break;
+        }
+        played += (channels == 2) ? frames * 2 * sizeof(int16_t)
+                                  : frames * sizeof(int16_t);
+    }
+
+    free(chunk);
+    s_playing = false;
+    ESP_LOGI(TAG, "[SPK] WAV done (%u bytes played)", (unsigned)played);
+    return err;
+}
+
+/* Public beep helper — short feedback cue (record start / pipeline states).
+ * Safe no-op when the bus is busy. */
+void tool_audio_beep(uint32_t freq_hz, uint32_t duration_ms, float vol)
+{
+    play_tone(freq_hz, duration_ms, vol);
+}
+
+/* =======================================================================
+ * Speaker diagnostic — audio_spktest (4 stages)
+ *
+ * Field history: TTS worked, then went silent across firmware changes.
+ * This tool bisects the chain — run it, listen to each stage, and the
+ * stage where sound stops is the broken link:
+ *   1 fails                 → amp / speaker / wiring / power (SD→5V!)
+ *   1 ok, 2 fails           → tool_audio_play_wav path (parser/format)
+ *   1-2 ok, 3 soft inaudible→ audibility: TTS speech (~-24 dBFS) is quieter
+ *                             than every ramp step; add playback gain
+ *   1-3 ok, 4 silent        → server/network/pipeline (check `voice:` logs)
+ * ===================================================================== */
+
+#define SPKTEST_TONE_MS   1000
+#define SPKTEST_RAMP_MS    700
+#define SPKTEST_GAP_MS     250
+
+/* Build a minimal 44-byte-header WAV (mono 16-bit @16 kHz) with a sine in
+ * PSRAM — lets stage 2 exercise tool_audio_play_wav with zero network. */
+static uint8_t *spktest_make_wav(uint32_t freq_hz, uint32_t ms, size_t *out_len)
+{
+    size_t n = (size_t)((uint64_t)AUDIO_SAMPLE_RATE * ms / 1000);
+    size_t total = 44 + n * 2;
+    uint8_t *buf = heap_caps_malloc(total, MALLOC_CAP_SPIRAM);
+    if (!buf) {
+        return NULL;
+    }
+    uint32_t v32;
+    uint16_t v16;
+    memcpy(buf, "RIFF", 4);
+    v32 = (uint32_t)(36 + n * 2);          memcpy(buf + 4,  &v32, 4);
+    memcpy(buf + 8,  "WAVE", 4);
+    memcpy(buf + 12, "fmt ", 4);
+    v32 = 16;                              memcpy(buf + 16, &v32, 4);
+    v16 = 1;                               memcpy(buf + 20, &v16, 2);   /* PCM    */
+    v16 = 1;                               memcpy(buf + 22, &v16, 2);   /* mono   */
+    v32 = AUDIO_SAMPLE_RATE;               memcpy(buf + 24, &v32, 4);
+    v32 = AUDIO_SAMPLE_RATE * 2;           memcpy(buf + 28, &v32, 4);   /* Bps    */
+    v16 = 2;                               memcpy(buf + 32, &v16, 2);   /* align  */
+    v16 = 16;                              memcpy(buf + 34, &v16, 2);   /* bits   */
+    memcpy(buf + 36, "data", 4);
+    v32 = (uint32_t)(n * 2);               memcpy(buf + 40, &v32, 4);
+
+    int16_t *pcm = (int16_t *)(buf + 44);
+    double inc = 2.0 * M_PI * (double)freq_hz / AUDIO_SAMPLE_RATE;
+    double ph = 0.0;
+    for (size_t i = 0; i < n; i++) {
+        pcm[i] = (int16_t)(sin(ph) * 20000.0);
+        ph += inc;
+        if (ph >= 2.0 * M_PI) ph -= 2.0 * M_PI;
+    }
+    *out_len = total;
+    return buf;
+}
+
+static esp_err_t audio_spktest_execute(const char *input_json, char *output, size_t output_size)
+{
+    (void)input_json;
+    if (!s_i2s_initialized) {
+        snprintf(output, output_size, "Error: audio not initialized.");
+        return ESP_FAIL;
+    }
+    if (s_recording || s_playing) {
+        snprintf(output, output_size, "Error: audio busy (recording or playing).");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    bool s1 = false, s2 = false, s4 = false;
+    esp_err_t err;
+
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "╔══════════ SPEAKER TEST — 4 STAGES ══════════╗");
+    ESP_LOGI(TAG, "╚══════════════════════════════════════════════╝");
+
+    /* ---- [1/4] hardware: raw tone ---- */
+    ESP_LOGI(TAG, "[1/4] TONE 440 Hz, full volume, 1 s — expect a LOUD beep");
+    err = play_tone(440, SPKTEST_TONE_MS, 1.0f);
+    s1 = (err == ESP_OK);
+    if (!s1) ESP_LOGE(TAG, "  stage 1 FAILED: %s", esp_err_to_name(err));
+    vTaskDelay(pdMS_TO_TICKS(SPKTEST_GAP_MS));
+
+    /* ---- [2/4] local WAV through the parser/play path ---- */
+    ESP_LOGI(TAG, "[2/4] LOCAL WAV 1 kHz (generated in PSRAM, no network) — expect the same beep");
+    size_t wav_len = 0;
+    uint8_t *wav = spktest_make_wav(1000, SPKTEST_TONE_MS, &wav_len);
+    if (wav) {
+        err = tool_audio_play_wav(wav, wav_len);
+        s2 = (err == ESP_OK);
+        free(wav);
+        if (!s2) ESP_LOGE(TAG, "  stage 2 FAILED: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGE(TAG, "  stage 2 skipped: no memory for test WAV");
+    }
+    vTaskDelay(pdMS_TO_TICKS(SPKTEST_GAP_MS));
+
+    /* ---- [3/4] volume ramp ---- */
+    ESP_LOGI(TAG, "[3/4] VOLUME RAMP: 1 kHz at 1.0 / 0.4 / 0.15 — note where it becomes inaudible");
+    static const float vols[3] = { 1.0f, 0.4f, 0.15f };
+    for (int i = 0; i < 3; i++) {
+        ESP_LOGI(TAG, "  ramp %d/3: volume %.2f", i + 1, vols[i]);
+        err = play_tone(1000, SPKTEST_RAMP_MS, vols[i]);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "  ramp %d failed: %s", i + 1, esp_err_to_name(err));
+        }
+        vTaskDelay(pdMS_TO_TICKS(SPKTEST_GAP_MS));
+    }
+
+    /* ---- [4/4] full production pipeline (server TTS) ---- */
+    ESP_LOGI(TAG, "[4/4] FULL PIPELINE: server TTS 'Speaker test, one, two, three'");
+    s4 = voice_client_speak("Speaker test. One. Two. Three.");
+    if (!s4) {
+        ESP_LOGE(TAG, "  stage 4 could not start (pipeline busy) — see voice: logs");
+    }
+
+    /* ---- verdict guidance ---- */
+    const char *verdict;
+    if (!s1) {
+        verdict = "HARDWARE: tone failed — check MAX98357A SD->5V, VIN->5V, DIN->GPIO21, speaker terminals";
+    } else if (!s2) {
+        verdict = "SOFTWARE: play_wav path failed — report [SPK] logs";
+    } else if (!s4) {
+        verdict = "PIPELINE: local playback OK but server TTS failed — check backend & WiFi";
+    } else {
+        verdict = "ALL STAGES PLAYED — compare loudness: if ramp was faint and speech silent, "
+                  "speaker sensitivity is the issue (wiring/power), not the pipeline";
+    }
+
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "╔══════════ SPEAKER TEST SUMMARY ══════════╗");
+    ESP_LOGI(TAG, "║ 1/4 tone   : %s                     ║", s1 ? "played" : "FAILED");
+    ESP_LOGI(TAG, "║ 2/4 wav    : %s                     ║", s2 ? "played" : "FAILED");
+    ESP_LOGI(TAG, "║ 3/4 ramp   : played (note audibility) ║");
+    ESP_LOGI(TAG, "║ 4/4 tts    : %s                     ║", s4 ? "played" : "FAILED");
+    ESP_LOGI(TAG, "╚══════════════════════════════════════════╝");
+    ESP_LOGI(TAG, "%s", verdict);
+
+    snprintf(output, output_size,
+             "{\"tone\":%s,\"local_wav\":%s,\"server_tts\":%s,"
+             "\"verdict\":\"%s\"}",
+             s1 ? "true" : "false", s2 ? "true" : "false", s4 ? "true" : "false",
+             verdict);
     return ESP_OK;
 }

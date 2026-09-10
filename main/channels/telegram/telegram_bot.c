@@ -2,6 +2,7 @@
 #include "mimi_config.h"
 #include "bus/message_bus.h"
 #include "proxy/http_proxy.h"
+#include "wifi/wifi_manager.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -10,6 +11,7 @@
 #include "esp_timer.h"
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
+#include "esp_heap_caps.h"
 #include "nvs.h"
 #include "cJSON.h"
 
@@ -113,11 +115,14 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
     if (evt->event_id == HTTP_EVENT_ON_DATA) {
         if (resp->len + evt->data_len >= resp->cap) {
             size_t new_cap = resp->cap * 2;
-            if (new_cap < resp->len + evt->data_len + 1) {
-                new_cap = resp->len + evt->data_len + 1;
+            while (new_cap <= resp->len + evt->data_len) {
+                new_cap *= 2;
             }
-            char *tmp = realloc(resp->buf, new_cap);
-            if (!tmp) return ESP_ERR_NO_MEM;
+            char *tmp = heap_caps_realloc(resp->buf, new_cap, MALLOC_CAP_SPIRAM);
+            if (!tmp) {
+                ESP_LOGE(TAG, "Failed to grow response buffer to %u in PSRAM", (unsigned)new_cap);
+                return ESP_ERR_NO_MEM;
+            }
             resp->buf = tmp;
             resp->cap = new_cap;
         }
@@ -165,15 +170,15 @@ static char *tg_api_call_via_proxy(const char *path, const char *post_data)
     }
 
     /* Read response — accumulate until connection close */
-    size_t cap = 4096, len = 0;
-    char *buf = calloc(1, cap);
+    size_t cap = 8192, len = 0;
+    char *buf = heap_caps_calloc(1, cap, MALLOC_CAP_SPIRAM);
     if (!buf) { proxy_conn_close(conn); return NULL; }
 
     int timeout = (MIMI_TG_POLL_TIMEOUT_S + 5) * 1000;
     while (1) {
         if (len + 1024 >= cap) {
             cap *= 2;
-            char *tmp = realloc(buf, cap);
+            char *tmp = heap_caps_realloc(buf, cap, MALLOC_CAP_SPIRAM);
             if (!tmp) break;
             buf = tmp;
         }
@@ -201,11 +206,12 @@ static char *tg_api_call_direct(const char *method, const char *post_data)
 {
     char url[256];
     snprintf(url, sizeof(url), "https://api.telegram.org/bot%s/%s", s_bot_token, method);
+    ESP_LOGI(TAG, "tg_api_call: %s", url);
 
     http_resp_t resp = {
-        .buf = calloc(1, 4096),
+        .buf = heap_caps_calloc(1, 8192, MALLOC_CAP_SPIRAM),
         .len = 0,
-        .cap = 4096,
+        .cap = 8192,
     };
     if (!resp.buf) return NULL;
 
@@ -214,13 +220,14 @@ static char *tg_api_call_direct(const char *method, const char *post_data)
         .event_handler = http_event_handler,
         .user_data = &resp,
         .timeout_ms = (MIMI_TG_POLL_TIMEOUT_S + 5) * 1000,
-        .buffer_size = 2048,
-        .buffer_size_tx = 2048,
+        .buffer_size = 4096,
+        .buffer_size_tx = 4096,
         .crt_bundle_attach = esp_crt_bundle_attach,
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (!client) {
+        ESP_LOGE(TAG, "esp_http_client_init failed for %s", method);
         free(resp.buf);
         return NULL;
     }
@@ -232,12 +239,17 @@ static char *tg_api_call_direct(const char *method, const char *post_data)
     }
 
     esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
 
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "HTTP request failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "HTTP perform failed for %s: %s (status %d)", method, esp_err_to_name(err), status);
         free(resp.buf);
         return NULL;
+    }
+
+    if (status < 200 || status >= 300) {
+        ESP_LOGW(TAG, "HTTP %s returned status %d: %.120s", method, status, resp.buf ? resp.buf : "");
     }
 
     return resp.buf;
@@ -246,6 +258,7 @@ static char *tg_api_call_direct(const char *method, const char *post_data)
 static char *tg_api_call(const char *method, const char *post_data)
 {
     if (http_proxy_is_enabled()) {
+        ESP_LOGD(TAG, "tg_api_call %s via proxy", method);
         return tg_api_call_via_proxy(method, post_data);
     }
     return tg_api_call_direct(method, post_data);
@@ -285,10 +298,15 @@ static bool tg_response_is_ok(const char *resp, const char **out_desc)
 static void process_updates(const char *json_str)
 {
     cJSON *root = cJSON_Parse(json_str);
-    if (!root) return;
+    if (!root) {
+        ESP_LOGE(TAG, "cJSON_Parse failed for updates (len=%u)", (unsigned)strlen(json_str));
+        return;
+    }
 
     cJSON *ok = cJSON_GetObjectItem(root, "ok");
     if (!cJSON_IsTrue(ok)) {
+        cJSON *desc = cJSON_GetObjectItem(root, "description");
+        ESP_LOGW(TAG, "getUpdates returned ok=false: %s", (desc && cJSON_IsString(desc)) ? desc->valuestring : "unknown");
         cJSON_Delete(root);
         return;
     }
@@ -299,34 +317,52 @@ static void process_updates(const char *json_str)
         return;
     }
 
+    int update_count = cJSON_GetArraySize(result);
+    if (update_count > 0) {
+        ESP_LOGI(TAG, "Received %d Telegram update(s)", update_count);
+    }
+
     cJSON *update;
     cJSON_ArrayForEach(update, result) {
-        /* Track offset and skip stale/duplicate updates */
+        char *upd_str = cJSON_PrintUnformatted(update);
+        ESP_LOGI(TAG, "RAW UPDATE: %s", upd_str ? upd_str : "(null)");
+        free(upd_str);
+
+        /* Track offset and advance */
         cJSON *update_id = cJSON_GetObjectItem(update, "update_id");
         int64_t uid = -1;
         if (cJSON_IsNumber(update_id)) {
             uid = (int64_t)update_id->valuedouble;
         }
         if (uid >= 0) {
-            if (uid < s_update_offset) {
-                continue;
-            }
             s_update_offset = uid + 1;
             save_update_offset_if_needed(false);
         }
 
         /* Extract message */
         cJSON *message = cJSON_GetObjectItem(update, "message");
-        if (!message) continue;
+        if (!message) {
+            ESP_LOGW(TAG, "Update has no 'message' field");
+            continue;
+        }
 
         cJSON *text = cJSON_GetObjectItem(message, "text");
-        if (!text || !cJSON_IsString(text)) continue;
+        if (!text || !cJSON_IsString(text)) {
+            ESP_LOGW(TAG, "Message has no 'text' string");
+            continue;
+        }
 
         cJSON *chat = cJSON_GetObjectItem(message, "chat");
-        if (!chat) continue;
+        if (!chat) {
+            ESP_LOGW(TAG, "Message has no 'chat' object");
+            continue;
+        }
 
         cJSON *chat_id = cJSON_GetObjectItem(chat, "id");
-        if (!chat_id) continue;
+        if (!chat_id) {
+            ESP_LOGW(TAG, "Chat has no 'id'");
+            continue;
+        }
 
         int msg_id_val = -1;
         cJSON *message_id = cJSON_GetObjectItem(message, "message_id");
@@ -341,6 +377,7 @@ static void process_updates(const char *json_str)
         } else if (cJSON_IsNumber(chat_id)) {
             snprintf(chat_id_str, sizeof(chat_id_str), "%.0f", chat_id->valuedouble);
         } else {
+            ESP_LOGW(TAG, "Chat id is neither string nor number");
             continue;
         }
 
@@ -378,9 +415,15 @@ static void process_updates(const char *json_str)
 
 static void telegram_poll_task(void *arg)
 {
-    ESP_LOGI(TAG, "Telegram polling task started");
+    ESP_LOGI(TAG, "Telegram polling task started (proxy=%s, offset=%" PRId64 ")",
+             http_proxy_is_enabled() ? "YES" : "NO", s_update_offset);
 
     while (1) {
+        if (!wifi_manager_is_connected()) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
         if (s_bot_token[0] == '\0') {
             ESP_LOGW(TAG, "No bot token configured, waiting...");
             vTaskDelay(pdMS_TO_TICKS(5000));
@@ -389,7 +432,7 @@ static void telegram_poll_task(void *arg)
 
         char params[128];
         snprintf(params, sizeof(params),
-                 "getUpdates?offset=%" PRId64 "&timeout=%d",
+                 "getUpdates?offset=%" PRId64 "&timeout=%d&limit=5",
                  s_update_offset, MIMI_TG_POLL_TIMEOUT_S);
 
         char *resp = tg_api_call(params, NULL);
@@ -398,6 +441,7 @@ static void telegram_poll_task(void *arg)
             free(resp);
         } else {
             /* Back off on error */
+            ESP_LOGW(TAG, "Poll failed, backoff 3s");
             vTaskDelay(pdMS_TO_TICKS(3000));
         }
     }
@@ -407,13 +451,19 @@ static void telegram_poll_task(void *arg)
 
 esp_err_t telegram_bot_init(void)
 {
-    /* NVS overrides take highest priority (set via CLI) */
+    /* Build-time secret takes priority */
+    if (MIMI_SECRET_TG_TOKEN[0] != '\0') {
+        strncpy(s_bot_token, MIMI_SECRET_TG_TOKEN, sizeof(s_bot_token) - 1);
+    }
+
     nvs_handle_t nvs;
-    if (nvs_open(MIMI_NVS_TG, NVS_READONLY, &nvs) == ESP_OK) {
-        char tmp[128] = {0};
-        size_t len = sizeof(tmp);
-        if (nvs_get_str(nvs, MIMI_NVS_KEY_TG_TOKEN, tmp, &len) == ESP_OK && tmp[0]) {
-            strncpy(s_bot_token, tmp, sizeof(s_bot_token) - 1);
+    if (nvs_open(MIMI_NVS_TG, NVS_READWRITE, &nvs) == ESP_OK) {
+        char nvs_token[128] = {0};
+        size_t len = sizeof(nvs_token);
+        bool has_nvs_token = (nvs_get_str(nvs, MIMI_NVS_KEY_TG_TOKEN, nvs_token, &len) == ESP_OK && nvs_token[0]);
+
+        if (s_bot_token[0] == '\0' && has_nvs_token) {
+            strncpy(s_bot_token, nvs_token, sizeof(s_bot_token) - 1);
         }
 
         int64_t offset = 0;
@@ -424,8 +474,6 @@ esp_err_t telegram_bot_init(void)
         }
         nvs_close(nvs);
     }
-
-    /* s_bot_token is already initialized from MIMI_SECRET_TG_TOKEN as fallback */
 
     if (s_bot_token[0]) {
         ESP_LOGI(TAG, "Telegram bot token loaded (len=%d)", (int)strlen(s_bot_token));
@@ -595,7 +643,7 @@ esp_err_t telegram_send_photo(const char *chat_id, const uint8_t *jpeg_data, siz
     snprintf(url, sizeof(url), "https://api.telegram.org/bot%s/sendPhoto", s_bot_token);
 
     http_resp_t resp = {
-        .buf = calloc(1, 4096),
+        .buf = heap_caps_calloc(1, 4096, MALLOC_CAP_SPIRAM),
         .len = 0,
         .cap = 4096,
     };
@@ -606,8 +654,8 @@ esp_err_t telegram_send_photo(const char *chat_id, const uint8_t *jpeg_data, siz
         .event_handler = http_event_handler,
         .user_data = &resp,
         .timeout_ms = 15000,
-        .buffer_size = 2048,
-        .buffer_size_tx = 2048,
+        .buffer_size = 4096,
+        .buffer_size_tx = 4096,
         .crt_bundle_attach = esp_crt_bundle_attach,
     };
 

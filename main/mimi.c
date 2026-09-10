@@ -29,6 +29,7 @@
 #include "onboard/wifi_onboard.h"
 #include "tools/button_handler.h"
 #include "tools/tool_audio.h"
+#include "voice/voice_client.h"
 #include "tools/tool_oled.h"
 #include "tools/tool_camera.h"
 
@@ -67,16 +68,9 @@ static void on_white_button_long_press(bool is_starting)
     }
 }
 
-static void on_green_button_ptt(bool is_pressed)
-{
-    if (is_pressed) {
-        ESP_LOGI(TAG, "[GREEN BUTTON] Pressed (GPIO 39) - Input working!");
-        tool_audio_ptt_record_start();
-    } else {
-        ESP_LOGI(TAG, "[GREEN BUTTON] Released (GPIO 39)");
-        tool_audio_ptt_record_stop();
-    }
-}
+/* GPIO 41 camera button: short press = snapshot to Telegram,
+ * hold >= 600 ms = video capture start/stop. (Previously PTT; voice is now
+ * hands-free via the esp-sr wake word — see voice/voice_client.c.) */
 
 static esp_err_t init_nvs(void)
 {
@@ -131,6 +125,9 @@ static void outbound_dispatch_task(void *arg)
                     ESP_LOGE(TAG, "Telegram send failed for %s: %s", msg.chat_id, esp_err_to_name(send_err));
                 } else {
                     ESP_LOGI(TAG, "Telegram send success for %s (%d bytes)", msg.chat_id, (int)strlen(msg.content));
+                    /* Final agent replies are spoken too (user request):
+                     * every text answer also comes out of the speaker. */
+                    voice_client_speak(msg.content);
                 }
             }
         } else if (strcmp(msg.channel, MIMI_CHAN_FEISHU) == 0) {
@@ -147,6 +144,14 @@ static void outbound_dispatch_task(void *arg)
             }
         } else if (strcmp(msg.channel, MIMI_CHAN_SYSTEM) == 0) {
             ESP_LOGI(TAG, "System message [%s]: %.128s", msg.chat_id, msg.content);
+            /* Voice pipeline output [PIPELINE-3/4]: mirror the reply to the
+             * last Telegram chat AND speak it through the MAX98357A. */
+            if (strcmp(msg.chat_id, "voice") == 0) {
+                telegram_send_to_last_chat(msg.content);
+                voice_client_speak(msg.content);   /* final answers AND the
+                                                      "ESPeting..." status are
+                                                      spoken */
+            }
         } else {
             ESP_LOGW(TAG, "Unknown channel: %s", msg.channel);
         }
@@ -187,7 +192,7 @@ void app_main(void)
     ESP_ERROR_CHECK(llm_proxy_init());
     ESP_ERROR_CHECK(tool_registry_init());
     ESP_ERROR_CHECK(tool_camera_init());
-    ESP_ERROR_CHECK(button_handler_init(on_white_button_short_press, on_white_button_long_press, on_green_button_ptt));
+    ESP_ERROR_CHECK(button_handler_init(on_white_button_short_press, on_white_button_long_press, NULL));
     ESP_ERROR_CHECK(cron_service_init());
     ESP_ERROR_CHECK(heartbeat_init());
     ESP_ERROR_CHECK(config_sync_init());
@@ -242,6 +247,12 @@ void app_main(void)
         heartbeat_start();
         ESP_ERROR_CHECK(ws_server_start());
         config_sync_start();
+
+        /* Hands-free wake word listener ("Hi ESP" -> Yes? -> command). */
+        esp_err_t v_err = voice_client_start();
+        if (v_err != ESP_OK) {
+            ESP_LOGW(TAG, "voice wake listener not started: %s", esp_err_to_name(v_err));
+        }
 
         ESP_LOGI(TAG, "All services started!");
     }

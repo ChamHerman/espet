@@ -48,6 +48,7 @@ static void button_task(void *arg)
         if (xQueueReceive(s_btn_evt_queue, &evt, pdMS_TO_TICKS(50))) {
             int64_t now = esp_timer_get_time() / 1000;
 
+#if (GPIO_BTN_WHITE_SNAP >= 0)
             if (evt.pin == GPIO_BTN_WHITE_SNAP) {
                 bool current_level_pressed = !evt.level; // LOW means pressed
                 
@@ -63,12 +64,12 @@ static void button_task(void *arg)
                     is_pressed = false;
                     
                     if (is_long_pressing) {
-                        ESP_LOGI(TAG, "White Button (GPIO 38): Long Press Released");
+                        ESP_LOGI(TAG, "White Button (GPIO %d): Long Press Released", GPIO_BTN_WHITE_SNAP);
                         if (s_long_cb) {
                             s_long_cb(false); // Stop
                         }
                     } else {
-                        ESP_LOGI(TAG, "White Button (GPIO 38): Short Click Detected");
+                        ESP_LOGI(TAG, "White Button (GPIO %d): Short Click Detected", GPIO_BTN_WHITE_SNAP);
                         if (s_short_cb) {
                             s_short_cb();
                         }
@@ -76,13 +77,15 @@ static void button_task(void *arg)
                     // Purge bounce events
                     xQueueReset(s_btn_evt_queue);
                 }
-            } else if (evt.pin == GPIO_BTN_GREEN_PTT) {
+            } else
+#endif
+            if (evt.pin == GPIO_BTN_GREEN_PTT) {
                 bool is_green_pressed = !evt.level;
                 if (is_green_pressed != last_green_state) {
                     if (now - s_last_ptt_time > 300) { /* 300ms debounce */
                         s_last_ptt_time = now;
                         last_green_state = is_green_pressed;
-                        ESP_LOGI(TAG, "Green Button (GPIO 39): %s", is_green_pressed ? "Pressed" : "Released");
+                        ESP_LOGI(TAG, "Green Button (GPIO %d): %s", GPIO_BTN_GREEN_PTT, is_green_pressed ? "Pressed" : "Released");
                         if (s_ptt_cb) {
                             s_ptt_cb(is_green_pressed);
                         }
@@ -92,17 +95,19 @@ static void button_task(void *arg)
             }
         }
 
+#if (GPIO_BTN_WHITE_SNAP >= 0)
         // --- TIMEOUT CHECK for White Button ---
         if (is_pressed && !is_long_pressing) {
             int64_t now = esp_timer_get_time() / 1000;
             if ((now - press_time) >= LONG_PRESS_THRESHOLD_MS) {
                 is_long_pressing = true;
-                ESP_LOGI(TAG, "White Button (GPIO 38): Long Press Triggered");
+                ESP_LOGI(TAG, "White Button (GPIO %d): Long Press Triggered", GPIO_BTN_WHITE_SNAP);
                 if (s_long_cb) {
                     s_long_cb(true); // Start
                 }
             }
         }
+#endif
     }
 }
 
@@ -118,8 +123,16 @@ esp_err_t button_handler_init(button_short_press_cb_t short_cb, button_long_pres
         return ESP_FAIL;
     }
 
+    uint64_t pin_mask = 0;
+#if (GPIO_BTN_WHITE_SNAP >= 0)
+    pin_mask |= (1ULL << GPIO_BTN_WHITE_SNAP);
+#endif
+#if (GPIO_BTN_GREEN_PTT >= 0)
+    pin_mask |= (1ULL << GPIO_BTN_GREEN_PTT);
+#endif
+
     gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << GPIO_BTN_WHITE_SNAP) | (1ULL << GPIO_BTN_GREEN_PTT),
+        .pin_bit_mask = pin_mask,
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -139,19 +152,32 @@ esp_err_t button_handler_init(button_short_press_cb_t short_cb, button_long_pres
     if (isr_err != ESP_OK && isr_err != ESP_ERR_INVALID_STATE) {
         ESP_LOGW(TAG, "gpio_install_isr_service info: %s", esp_err_to_name(isr_err));
     }
+#if (GPIO_BTN_WHITE_SNAP >= 0)
     gpio_isr_handler_add(GPIO_BTN_WHITE_SNAP, gpio_isr_handler, (void *)GPIO_BTN_WHITE_SNAP);
+#endif
+#if (GPIO_BTN_GREEN_PTT >= 0)
     gpio_isr_handler_add(GPIO_BTN_GREEN_PTT, gpio_isr_handler, (void *)GPIO_BTN_GREEN_PTT);
+#endif
 
-    ESP_LOGI(TAG, "Button handler initialized (White Snap=38, Green PTT=39)");
+    ESP_LOGI(TAG, "Button handler initialized (Cam=%d: short=snap/hold=video, PTT=%d disabled)",
+             GPIO_BTN_WHITE_SNAP, GPIO_BTN_GREEN_PTT);
     return ESP_OK;
 }
 
 bool button_is_white_pressed(void)
 {
+#if (GPIO_BTN_WHITE_SNAP >= 0)
     return gpio_get_level(GPIO_BTN_WHITE_SNAP) == 0;
+#else
+    return false;
+#endif
 }
 
 bool button_is_green_pressed(void)
 {
+#if (GPIO_BTN_GREEN_PTT >= 0)
     return gpio_get_level(GPIO_BTN_GREEN_PTT) == 0;
+#else
+    return false;
+#endif
 }

@@ -27,6 +27,7 @@ idf_component_register(
         "tools/tool_audio.c"
         "tools/tool_camera.c"
         "tools/button_handler.c"
+        "voice/voice_client.c"
         "skills/skill_loader.c"
         "onboard/wifi_onboard.c"
     INCLUDE_DIRS

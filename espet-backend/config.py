@@ -38,6 +38,15 @@ class Settings(BaseSettings):
     calendar_mcp_url: str = "https://calendarmcp.googleapis.com/mcp/v1"
     drive_mcp_url: str = "https://drivemcp.googleapis.com/mcp/v1"
 
+    # --- Voice pipeline (STT/TTS) ---
+    # STT: faster-whisper model size: tiny, base, small, medium...
+    voice_stt_model: str = "base"
+    # None = auto-detect language; "en"/"zh" forces a language
+    voice_language: str | None = None
+    # TTS: edge-tts voice (neural, free). zh-HK = Cantonese, en-US alternatives:
+    #   zh-HK-HiuMaanNeural / zh-HK-WanLungNeural / en-US-AriaNeural ...
+    voice_tts_voice: str = "zh-HK-HiuMaanNeural"
+
     # --- Database ---
     db_path: str = "db/tokens.db"
 

@@ -191,10 +191,10 @@ esp_err_t tool_registry_init(void)
 
     mimi_tool_t gw = {
         .name = "gpio_write",
-        .description = "Set a GPIO pin HIGH (1) or LOW (0). Fixed hardware pins: GPIO 40 = WHITE LED.",
+        .description = "Set a GPIO pin HIGH (1) or LOW (0). Fixed hardware pins: GPIO 42 = WHITE LED.",
         .input_schema_json =
             "{\"type\":\"object\","
-            "\"properties\":{\"pin\":{\"type\":\"integer\",\"description\":\"GPIO pin number (e.g. 40 for WHITE LED)\"},"
+            "\"properties\":{\"pin\":{\"type\":\"integer\",\"description\":\"GPIO pin number (e.g. 42 for WHITE LED)\"},"
             "\"state\":{\"type\":\"integer\",\"description\":\"1 for HIGH (ON), 0 for LOW (OFF)\"}},"
             "\"required\":[\"pin\",\"state\"]}",
         .execute = tool_gpio_write_execute,
@@ -230,6 +230,7 @@ esp_err_t tool_registry_init(void)
     tool_audio_init();
     register_tool(&audio_play_tone_tool);
     register_tool(&audio_record_test_tool);
+    register_tool(&audio_spktest_tool);
 
     build_tools_json();
 

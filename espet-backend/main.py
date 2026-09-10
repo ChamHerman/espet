@@ -20,6 +20,7 @@ from api.mcp_router import router as mcp_router
 from api.tools_router import router as tools_router
 from api.auth_router import router as auth_router
 from api.config_router import router as config_router
+from api.voice_router import router as voice_router
 from api.ui_router import router as ui_router
 from mcp.client import mcp_client_manager
 
@@ -101,6 +102,7 @@ app.include_router(mcp_router)
 app.include_router(tools_router)
 app.include_router(auth_router)
 app.include_router(config_router)
+app.include_router(voice_router)
 
 # Dashboard assets (css/js) — GET / itself is served by ui_router
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")

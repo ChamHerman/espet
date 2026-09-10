@@ -311,15 +311,15 @@ Centrally configured in `main/mimi_config.h` and documented in `.agent/ESPET_PIN
 
 | Peripheral | Component | Pin | Protocol / Details |
 |---|---|---|---|
-| **OLED Clock** | SSD1306 | **GPIO 21** | I2C0 SCL (400 kHz, internal pull-up) |
-| **OLED Data** | SSD1306 | **GPIO 47** | I2C0 SDA (400 kHz, internal pull-up) |
-| **White Push Button** | Tactile Switch | **GPIO 38** | Input pull-up; Falling edge triggers camera snapshot |
-| **Green Push Button** | Tactile Switch | **GPIO 39** | Input pull-up; Any-edge interrupt (PTT voice record) |
-| **Status LED** | Discrete White LED | **GPIO 40** | Output (1 = HIGH / ON, 0 = LOW / OFF) |
-| **Audio I2S BCLK** | INMP441 / MAX98357A | **GPIO 41** | I2S0 Master Bit Clock |
-| **Audio I2S WS** | INMP441 / MAX98357A | **GPIO 42** | I2S0 Word Select / Frame Clock |
-| **Audio Mic Data In** | INMP441 Microphone | **GPIO 1** | I2S0 Data Input (`DIN`/`SD`) |
-| **Audio Speaker Out**| MAX98357A Amplifier | **GPIO 2** | I2S0 Data Output (`DOUT`) |
+| **OLED Clock** | SSD1306 | **GPIO 2** | I2C0 SCL (400 kHz, internal pull-up) |
+| **OLED Data** | SSD1306 | **GPIO 1** | I2C0 SDA (400 kHz, internal pull-up) |
+| **White Push Button** | Tactile Switch | *Unassigned* | Unassigned / disabled |
+| **Green Push Button** | Tactile Switch | **GPIO 41** | Input pull-up; Any-edge interrupt (PTT voice record) |
+| **Status LED** | Discrete White LED | **GPIO 42** | Output (1 = HIGH / ON, 0 = LOW / OFF) |
+| **Audio I2S BCLK** | INMP441 / MAX98357A | **GPIO 38** | I2S0 Master Bit Clock |
+| **Audio I2S WS** | INMP441 / MAX98357A | **GPIO 39** | I2S0 Word Select / Frame Clock |
+| **Audio Mic Data In** | INMP441 Microphone | **GPIO 40** | I2S0 Data Input (`DIN`/`SD`) |
+| **Audio Speaker Out**| MAX98357A Amplifier | **GPIO 21** | I2S0 Data Output (`DOUT`) |
 | **Camera Sensor** | OV2640 DVP | **GPIO 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18** | DVP parallel bus & SCCB |
 | **Serial Console** | UART0 (CP2102/CH340)| **GPIO 43 (TX), 44 (RX)** | 115200 baud interactive REPL console |
 | **Native USB** | ESP32-S3 USB/JTAG | **GPIO 19 (D-), 20 (D+)** | Native USB flashing and JTAG |

@@ -407,6 +407,7 @@ static esp_err_t start_softap(bool keep_sta)
     if (err != ESP_OK && !(keep_sta && err == ESP_ERR_WIFI_CONN)) {
         return err;
     }
+    esp_wifi_set_ps(WIFI_PS_NONE);
 
     ESP_LOGI(TAG, "Soft AP started: %s (open)", ssid);
     return ESP_OK;

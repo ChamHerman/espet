@@ -17,3 +17,5 @@ dependencies:
   espressif/esp_websocket_client: ^1.4.0
   espressif/ssd1306: "*"
   espressif/esp32-camera: "*"
+  # WakeWord engine (WakeNet) — on-device "Hi ESP" detection for the voice flow
+  espressif/esp-sr: "^2.0.0"

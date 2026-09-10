@@ -10,11 +10,12 @@
 #include <string.h>
 #include <stdlib.h>
 #include "oled_bitmaps.h"
+#include "mimi_config.h"
 
 static const char *TAG = "tool_oled";
 
-#define I2C_MASTER_SCL_IO 21
-#define I2C_MASTER_SDA_IO 47
+#define I2C_MASTER_SCL_IO MIMI_GPIO_OLED_SCL
+#define I2C_MASTER_SDA_IO MIMI_GPIO_OLED_SDA
 #define I2C_MASTER_NUM I2C_NUM_0
 #define I2C_MASTER_FREQ_HZ 400000
 

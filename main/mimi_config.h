@@ -53,7 +53,7 @@
 #define MIMI_WIFI_RETRY_MAX_MS 30000
 
 /* Telegram Bot */
-#define MIMI_TG_POLL_TIMEOUT_S 30
+#define MIMI_TG_POLL_TIMEOUT_S 5
 #define MIMI_TG_MAX_MSG_LEN 4096
 #define MIMI_TG_POLL_STACK (12 * 1024)
 #define MIMI_TG_POLL_PRIO 5
@@ -94,7 +94,11 @@
 #ifndef BACKEND_IP
 #define BACKEND_IP "127.0.0.1" /* Fallback for Backend Server */
 #endif
-#define MIMI_OPENAI_API_URL          "http://" HOST_IP ":1234/v1/chat/completions"
+#ifdef MIMI_SECRET_OPENAI_URL
+#define MIMI_OPENAI_API_URL          MIMI_SECRET_OPENAI_URL
+#else
+#define MIMI_OPENAI_API_URL          "https://apihub.agnes-ai.com/v1/chat/completions"
+#endif
 #define MIMI_BACKEND_URL             "http://" BACKEND_IP ":8000"
 #define MIMI_BACKEND_API_KEY         "espet_secret_device_key_2026"
 #define MIMI_LLM_API_VERSION         "2023-06-01"
@@ -136,15 +140,16 @@
 
 /* GPIO */
 #define MIMI_GPIO_CONFIG_SECTION 1 /* enable GPIO tools */
-#define MIMI_GPIO_OLED_SCL 21      /* SSD1306 OLED SCL/SCK */
-#define MIMI_GPIO_OLED_SDA 47      /* SSD1306 OLED SDA */
-#define MIMI_GPIO_BTN_GREEN 39     /* Green Push Button (Input Pull-Up) */
-#define MIMI_GPIO_BTN_WHITE 38     /* White Push Button (Input Pull-Up) */
-#define MIMI_GPIO_LED_WHITE 40     /* White LED Output */
-#define MIMI_GPIO_I2S_BCLK 41      /* Shared Audio BCLK / SCK (Mic + Amp) */
-#define MIMI_GPIO_I2S_WS 42        /* Shared Audio WS / LRC (Mic + Amp) */
-#define MIMI_GPIO_I2S_DOUT 2       /* MAX98357A Amp DIN */
-#define MIMI_GPIO_I2S_DIN 1        /* INMP441 Mic SD */
+#define MIMI_GPIO_OLED_SCL 2       /* SSD1306 OLED SCL/SCK (was 21) */
+#define MIMI_GPIO_OLED_SDA 1       /* SSD1306 OLED SDA (was 47) */
+#define MIMI_GPIO_BTN_CAM 41       /* Camera Push Button (Input Pull-Up): short=snap, hold=video (was "green PTT") */
+#define MIMI_GPIO_BTN_WHITE -1     /* (Unassigned) */
+#define MIMI_GPIO_BTN_PTT -1       /* PTT retired - voice uses on-device wake word (esp-sr WakeNet) */
+#define MIMI_GPIO_LED_WHITE 42     /* White LED Output (was 40) */
+#define MIMI_GPIO_I2S_BCLK 38      /* Shared Audio BCLK / SCK (Mic + Amp) (was 41) */
+#define MIMI_GPIO_I2S_WS 39        /* Shared Audio WS / LRC (Mic + Amp) (was 42) */
+#define MIMI_GPIO_I2S_DOUT 21      /* MAX98357A Amp DIN (was 2) */
+#define MIMI_GPIO_I2S_DIN 40       /* INMP441 Mic SD (was 1) */
 
 /* Skills */
 #define MIMI_SKILLS_PREFIX MIMI_SPIFFS_BASE "/skills/"

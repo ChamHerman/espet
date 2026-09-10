@@ -15,28 +15,13 @@
 
 static const char *TAG = "proxy";
 
-/* Only show warnings/errors by default; reduce polling noise */
-__attribute__((constructor)) static void proxy_log_level(void)
-{
-    esp_log_level_set(TAG, ESP_LOG_WARN);
-}
-
 static char     s_proxy_host[64] = {0};
 static uint16_t s_proxy_port     = 0;
 static char     s_proxy_type[8] = "http"; // "http" or "socks5"
 
 esp_err_t http_proxy_init(void)
 {
-    /* Start with build-time defaults */
-    if (MIMI_SECRET_PROXY_HOST[0] != '\0' && MIMI_SECRET_PROXY_PORT[0] != '\0') {
-        strncpy(s_proxy_host, MIMI_SECRET_PROXY_HOST, sizeof(s_proxy_host) - 1);
-        s_proxy_port = (uint16_t)atoi(MIMI_SECRET_PROXY_PORT);
-        if (MIMI_SECRET_PROXY_TYPE[0] != '\0') {
-            strncpy(s_proxy_type, MIMI_SECRET_PROXY_TYPE, sizeof(s_proxy_type) - 1);
-        }
-    }
-
-    /* NVS overrides take highest priority (set via CLI) */
+    /* Check NVS first */
     nvs_handle_t nvs;
     if (nvs_open(MIMI_NVS_PROXY, NVS_READONLY, &nvs) == ESP_OK) {
         char tmp[64] = {0};
@@ -47,7 +32,6 @@ esp_err_t http_proxy_init(void)
             if (nvs_get_u16(nvs, MIMI_NVS_KEY_PROXY_PORT, &port) == ESP_OK && port) {
                 s_proxy_port = port;
             }
-            // Read proxy type from NVS
             len = sizeof(tmp);
             memset(tmp, 0, sizeof(tmp));
             if (nvs_get_str(nvs, "proxy_type", tmp, &len) == ESP_OK && tmp[0]) {
@@ -55,6 +39,19 @@ esp_err_t http_proxy_init(void)
             }
         }
         nvs_close(nvs);
+    }
+
+    /* Build-time secrets from mimi_secrets.h take precedence */
+    if (MIMI_SECRET_PROXY_HOST[0] != '\0') {
+        strncpy(s_proxy_host, MIMI_SECRET_PROXY_HOST, sizeof(s_proxy_host) - 1);
+        s_proxy_port = (uint16_t)atoi(MIMI_SECRET_PROXY_PORT);
+        if (MIMI_SECRET_PROXY_TYPE[0] != '\0') {
+            strncpy(s_proxy_type, MIMI_SECRET_PROXY_TYPE, sizeof(s_proxy_type) - 1);
+        }
+    } else {
+        /* If secrets explicitly define empty proxy, force direct connection */
+        s_proxy_host[0] = '\0';
+        s_proxy_port = 0;
     }
 
     if (s_proxy_host[0] && s_proxy_port) {
