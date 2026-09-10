@@ -11,9 +11,9 @@
 > |---|---|
 > | **Firmware** | Pure C, ESP-IDF v5.5+, FreeRTOS (`main/`) |
 > | **Backend** | Python 3.11+, FastAPI (`espet-backend/`) |
-> | **Dashboard** | Vanilla HTML/CSS/JS + anime.js (`espet-backend/static/`) |
+> | **Dashboard** | React 19 + antd 6 + @lobehub/ui SPA (`espet-backend/src/`) |
 > | **LLM** | OpenAI-compatible endpoint (LM Studio / cloud) or Anthropic API |
-> | **Docs** | This file · `docs/ARCHITECTURE.md` (firmware detail) · `.agent/ESPET_PINS.MD` (wiring) |
+> | **Docs** | This file · `.agent/FR.MD` (locked functional reqs) · `docs/ARCHITECTURE.md` (firmware detail) · `.agent/ESPET_PINS.MD` (wiring) |
 
 ---
 
@@ -224,6 +224,14 @@ outbound dispatch task → OLED boot animation → agent_loop_start
 | `/spiffs/sessions/*` | session_mgr | agent loop | Rolling conversation history |
 | `/spiffs/skills/*.md` | web dashboard (config sync) **and** the agent (`write_file`) | context builder | Reusable skill playbooks |
 
+> **Locked Memory & RAG Requirements (`.agent/FR.MD`)**:
+> Local SPIFFS holds fast, active working memory. Aged daily notes (`YYYY-MM-DD.md`)
+> automatically archive to the backend (`POST /api/memory/archive`), where they are chunked
+> and embedded into SQLite (`db/espet.db`) via `sqlite-vec` and local CPU `fastembed`.
+> During ReAct turns, the agent queries persistent memory via remote tool calls
+> (`memory_search` / `memory_save`) with strict `user_id` query isolation.
+> See authoritative spec: [`.agent/FR.MD`](./FR.MD).
+
 ### 3.4 Proactive daemons
 
 - **`cron/cron_service.c`** — up to 16 jobs in `/spiffs/cron.json`. Two kinds:
@@ -284,9 +292,11 @@ first-boot setup from a phone). `ota/` for firmware updates.
 | Role | How |
 |---|---|
 | **MCP host/router** | Connects to Google's official remote MCP servers (Gmail, Calendar, Docs, Drive) listed in `config/mcp_servers.json`; auto-discovers all tool schemas at startup into one registry (`mcp/client.py`, `mcp/registry.py`) |
-| **Single tool endpoint** | `POST /api/mcp/execute` forwards `{tool_name, arguments}` to whichever MCP server owns that tool — adding a new MCP server needs **zero code changes** on backend or firmware |
-| **Auth manager** | One-time Google OAuth consent at `/auth/google` (launched from the dashboard's **Login with Google** popup); access + refresh tokens in `db/tokens.db`, refreshed automatically. After a re-auth the dashboard calls `POST /api/mcp/reconnect` to re-discover tools with the fresh token — no backend restart needed. The ESP32 only ever presents the shared device API key |
-| **Config source of truth** | `config_store.py` + `data/config.json` — everything the web dashboard edits (see §5) |
+| **Single tool endpoint** | `POST /api/mcp/execute` forwards `{tool_name, arguments}` to whichever MCP server or internal tool owns that tool — adding a new tool needs **zero code changes** on firmware |
+| **Persistent Memory & RAG (Locked: FR.MD)** | Manages local vector RAG via `sqlite-vec` + local CPU `fastembed` in unified SQLite (`db/espet.db`). Endpoints for daily note archiving (`POST /api/memory/archive`), conversational search (`memory_search`), and fact saving (`memory_save`) with strict `user_id` isolation. Governed by [`.agent/FR.MD`](./FR.MD). |
+| **Device-User Identity Binding** | Maps physical ESP32 devices to owners (`devices.device_id -> user_id`), ensuring multi-user isolation with zero cross-contamination without needing heavy JWT auth on firmware. |
+| **Auth manager** | One-time Google OAuth consent at `/auth/google` (launched from the dashboard's **Login with Google** popup); access + refresh tokens in `db/tokens.db` (migrating to unified `espet.db`), refreshed automatically. After a re-auth the dashboard calls `POST /api/mcp/reconnect` to re-discover tools with the fresh token — no backend restart needed. The ESP32 only ever presents the shared device API key |
+| **Config source of truth** | `config_store.py` + `data/config.json` (migrating to SQLite `db/espet.db` per FR.MD) — everything the web dashboard edits (see §5) |
 | **Dashboard host** | Serves the control center UI at `/` (`api/ui_router.py` + `static/`) |
 
 ### 4.2 API surface
@@ -297,20 +307,25 @@ first-boot setup from a phone). `ota/` for firmware updates.
 | `GET` | `/health` | — | Status + connected MCP servers/tool counts |
 | `GET` | `/auth/google` · `/auth/status` | — | OAuth login + link state (status also reports `token_valid` + `token_updated_at`) |
 | `GET` | `/api/tools` | device key | Full tool schema list (feeds the agent's system prompt) |
-| `POST` | `/api/mcp/execute` | device key | Execute any remote tool |
+| `POST` | `/api/mcp/execute` | device key | Execute any remote tool (MCP or internal tools like `memory_search` / `memory_save`) |
 | `POST` | `/api/mcp/reconnect` | device key | Re-run MCP discovery with the current token (after Google re-auth) |
+| `POST` | `/api/memory/archive` | device key | Upload aged daily notes (`YYYY-MM-DD.md`) from SPIFFS to SQLite RAG (FR.MD) |
 | `GET` | `/api/config` | device key | **Config bundle the device pulls** |
 | `GET` | `/api/config/version` | device key | Per-section versions (cheap poll) |
 | `PUT` | `/api/ui/profile` · `/soul` · `/memory` | device key | Edit USER.md / SOUL.md / MEMORY.md |
+| `GET/POST/DELETE` | `/api/ui/memory[/{id}]` | device key | Dashboard memory search, manual creation, and deletion (FR.MD) |
+| `GET/POST` | `/api/ui/devices[/bind]` | device key | List devices and re-bind physical ESP32 hardware to user owners (FR.MD) |
 | `PUT` | `/api/ui/device` | device key | Name, timezone (IANA + generated POSIX TZ), sync interval |
 | `GET/POST/PUT/DELETE` | `/api/ui/jobs[/{id}]` | device key | Web-managed cron jobs |
 | `GET/POST/PUT/DELETE` | `/api/ui/skills[/{id}]` | device key | Web-managed skill markdown files |
 | `GET` | `/api/skills/sync` | device key | Skill bundle the device pulls when `versions.skills` advances (enabled skills only) |
 | `GET/PUT` | `/api/ui/avatar` | device key | Agent avatar dress-up state (dashboard-only) |
 
-Auth model: one shared **device API key** (`Bearer`, set in `.env` and
-`main/mimi_config.h`) for everything — single-user scope by design. CORS open
-on LAN; put TLS in front before leaving the local network.
+Auth model: Physical ESP32 hardware binds to an owner `user_id` in SQLite. Requests from
+devices present `Bearer <device_api_key>` which resolves to their bound owner (default `'default_user'`).
+Queries strictly scope with `WHERE user_id = :uid` and vector join on `memory_chunks.user_id`
+to guarantee zero cross-tenant leakage (see [`.agent/FR.MD`](./FR.MD)). CORS open on LAN;
+put TLS in front before leaving the local network.
 
 ### 4.3 What the device-pull bundle looks like
 
@@ -560,7 +575,8 @@ espet/
 │   │                          config_router (device pull + UI CRUD) · ui_router (dashboard)
 │   ├── auth/                  device_auth (Bearer key) · oauth_manager · token_store
 │   ├── mcp/                   client + auto-discovery registry
-│   ├── db/tokens.db           OAuth token store (SQLite)
+│   ├── db/tokens.db           OAuth token store (SQLite, consolidating into espet.db)
+│   ├── db/espet.db            Unified SQLite DB: config, RAG memory (sqlite-vec), devices (FR.MD)
 │   ├── package.json           front-end vendor deps (animejs, three) + esbuild
 │   ├── tools/toy-entry.js     esbuild entry → static/vendor/toy.bundle.js (3D agent)
 │   ├── static/                index.html · style.css · app.js
@@ -568,6 +584,7 @@ espet/
 │   └── data/config.json       live config (gitignored, seeded on first run)
 ├── DESIGN.MD                  dashboard design system doc (tokens, components, layout)
 ├── docs/ARCHITECTURE.md       firmware-deep architecture
+├── .agent/FR.MD               locked functional requirements (Memory, RAG, SQLite, Multi-user)
 ├── .agent/HERMAN_ROADMAP.MD   proactive-half gap analysis + prioritized roadmap
 └── .agent/ESPET_PINS.MD       wiring table
 ```
@@ -614,6 +631,8 @@ Herman's full gap analysis and prioritized roadmap of needed tools/functions:
 
 Append-only session log. Newest first. One line per change:
 `- YYYY-MM-DD — summary (files: ...)`.
+
+- 2026-09-10 — **Locked Functional Requirements for Memory, RAG & Storage (.agent/FR.MD):** formalized and locked architecture decisions: 100% embedded/local-first SQLite backend (db/espet.db) with sqlite-vec (384d) and local CPU fastembed (zero cloud DB, zero external embedding API keys), single shared DB with strict user_id foreign keys and query joins (zero cross-user leakage), physical device-to-user binding table, and dual-pipeline memory ingestion (aged daily notes auto-archive + agent memory_save/memory_search ReAct tools + React dashboard memory management). Updated SYSTEM_OVERVIEW.md to map FR.MD as authoritative locked functional requirements (files: .agent/FR.MD, .agent/SYSTEM_OVERVIEW.md).
 
 - 2026-09-09 — **Frontend redesign (this session, frontend-only):** replaced the
   vanilla `app.js`/`style.css`/anime.js dashboard with a **React 19 + antd 6 +
