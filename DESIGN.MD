@@ -1,142 +1,188 @@
 # ESPET Dashboard — Design System (DESIGN.MD)
 
-Source of truth: `espet-backend/static/style.css` (dark glassmorphism).
-Served by the FastAPI backend at `/`; single page, no build step.
-Cache-busting: asset URLs carry `?v=N` in `index.html` — **bump N on every CSS/JS edit**.
+**The single source of truth for the frontend's visual language.** Every UI
+change to `espet-backend/src/` must follow these tokens — and **must update this
+file in the same change** when a token, pattern, or component rule evolves
+(mandated in AGENTS.md).
+
+Implementation lives in: `src/global.css` (canvas, orbs, buttons, utilities),
+`src/theme.tsx` (antd tokens + `ESPET_COLORS`), `src/ui.tsx` (glass primitives,
+badges, layout), `src/components/` (GlassNav, SectionRail, StatusChips,
+MarkdownField/SourceField), `static/index.html` (boot splash, favicon, fonts).
+Built by `npm run build:app` → `static/vendor/app/` (cache-bust `?v=<hash>`
+stamped automatically by the build — never bump it by hand).
 
 ---
 
 ## 1. Design language
 
-- **Style**: dark glassmorphism, density 8/10 — translucent cards over an ambient gradient backdrop.
-- **Palette**: slate-dark base + emerald accent; blue for informational/interactive, amber for warnings/dirty-state, red for danger.
-- **Fonts**: Outfit (UI), JetBrains Mono (values, code, badges). Loaded from Google Fonts.
-- **Personality**: soft glows on status dots, blurred ambient "orbs", gentle hover lifts — motion is progressive enhancement only (`prefers-reduced-motion` honored).
+- **Monochrome canvas**: black + white for every surface, tone, chart and
+  accent — brightness, never hue. Exactly TWO chromatic exceptions:
+  the **dim light-blue accent family** (primary buttons, checked toggles,
+  selected segments/radio buttons, text selection) and **semantic status
+  colors** (dimmed mint / red / yellow — see §2).
+- Dark-first glassmorphism, density ~7/10: translucent white-on-black glass
+  surfaces floating over a moving dimmed-white gradient canvas.
+- Motion is springy but restrained; always progressive enhancement —
+  `prefers-reduced-motion` disables orbs, springs, and pulses.
+- Brand mark: `static/brand/espet_logo.jpg` (black-background robot badge —
+  blends into the canvas). 46 px nav / 40 px Chat header / 128 px boot splash /
+  favicon. Never pair a stroked `Icon` with a light Avatar gradient without
+  setting a dark `color` — antd Avatar's default icon color is white.
 
-## 2. Tokens (`:root`)
+## 2. Color tokens
 
-### Colors
+### Canvas & glass
 
 | Token | Value | Use |
 |---|---|---|
-| `--bg` | `#0a0e17` | Page background |
-| `--bg-elevated` | `#101725` | Elevated surfaces |
-| `--card` | `rgba(21, 28, 46, 0.62)` | Glass card fill |
-| `--card-solid` | `#141b2d` | Modals, toasts (opaque) |
-| `--card-hover` | `rgba(30, 40, 66, 0.72)` | Row hover fill |
-| `--inset` | `rgba(255, 255, 255, 0.035)` | Inset wells, inputs, buttons |
-| `--border` | `rgba(255, 255, 255, 0.08)` | Hairline borders |
-| `--border-strong` | `rgba(255, 255, 255, 0.16)` | Input/button borders |
-| `--text` | `#f1f5f9` | Primary text |
-| `--text-muted` | `#94a3b8` | Secondary text |
-| `--text-dim` | `#64748b` | Hints, labels |
-| `--accent` | `#10b981` | Emerald accent |
-| `--accent-soft` | `rgba(16, 185, 129, 0.14)` | Accent fills |
-| `--accent-border` | `rgba(16, 185, 129, 0.38)` | Accent borders |
-| `--blue` | `#3b82f6` | Info/focus |
-| `--blue-soft` / `--blue-border` | `rgba(59,130,246,.14)` / `.38` | Info fills/borders |
-| `--amber` | `#fbbf24` | Warnings, unsaved-changes |
-| `--amber-soft` / `--amber-border` | `rgba(245,158,11,.13)` / `.4` | Warning fills/borders |
-| `--red` | `#f87171` | Danger, errors |
-| `--red-soft` / `--red-border` | `rgba(239,68,68,.13)` / `.4` | Danger fills/borders |
-| `--ok` | `#34d399` | "Connected/online" states |
+| `--espet-bg` | `#050505` | Page background (near-black) |
+| `--espet-elevated` | `#101010` | antd `colorBgContainer` |
+| Glass fill | `rgba(255,255,255,0.055)` | cards, nav pill, dock (`blur(12-20px) saturate(1.1)`) |
+| Glass soft | `rgba(255,255,255,0.035)` | inset wells, rows |
+| Hairline border | `rgba(255,255,255,0.09-0.12)` | every glass edge |
+| Top highlight | `inset 0 1px 0 rgba(255,255,255,0.1)` | nav/dock depth |
+| Floating shadow | `0 10px 40px rgba(0,0,0,0.55)` | nav, dock, bubbles |
+| Solid bubble fill | `#0b0b0b` | rail dots (opaque so the line stops at them) |
 
-Status-color recipe: tinted fill + matching border + colored text, e.g. badges `.badge.emerald{color:#34d399;border-color:var(--accent-border);background:var(--accent-soft)}`.
+### Text ramp (pure neutral grays — no slate/blue tint)
 
-### Geometry & type
-
-| Token | Value |
-|---|---|
-| `--radius` | `14px` (cards, stages, empty states) |
-| `--radius-sm` | `9px` (inputs, buttons, rows, nav items) |
-| `--sidebar-w` | `232px` |
-| `--font-ui` | `"Outfit", system-ui, sans-serif` |
-| `--font-mono` | `"JetBrains Mono", ui-monospace, monospace` |
-
-Body: `15px / 1.55`. Pills (chips, badges, filters) use `border-radius: 999px`.
-
-## 3. Background & ambience
-
-- **Body**: fixed layered radial gradients — blue top-left (`0.13`), purple top-right (`0.10`), emerald bottom-center (`0.09`) over `--bg`.
-- **Orbs** (`.bg-orbs`, `aria-hidden`): three fixed blurred circles (`blur(80px)`, opacity `0.16`, blue/purple/emerald), drifted slowly by anime.js. Decorative only, `pointer-events: none`, `z-index: 0`; the app shell sits at `z-index: 1`.
-
-## 4. Layout architecture
-
-```
-.app  display:grid; grid-template-columns: var(--sidebar-w) 1fr; min-height:100vh
-├── .sidebar   sticky, 100vh, glass (rgba(10,14,23,.62) + blur(14px)), border-right
-│   ├── .brand         40px gradient mark (blue→emerald) + name/sub
-│   ├── .nav           column of .nav-item; .nav-label section headers
-│   └── .sidebar-foot  margin-top:auto; backend/device footnote
-└── .main      max-width:1080px; width:100%; margin-inline:auto  ← centered in
-              the 1fr column (padding 22px 30px 60px)              remaining space
-    ├── .topbar        h1 + subtitle, right: .topbar-meta chips; bottom hairline
-    └── #view-root     per-view content (entrance animated by anime.js)
-```
-
-**Invariant**: `.main` must stay horizontally centered in the space right of the sidebar (`margin-inline: auto`). Removing that centering is what caused the all-left layout bug.
-
-Sidebar active item: `linear-gradient(90deg, rgba(59,130,246,.16), rgba(16,185,129,.10))` + blue border; status dot (`.nav-dot`) glows `--ok` or `--red`.
-
-### Status chips (`.chip`)
-
-Pills in the topbar: server state (`.dot.ok/.bad` with glow), config version, unsaved-changes (`.chip.dirty` = amber tint + pulsing dot).
-
-## 5. Components
-
-| Component | Anatomy / key rules |
-|---|---|
-| **Card** `.card` | glass fill + `--border`, radius 14, padding 20, `blur(12px)`; hover brightens border. Head: `.card-head` (`.card-title` w/ 17px emerald svg + actions), `.card-sub` muted line |
-| **Grids** | `.grid.cols-3` / `.grid.cols-2`, gap 16; `.stack` = column flex, gap 16 |
-| **Stat** `.stat` | uppercase `.stat-label` (0.72rem, tracking .09em) + `.stat-value` 1.35rem mono; `.ok/.bad/.dim` variants; `.stat-detail` below |
-| **Buttons** `.btn` | inset bg, strong border, radius-sm; `.primary` = emerald gradient, near-black text `#04110b`, glow shadow, `-1px` hover lift; `.blue` = blue gradient; `.danger-ghost` = red outline; `.small`; disabled at 45% opacity |
-| **Icon button** `.icon-btn` | 30×30 ghost square; `.danger` hover tints red |
-| **Forms** `.field` | label (muted, 600) → control → `.hint` (dim, 0.73rem). Inputs: near-black fill `rgba(8,12,20,.7)`, strong border; focus = blue border + `0 0 0 3px rgba(59,130,246,.22)` ring. Select: custom chevron svg, `appearance:none`. `.checkbox-row` uses `accent-color: var(--accent)` |
-| **Switch** `.switch` | 36×20 track, 16px knob travel; checked = emerald soft bg + accent knob |
-| **Row item** `.row-item` | inset well; `.name` (0.92rem/600) + `.meta` (0.78rem), right `.actions`. Hover → `--card-hover` |
-| **Badge** `.badge` | mono 0.7rem pill; `.emerald` / `.blue` / `.amber` tint recipes |
-| **Empty state** `.empty` | dashed `--border-strong` box, centered dim text + 26px icon |
-| **Banner** `.banner` | amber default; `.info` blue, `.danger` red (same tint recipe); icon + text |
-| **KV row** `.kv-row` | label muted / value mono, inset well |
-| **Modal** | `.modal-backdrop` fixed blur(7px) `rgba(2,6,14,.72)`, fade+visibility transition; `.modal` opaque `--card-solid`, radius 16, max-w 560 (`.wide` 760 for dress-up), sticky head, foot right-aligned; `pre` on `#070b13` |
-| **Toast** `.toast` | fixed bottom-right stack (`.toast-wrap`), `--card-solid`, emerald border; `.error` red; spring entrance `cubic-bezier(0.2,0.9,0.3,1.2)`; container `aria-live="polite"` |
-| **Tool card** `.tool-card` | auto-fill grid `minmax(330px,1fr)`; mono blue `.tool-name`, 3-line clamped `.tool-desc`; search input (max 320px) + pill `.filter-btn` row |
-| **Segmented** `.seg` | 2-col grid in inset well; active segment = blue soft + `#93c5fd` |
-| **Skeleton** `.skeleton` | shimmer gradient sweep, 1.4s loop |
-
-## 6. Agent showcase (3D stage)
-
-- `.stage-hero`: min-height 450; `.stage-3d` 430px canvas layer over the stage backdrop, `-28px` bottom overlap so the robot stands over the podium.
-- `.stage`: layered radial glows (emerald top `0.20`, blue bottom `0.16`) over near-black; centered `.stage-spot` spotlight halo; `.stage-podium` emerald ellipse glow; corner overlays `.stage-badge` / `.stage-name` (mono).
-- Engine: three.js + RobotExpressive glTF via `static/vendor/toy.bundle.js` (esbuild bundle of `tools/toy-entry.js`; rebuild with `npm run build:vendor` — only needed when that entry changes).
-- Fallback (no WebGL/JS): `.stage-avatar.fallback` renders a large emoji.
-- **Dress-up workbench** (modal `.wide`): `.dress-grid` 2 cols (1 col < 700px) of `.dress-group`s — uppercase `.dress-label` + `.dress-row` of `.chip-btn` pills (optional `.swatch` dot); active = emerald tint. Trait readout uses `.trait` emerald pills.
-
-## 7. Motion
-
-| Animation | Where | Spec |
+| Token | Value | Use |
 |---|---|---|
-| View entrance | `#view-root` | anime.js `animateView` (JS-driven) |
-| Orb drift | `.orb` | anime.js, slow |
-| `pulse` | dirty chip dot | opacity 1→0.45→1, 2.4s infinite |
-| `toast-in` | toasts | translateY(10px)+scale(.97)→none, 220ms spring |
-| `shimmer` | skeletons | background-position sweep, 1.4s |
-| Hover transitions | cards/rows/buttons | 140–220ms ease; primary button lifts 1px |
+| text | `#f5f5f5` | primary |
+| text-muted | `#a3a3a3` | secondary, labels |
+| text-dim | `#737373` | hints, footer credit |
+| on-active (dark) | `#050505` | icon on white-filled active bubble/chip |
 
-`prefers-reduced-motion: reduce` nukes all animation/transition durations to ~0 — the page is fully functional without motion.
+### Semantic status tones (dimmed hues — the sanctioned exception)
 
-## 8. Responsive breakpoints
+Success / live / online / complete paths are **dimmed mint green**; failure /
+offline / disconnected paths are **dimmed red**; warnings and anything needing
+user attention are **dimmed yellow**; general / informational messages stay
+glass black + white. Status text is always **Title Case** ("Not Connected",
+"Backend Online", "Unsaved Changes").
 
-| ≤ px | Changes |
-|---|---|
-| 980 | `.grid.cols-3` → 2 cols |
-| 820 | Sidebar collapses to a top bar (row layout, wraps; brand text, nav labels, foot hidden); `.main` padding 18px 16px 50px; all card grids → 1 col |
-| 700 | `.dress-grid` → 1 col |
+| Meaning | Text/dot | Glass bg | Border |
+|---|---|---|---|
+| Success (live, online, done) | `#8fd9ae` mint | `rgba(143,217,174,0.10)` | `rgba(143,217,174,0.28)` |
+| Warning / attention | `#e6cf94` yellow | `rgba(230,207,148,0.10)` | `rgba(230,207,148,0.28)` |
+| Danger (failed, offline) | `#eda7a7` red | `rgba(237,167,167,0.10)` | `rgba(237,167,167,0.28)` |
+| Neutral / general | `#d4d4d4` | `rgba(255,255,255,0.06)` | `rgba(255,255,255,0.12)` |
 
-## 9. Accessibility conventions
+antd tokens mirror these in `theme.tsx` (`colorSuccess/colorWarning/colorError`
+= the hues above, `colorInfo` stays gray `#d4d4d4`) so Badge dots, Alerts,
+Switch danger buttons and toasts inherit them. Toast kinds: `toast(msg,
+"success" | "error" | "info")` in `store.tsx` — in-progress messages are
+`"info"` (neutral glass), never fake-green.
 
-- `:focus-visible` everywhere: blue 2px outline (offset 2) on buttons/nav/icon-buttons; blue ring on inputs.
-- `[hidden] { display: none !important; }` — never fight the attribute with classes.
-- Modals: `role="dialog"` / `aria-modal`, labelled heads, close buttons with `aria-label`.
-- Toasts `aria-live="polite"`; decorative layers (`bg-orbs`) `aria-hidden`.
-- Confirm dialogs for destructive actions; unsaved-changes guard chip.
+Non-status decoration (charts, trait tags, meta badges) remains monochrome —
+chart palette `["#fafafa","#d4d4d4","#a3a3a3","#737373","#525252"]`.
+**Dim light-blue accent family** (the only other hue):
+- Primary button: gradient `rgba(96,165,250,0.22 → 147,197,253,0.14)`, border
+  `rgba(147,197,253,0.35)`, text `#dbeafe`.
+- Checked `Switch`: gradient `rgba(96,165,250,0.55 → 147,197,253,0.4)`
+  (global CSS, `.ant-switch-checked`).
+- Selected `Segmented` item / solid `Radio.Button`: bg
+  `rgba(147,197,253,0.22)`, text `#dbeafe` (antd component tokens).
+- Text selection `::selection`: `rgba(147,197,253,0.35)` + `#f0f7ff`.
+No other hues, no slate/blue-tinted grays; never antd preset
+`Tag color="blue"` etc.
+
+## 3. Typography
+
+| Role | Font | Notes |
+|---|---|---|
+| All UI + rendered content | **Outfit** (Google Fonts 300-700) | incl. markdown **previews** (Preview tab) |
+| Raw markdown only | **JetBrains Mono** 13px | Edit-tab textareas, SourceField; antd `fontFamilyCode` |
+| Technical values | JetBrains Mono via `.espet-mono` | versions, bytes, addresses, file names |
+
+Rule: *if the user is looking at markdown source, it's mono; if they're reading
+rendered content, it's Outfit.* Body `15px / 1.55`. No other fonts.
+
+## 4. Layout
+
+- Content column: max-width **1080 px**, centered, `padding 22px 22px 90px`.
+- Floating nav pill: fixed `top 14px`, **centered with `width: fit-content`**
+  (`left/right: 16px; margin-inline: auto`), height 70, radius 20 — brand +
+  items only, no empty stretch, no status chips. Reserve space with
+  `--espet-nav-h` (98 px desktop / 88 px mobile) — the GlassNav spacer, Chat
+  height, and section `scroll-margin-top` all consume it.
+- **Scroll owns `html`, never body**: `html { overflow-x: clip;
+  overflow-y: auto }`, `body { overflow-x: clip }`, `#root { min-height: 100% }`
+  (no `height: 100%`). Explicit html overflow stops body→viewport overflow
+  propagation, so antd Modal's body scroll-lock can't reset `window.scrollY`
+  (the "modal opens, page jumps to top" bug). Never `overflow-x: hidden`
+  either (it would make body a scroll container and break `window.scrollY`).
+- Section rail (Assistant/System pages): fixed right 14, vertical center;
+  solid 36 px bubbles (32 px mobile) on a 2 px white gradient line passing
+  through their centres; label pill collapsed to zero width except the active
+  bubble, slides open on hover — the rail never crowds content.
+- **StatusDock**: fixed bottom-right (14/14) glass chips — config version
+  (neutral glass, mint dot) + backend health (mint/red). Desktop only; mobile
+  keeps the compact chip row in the top brand pill. "Unsaved Changes" shows on
+  the **container being edited** (card header), never in the nav.
+- Radius scale: 999 (pills/chips) · 20-22 (nav, dock) · 16 (cards, frames) ·
+  12-14 (inputs, sections; antd `borderRadius: 14`).
+- Spacing: card padding 20, stacks 18-30, grids 16.
+- Control height: global `controlHeight: 40` — inputs, selects, segmented and
+  buttons all share one 40 px middle size (so `addonBefore` groups line up
+  with their Save button); small controls use `controlHeightSM`.
+- Breakpoints: single nav breakpoint at **820 px** (top pill ↔ brand pill +
+  bottom dock); content grids collapse at 720/860.
+
+## 5. Motion (`motion` — "motion/react")
+
+- Nav: spring entrance (`stiffness 260, damping 22`), scroll shrink
+  `scale 0.97`, active pill magic-move via shared `layoutId`.
+- Items: hover `scale 1.05 / y -1`, tap `0.94`; brand wiggle `scale 1.12
+  rotate -4`.
+- Buttons: hover lift `translateY(-2) scale(1.02)` (cubic-bezier
+  `.34,1.56,.64,1`), press `0.98`.
+- Orbs: 4 dimmed-white radials, closed multi-waypoint viewport paths, 60-95 s.
+- Reduced motion: springs → `duration: 0`; orbs/pulses off.
+
+## 6. Components
+
+- **Card** (`ui.tsx`): glass fill + hairline + radius 16; `hover` prop adds the
+  lift + brighter border.
+- **Badge/Chip**: pill, 13 px, semantic tone (`ui.tsx` `Badge` tone
+  `default/success/warning/danger`; 12 px meta badges). **`StatusChip`**
+  (`StatusChips.tsx`): the 13 px glass pill (7/15 padding) for live status —
+  built-in semantic dot, optional `pulse`; Title Case text. **`SectionDirtyChip`**:
+  yellow pulsing "Unsaved Changes" chip rendered in the edited card's header
+  (sections `soul/profile/memory/device`).
+- **Primary button**: antd/lobe `Button type="primary"` — global CSS paints the
+  dim-blue gradient; never hand-roll a colored button.
+- **Toggles & selection**: checked `Switch`, selected `Segmented` item and
+  solid `Radio.Button` all take the dim-blue accent family (§2); selection
+  states must never be grey-with-white-text. Switch labels keep an 8 px gap.
+- **Markdown fields — ONE unified editor**: `SourceField` (components/
+  SourceField.tsx) everywhere. "Content (markdown)" caption above small
+  antd Tabs **Edit | Preview** (Edit default): Edit = exact-byte JetBrains Mono
+  textarea (16/14 padding, mono 13px), Preview = lobe `Markdown` in Outfit;
+  live byte counter with `byteLimit`. `canonical()` lives here too. No
+  Segmented "View/Edit" anywhere.
+- **Switch + label**: never a bare text node next to `<Switch />` — wrap the
+  label: `<Switch />{" "}<span style={{ marginLeft: 8 }}>Label</span>` (or a
+  flex row with gap, as `rowItem` does).
+- **SectionRail**: see §4.
+- **StatusChips**: `StatusDock` (bottom-right) + `StatusChips` (mobile top bar)
+  + `StatusChip`/`SectionDirtyChip` primitives. Nothing status-related in the
+  nav.
+- **Footer**: plain text only — no background, no border. Centered — brand
+  `#a3a3a3` · separator `#3f3f46` · credit `#737373`.
+- **Toasts/confirms**: antd `App` context + store `toast(msg, kind)` /
+  `confirm()` only; kind = success (mint) / error (red) / info (glass).
+
+## 7. Wording
+
+- The product is **ESPET** everywhere user-facing (copy, defaults, persona).
+- **MimiClaw appears only as the footer credit.** Never introduce it as a label.
+- Voice: direct, second person, no marketing fluff.
+
+## 8. Honesty rules
+
+- No fake data: charts render only from real endpoints/localStorage samples;
+  unavailable device features (e.g. the camera endpoint until firmware ships
+  it) show a clear offline state, never a placeholder frame.
+- Destructive actions go through `confirm()`; dirty state guards navigation.

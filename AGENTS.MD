@@ -89,8 +89,9 @@ The ESP32-S3 dual Xtensa LX7 cores strictly separate networking from agent compu
 │   ├── auth/               # Device API key verification, OAuth manager, SQLite token store
 │   ├── config/             # Remote MCP server registry (mcp_servers.json)
 │   ├── mcp/                # Multi-server MCP client and tool registry
-│   ├── static/             # Web dashboard UI and 3D avatar assets
-│   └── tools/              # Frontend asset bundling scripts (toy-entry.js)
+│   ├── src/                # Dashboard SPA source (React 19 + @lobehub/ui, TSX)
+│   ├── static/             # Built dashboard (static/vendor/app) + 3D avatar assets
+│   └── tools/              # esbuild build scripts (toy-entry.js, build-app.mjs)
 ├── scripts/                # Platform setup and build helpers (setup_idf_*.sh, build_*.sh)
 ├── skills/deploy/scripts/  # Deployment orchestration (deploy.sh) and pre-flight check (validate.sh)
 ├── docs/                   # Technical documentation, hardware test runbooks, integration guides
@@ -158,13 +159,20 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8000
 # Or run directly: python main.py
 ```
 
-### 3. Frontend Asset Bundling (Optional)
-The pre-built dashboard bundle `static/vendor/toy.bundle.js` is checked into git. Re-bundling is only required when modifying `tools/toy-entry.js`:
+### 3. Frontend Build (dashboard SPA + 3D avatar assets)
+The dashboard is a **React 19 + antd 6 + `@lobehub/ui`** SPA (source in
+`espet-backend/src/`, TypeScript). esbuild bundles it to `static/vendor/app/`
+(ESM + code-splitting) and the 3D viewer to `static/vendor/toy.bundle.js`; both
+are **checked into git** (firmware CI never runs Node). Rebuild after editing
+`src/**` or `tools/toy-entry.js`:
 ```bash
 cd espet-backend
-npm install
-npm run build:vendor
+npm install --legacy-peer-deps   # lobe-charts peer-wants @lobehub/ui ^4; 5.x is fine
+npm run build:app                # src/ → static/vendor/app/ (stamps cache-bust ?v in index.html)
+npm run build:vendor             # tools/toy-entry.js → static/vendor/toy.bundle.js
 ```
+The SPA consumes the existing `/api/*`, `/health`, `/auth/*` endpoints — no
+backend change is needed to run it. `ui_router.py` still serves `static/index.html`.
 
 ### 4. CI Build Verification
 GitHub Actions (`.github/workflows/build.yml`) validates compilation on every push using container `espressif/idf:v5.5.2`:
@@ -357,3 +365,16 @@ Every update in feature/new implementation — regardless of size — MUST auto-
 - Scope: features, behavior changes, new files/modules, schema/API/config changes.
   Pure refactors that change no behavior are exempt.
 - Rule is enforced during every session; verify SYSTEM_OVERVIEW.md diff before finishing.
+
+## Design Token Rule (Mandatory)
+
+`DESIGN.MD` (repo root) is the single source of truth for the frontend's visual
+language — monochrome black/white system, dim-blue primary buttons, typography,
+glass, motion, and component rules.
+
+- Any change to the frontend UI (`espet-backend/src/`, `static/index.html`,
+  themes, components, views) MUST follow the tokens in `DESIGN.MD`.
+- Any change that introduces, alters, or retires a token, pattern, or
+  component rule MUST update `DESIGN.MD` in the same change — no separate
+  request needed. Verify the DESIGN.MD diff alongside the SYSTEM_OVERVIEW.md
+  diff before finishing.

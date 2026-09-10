@@ -1,18 +1,42 @@
-# ESPET / MimiClaw Hardware Pinout Reference
+# ESP32-S3 Hardware Pin Map (Authoritative — 2026-09 remap)
 
-| Peripheral / Signal | Component | Pin | Protocol / Details |
-|---|---|---|---|
-| **OLED Clock (SCL)** | SSD1306 OLED Display | **GPIO 2** | I2C0 SCL (400 kHz, pull-up) |
-| **OLED Data (SDA)** | SSD1306 OLED Display | **GPIO 1** | I2C0 SDA (400 kHz, pull-up) |
-| **Green Push Button** | Tactile Switch | **GPIO 41** | Input Pull-Up (0 = Pressed, PTT Audio Record) |
-| **White Push Button** | Tactile Switch | *Unassigned* | Currently disabled / unassigned (was GPIO 38) |
-| **Status LED** | Discrete White LED | **GPIO 42** | Output (1 = HIGH / ON, 0 = LOW / OFF) |
-| **Audio I2S BCLK** | INMP441 Mic + MAX98357A Amp | **GPIO 38** | I2S0 Master Bit Clock (SCK / BCLK) |
-| **Audio I2S WS** | INMP441 Mic + MAX98357A Amp | **GPIO 39** | I2S0 Word Select / Frame Clock (WS / LRC) |
-| **Audio Speaker Out** | MAX98357A Amplifier | **GPIO 21** | I2S0 Data Output (`DOUT` / `DIN`) |
-| **Audio Mic Data In** | INMP441 Microphone | **GPIO 40** | I2S0 Data Input (`DIN` / `SD`) |
-| **Mic / Periph Power** | Power Rails | **5V / 3.3V** | VCC |
-| **Ground** | Ground Rails | **GND** | Ground (INMP441 GND + L/R to GND for Left channel) |
-| **Camera DVP Bus** | OV2640 Sensor | **GPIO 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18** | DVP parallel bus & SCCB |
-| **Serial Console** | UART0 (CP2102/CH340) | **GPIO 43 (TX), 44 (RX)** | 115200 baud interactive REPL console |
-| **Native USB** | ESP32-S3 USB/JTAG | **GPIO 19 (D-), 20 (D+)** | Native USB flashing & JTAG |
+Source of truth for GPIO assignments on the ESP32-S3-WROOM-1-N16R8.
+The firmware `#define`s (`main/mimi_config.h`) and all skills/docs **still carry
+the pre-remap numbers and must be migrated** — see `.agent/NEXT_PLAN_BACKEND.MD`.
+
+## User-Facing Peripherals
+
+| Peripheral | Component | GPIO (new) | Was | Notes |
+|---|---|---|---|---|
+| OLED Clock | SSD1306 | **2** | 21 | I2C SCL |
+| OLED Data | SSD1306 | **1** | 47 | I2C SDA |
+| Green Push Button | Tactile Switch | **41** | 39 | Input pull-up; press-hold = PTT voice record |
+| Status LED (white) | Discrete LED | **42** | 40 | Output (1 = ON, 0 = OFF) |
+| Audio BCLK / SCK | INMP441 + MAX98357A | **38** | 41 | I2S bit clock (shared mic + amp) |
+| Audio WS / LRC | INMP441 + MAX98357A | **39** | 42 | I2S word select (shared mic + amp) |
+| Mic Data In (SD) | INMP441 | **40** | 1 | I2S data input |
+| Speaker Data Out (DIN) | MAX98357A | **21** | 2 | I2S data output |
+| Mic Power | INMP441 VCC | **5V** | — | — |
+| Mic Ground | INMP441 GND + L/R | **GND** | — | L/R tied low = left channel |
+
+**WHITE push button: REMOVED** (old GPIO 38 → now the I2S BCLK line). The camera
+snapshot trigger it used to provide no longer has a physical button; camera capture
+must be driven by the agent (tool call) or a future replacement input.
+
+## Camera Bus (OV2640 DVP)
+
+Pins in `main/tools/tool_camera.c`: XCLK **15** · SIOD **4** · SIOC **5** ·
+D7 **16** · D6 **17** · D5 **18** · D4 **12** · D3 **10** · D2 **8** · D1 **9** ·
+D0 **11** · VSYNC **6** · HREF **7** · PCLK **13**
+
+## Reserved Pins (blocked for user GPIO tools)
+
+| Block | Pins | Reason |
+|---|---|---|
+| Octal Flash/PSRAM | 33–37 | Board wiring — never touch |
+| Native USB JTAG | 19, 20 | Flashing + JTAG |
+| UART0 Console | 43 (TX), 44 (RX) | Serial REPL (115200) |
+| Camera DVP bus | 4–18 | Camera-only |
+
+Post-migration user-GPIO allowlist should be `1,2,21,38,39,40,41,42` (47 is
+released; 38 is no longer a button).
