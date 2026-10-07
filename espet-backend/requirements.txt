@@ -33,3 +33,5 @@ python-dotenv>=1.0.0
 python-multipart>=0.0.9
 pydantic>=2.9.0
 pydantic-settings>=2.5.0
+# mDNS/Bonjour advertisement so the ESP32 can discover this backend at runtime
+zeroconf>=0.131.0

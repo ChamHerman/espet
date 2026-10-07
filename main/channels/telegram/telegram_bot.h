@@ -44,4 +44,18 @@ esp_err_t telegram_send_photo(const char *chat_id, const uint8_t *jpeg_data, siz
  */
 esp_err_t telegram_send_photo_to_last_chat(const uint8_t *jpeg_data, size_t jpeg_len, const char *caption);
 
+/**
+ * Send a video file to a Telegram chat using multipart/form-data.
+ * @param chat_id   Telegram chat ID
+ * @param video_data Pointer to the video bytes (e.g. MJPEG AVI)
+ * @param video_len  Length of the video bytes
+ * @param caption    Optional text caption (can be NULL)
+ */
+esp_err_t telegram_send_video(const char *chat_id, const uint8_t *video_data, size_t video_len, const char *caption);
+
+/**
+ * Send a video file to the most recent active Telegram chat.
+ */
+esp_err_t telegram_send_video_to_last_chat(const uint8_t *video_data, size_t video_len, const char *caption);
+
 

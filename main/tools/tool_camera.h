@@ -23,11 +23,28 @@ camera_fb_t* tool_camera_take_picture(void);
 void tool_camera_return_picture(camera_fb_t *fb);
 
 /**
- * @brief Start capturing a sequence of frames (Video Burst/Stream mock)
+ * @brief Start recording video: JPEG frames are captured into a PSRAM buffer
+ *        at ~10 fps until tool_camera_video_stop_and_get() is called or the
+ *        buffer/frame cap is hit (auto-stop).
  */
 void tool_camera_video_start(void);
 
 /**
- * @brief Stop capturing frames
+ * @brief Stop recording, finalize the frame store into an in-place MJPEG AVI
+ *        buffer, and hand it to the caller for upload.
+ *
+ * Blocks until the capture task exits (max 3 s). On success the caller owns
+ * the buffer returned via *avi_out and MUST free it with
+ * tool_camera_video_release().
+ *
+ * @param avi_out Receives the AVI buffer (NULL if no frames were captured).
+ * @param avi_len Receives the AVI size in bytes.
+ * @return ESP_OK, ESP_ERR_INVALID_STATE (no recording active),
+ *         ESP_ERR_NOT_FOUND (zero frames), ESP_ERR_TIMEOUT.
  */
-void tool_camera_video_stop(void);
+esp_err_t tool_camera_video_stop_and_get(uint8_t **avi_out, size_t *avi_len);
+
+/**
+ * @brief Free the AVI buffer returned by tool_camera_video_stop_and_get.
+ */
+void tool_camera_video_release(void);

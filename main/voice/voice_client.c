@@ -18,6 +18,8 @@
 
 #include "voice/voice_client.h"
 #include "mimi_config.h"
+#include "display/display_status.h"
+#include "sync/backend_discovery.h"
 #include "tools/tool_audio.h"
 #include "bus/message_bus.h"
 #include "esp_log.h"
@@ -59,8 +61,14 @@ static const char *TAG = "voice";
 
 #define CMD_MAX_MS             10000       /* hard cap on command capture */
 #define CMD_MAX_SAMPLES        (TOOL_AUDIO_SAMPLE_RATE * CMD_MAX_MS / 1000)
-#define CMD_SILENCE_MS         1600        /* stop after this much silence */
-#define CMD_SILENCE_RMS        350         /* quiet-room floor threshold */
+#define CMD_LEAD_MS            5000        /* grace to START talking: silence
+                                               stop only applies once speech
+                                               was heard (RMS > threshold) */
+#define CMD_SILENCE_MS         1600        /* stop after this much trailing
+                                               silence */
+#define CMD_SILENCE_RMS        200         /* voice @1m ≈ 300–1000 RMS, quiet
+                                               room floor <100 — 350 clipped
+                                               soft trailing words */
 
 #define VOICE_HTTP_TIMEOUT_MS  30000
 #define VOICE_HTTP_RX_MAX      (2 * 1024 * 1024)  /* PSRAM; long replies hit the
@@ -95,11 +103,13 @@ static size_t               s_ack_wav_len    = 0;
  * HTTP helpers (PSRAM buffers)
  * --------------------------------------------------------------------- */
 
-static char *voice_backend_url(const char *path)
+/* Writes into a caller-owned buffer: called from both the wake task (STT)
+ * and the outbound task (speak) — a shared static buffer would race. */
+static void voice_backend_url(char *out, size_t out_sz, const char *path)
 {
-    static char url[128];
-    snprintf(url, sizeof(url), "%s%s", MIMI_BACKEND_URL, path);
-    return url;
+    char base[96];
+    backend_discovery_base_url(base, sizeof(base));
+    snprintf(out, out_sz, "%s%s", base, path);
 }
 
 typedef struct {
@@ -138,10 +148,12 @@ static bool ack_fetch(void)
     tool_audio_speaker_session_begin();   /* feeder parks for download too */
     bool ok = false;
     char *body = "{\"text\":\"Yes?\"}";
+    char url[128];
+    voice_backend_url(url, sizeof(url), "/api/voice/tts");
     rx_buf_t rx = { .buf = s_ack_wav, .len = 0, .cap = ACK_CACHE_BYTES, .oom = false };
 
     esp_http_client_config_t cfg = {
-        .url = voice_backend_url("/api/voice/tts"),
+        .url = url,
         .method = HTTP_METHOD_POST,
         .timeout_ms = VOICE_HTTP_TIMEOUT_MS,
         .event_handler = rx_event_handler,
@@ -151,6 +163,9 @@ static bool ack_fetch(void)
     };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (!client) {
+        tool_audio_speaker_session_end();   /* never leak the gate: feeder
+                                               would park forever and the
+                                               wake word would go deaf */
         return false;
     }
     esp_http_client_set_header(client, "Authorization", "Bearer " MIMI_BACKEND_API_KEY);
@@ -198,8 +213,11 @@ static char *voice_transcribe(const int16_t *pcm, size_t samples)
         return NULL;
     }
 
+    char url[128];
+    voice_backend_url(url, sizeof(url), "/api/voice/transcribe");
+
     esp_http_client_config_t cfg = {
-        .url = voice_backend_url("/api/voice/transcribe"),
+        .url = url,
         .method = HTTP_METHOD_POST,
         .timeout_ms = VOICE_HTTP_TIMEOUT_MS,
         .event_handler = rx_event_handler,
@@ -215,6 +233,11 @@ static char *voice_transcribe(const int16_t *pcm, size_t samples)
     }
     esp_http_client_set_header(client, "Authorization", "Bearer " MIMI_BACKEND_API_KEY);
     esp_http_client_set_header(client, "Content-Type", "application/octet-stream");
+    {   /* tell the backend the capture rate so a mismatch can be converted */
+        char rate_hdr[12];
+        snprintf(rate_hdr, sizeof(rate_hdr), "%d", TOOL_AUDIO_SAMPLE_RATE);
+        esp_http_client_set_header(client, "X-Audio-Rate", rate_hdr);
+    }
     esp_http_client_set_post_field(client, (const char *)pcm, (int)body_len);
 
     uint32_t t0 = (uint32_t)(esp_timer_get_time() / 1000);
@@ -237,6 +260,8 @@ static char *voice_transcribe(const int16_t *pcm, size_t samples)
     } else {
         ESP_LOGE(TAG, "STT FAILED: err=%s status=%d oom=%d len=%u (%u ms)",
                  esp_err_to_name(err), status, rx->oom, (unsigned)rx->len, (unsigned)dt);
+        /* Backend may have moved IP or come up after boot — re-discover */
+        backend_discovery_invalidate();
     }
 
     free(rx->buf);
@@ -267,8 +292,11 @@ static uint8_t *voice_tts_fetch(const char *text, size_t *out_len)
         return NULL;
     }
 
+    char url[128];
+    voice_backend_url(url, sizeof(url), "/api/voice/tts");
+
     esp_http_client_config_t cfg = {
-        .url = voice_backend_url("/api/voice/tts"),
+        .url = url,
         .method = HTTP_METHOD_POST,
         .timeout_ms = VOICE_HTTP_TIMEOUT_MS,
         .event_handler = rx_event_handler,
@@ -302,6 +330,9 @@ static uint8_t *voice_tts_fetch(const char *text, size_t *out_len)
     } else {
         ESP_LOGE(TAG, "TTS FAILED: err=%s status=%d oom=%d len=%u (%u ms)",
                  esp_err_to_name(err), status, rx->oom, (unsigned)rx->len, (unsigned)dt);
+        display_status_set("Voice err", "check backend");
+        /* Backend may have moved IP or come up after boot — re-discover */
+        backend_discovery_invalidate();
         free(rx->buf);
         free(rx);
     }
@@ -321,6 +352,7 @@ static void voice_speak_internal(const char *text)
         tool_audio_beep(BEEP_ERR_HZ, BEEP_MS * 2, BEEP_VOL);
         return;
     }
+    display_status_set("Speaking...", "");
     esp_err_t perr = tool_audio_play_wav(wav, wav_len);
     free(wav);
     tool_audio_speaker_session_end();
@@ -340,13 +372,14 @@ static void voice_run_command(void)
         return;
     }
 
-    ESP_LOGI(TAG, "[CMD] Listening for your command (silence stops after %d ms)...",
-             CMD_SILENCE_MS);
+    ESP_LOGI(TAG, "[CMD] Listening for your command (%d s to start, then %d ms of silence stops)...",
+             CMD_LEAD_MS / 1000, CMD_SILENCE_MS);
 
     int16_t scratch[WAKE_CHUNK_SAMPLES];
     size_t total = 0;
     int64_t last_voice_ms = esp_timer_get_time() / 1000;
     int64_t start_ms = last_voice_ms;
+    bool heard_speech = false;
 
     bool capturing = true;
     while (capturing) {
@@ -363,6 +396,7 @@ static void voice_run_command(void)
             }
             double rms = sqrt((double)ssq / (double)written);
             if (rms > CMD_SILENCE_RMS) {
+                heard_speech = true;
                 last_voice_ms = esp_timer_get_time() / 1000;
             }
         }
@@ -370,7 +404,12 @@ static void voice_run_command(void)
             break;
         }
         int64_t now = esp_timer_get_time() / 1000;
-        if (now - last_voice_ms >= CMD_SILENCE_MS) {
+        if (!heard_speech) {
+            if (now - start_ms >= CMD_LEAD_MS) {
+                ESP_LOGI(TAG, "[CMD] no speech within %d s lead-in", CMD_LEAD_MS / 1000);
+                break;
+            }
+        } else if (now - last_voice_ms >= CMD_SILENCE_MS) {
             ESP_LOGI(TAG, "[CMD] silence timeout");
             break;
         }
@@ -383,6 +422,12 @@ static void voice_run_command(void)
     tool_audio_capture_disarm();
     uint32_t dur = (uint32_t)(esp_timer_get_time() / 1000) - (uint32_t)start_ms;
     ESP_LOGI(TAG, "[CMD] captured %u samples (%u ms)", (unsigned)total, (unsigned)dur);
+
+    if (!heard_speech) {
+        ESP_LOGW(TAG, "no speech detected in the lead-in window — nothing to ask");
+        tool_audio_beep(BEEP_TIMEOUT_HZ, BEEP_MS, BEEP_VOL);
+        return;
+    }
 
     if (total < TOOL_AUDIO_SAMPLE_RATE / 2) {
         ESP_LOGW(TAG, "command too short — nothing to ask");
@@ -434,6 +479,8 @@ static void voice_task(void *arg)
     /* NOTE: sized for s_wn_chunk (512) — the ring read fills up to a full
      * wakenet frame; WAKE_CHUNK_SAMPLES (480) is only the per-read slice. */
     int16_t chunk[512];
+    size_t wn_filled = 0;   /* partial WakeNet frame carried across iterations
+                             * (resetting it discarded already-consumed audio) */
     size_t written = 0;
 
     /* ---- listen diagnostics (rate-limited) ---- */
@@ -460,6 +507,7 @@ static void voice_task(void *arg)
         if (was_paused) {
             was_paused = false;
             tool_audio_ring_flush();   /* drop stale audio buffered while paused */
+            wn_filled = 0;             /* a carried partial frame is stale too */
         }
 
         if (!s_wn_iface || !s_wn_data) {
@@ -472,21 +520,21 @@ static void voice_task(void *arg)
          * `chunk` and never filled s_wn_buf: the model was fed calloc'd
          * zeros — field rms=0, no detection.) The prio-7 mic_feed task
          * owns the I2S DMA; the ring keeps the stream gap-free. */
-        size_t filled = 0;
-        while (filled < (size_t)s_wn_chunk) {
-            size_t got = tool_audio_ring_read(s_wn_buf + filled,
-                                              (size_t)s_wn_chunk - filled,
+        while (wn_filled < (size_t)s_wn_chunk) {
+            size_t got = tool_audio_ring_read(s_wn_buf + wn_filled,
+                                              (size_t)s_wn_chunk - wn_filled,
                                               WAKE_CHUNK_MS);
             if (got == 0) {
                 dbg_empties++;
                 break;
             }
-            filled += got;
+            wn_filled += got;
         }
-        if (filled < (size_t)s_wn_chunk) {
-            vTaskDelay(1);   /* no full frame yet — yield instead of spinning */
+        if (wn_filled < (size_t)s_wn_chunk) {
+            vTaskDelay(1);   /* no full frame yet — keep the partial and yield */
             continue;
         }
+        wn_filled = 0;   /* full frame consumed — detect() below uses s_wn_buf */
 
         /* Yield before inference: without this the read-then-detect loop runs
          * flat out and starves IDLE0 (task watchdog fired every 5 s in the
@@ -520,6 +568,7 @@ static void voice_task(void *arg)
         }
         if (state == WAKENET_DETECTED) {
             ESP_LOGI(TAG, "*** WAKE WORD DETECTED ***");
+            display_status_set("Listening...", "");
             s_busy = true;
 
             ack_play();
@@ -528,6 +577,7 @@ static void voice_task(void *arg)
             voice_run_command();
 
             s_busy = false;
+            display_status_idle();
             ESP_LOGI(TAG, "pipeline done — listening for \"Hi ESP\" again");
         }
 

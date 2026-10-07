@@ -6,8 +6,6 @@ Control and monitor GPIO pins on the ESP32-S3 for digital I/O.
 Hardware components are fixed to specific GPIO pins:
 - **GPIO 42**: WHITE LED (Output: 1 = ON, 0 = OFF)
 - **GPIO 41**: GREEN Push Button (Input Pull-Up: 0 = Pressed, 1 = Released)
-- **GPIO 2**: SSD1306 OLED SCL / SCK
-- **GPIO 1**: SSD1306 OLED SDA
 - **GPIO 38 & 39**: Shared I2S Clocks (BCLK=38, WS=39 for INMP441 Mic & MAX98357A Amp)
 - **GPIO 21**: MAX98357A Amp DIN
 - **GPIO 40**: INMP441 Mic SD

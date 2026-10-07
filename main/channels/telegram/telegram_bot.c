@@ -24,6 +24,7 @@ static int64_t s_last_saved_offset = -1;
 static int64_t s_last_offset_save_us = 0;
 
 #define TG_OFFSET_NVS_KEY            "update_offset"
+#define TG_LAST_CHAT_NVS_KEY         "last_chat"
 #define TG_DEDUP_CACHE_SIZE          64
 #define TG_OFFSET_SAVE_INTERVAL_US   (5LL * 1000 * 1000)
 #define TG_OFFSET_SAVE_STEP          10
@@ -381,8 +382,18 @@ static void process_updates(const char *json_str)
             continue;
         }
 
-        /* Store last active chat ID for outbound debug/event messages */
-        strncpy(s_last_chat_id, chat_id_str, sizeof(s_last_chat_id) - 1);
+        /* Store last active chat ID for outbound debug/event messages.
+         * Persisted (only on change) so it survives reboots. */
+        if (strcmp(s_last_chat_id, chat_id_str) != 0) {
+            strncpy(s_last_chat_id, chat_id_str, sizeof(s_last_chat_id) - 1);
+            nvs_handle_t nvs;
+            if (nvs_open(MIMI_NVS_TG, NVS_READWRITE, &nvs) == ESP_OK) {
+                if (nvs_set_str(nvs, TG_LAST_CHAT_NVS_KEY, chat_id_str) == ESP_OK) {
+                    nvs_commit(nvs);
+                }
+                nvs_close(nvs);
+            }
+        }
 
         if (msg_id_val >= 0) {
             uint64_t msg_key = make_msg_key(chat_id_str, msg_id_val);
@@ -471,6 +482,14 @@ esp_err_t telegram_bot_init(void)
             s_update_offset = offset;
             s_last_saved_offset = offset;
             ESP_LOGI(TAG, "Loaded Telegram update offset: %" PRId64, s_update_offset);
+        }
+
+        /* Restore the last active chat from a previous session so button
+         * photo/video sends work before the first inbound message arrives. */
+        size_t chat_len = sizeof(s_last_chat_id);
+        if (nvs_get_str(nvs, TG_LAST_CHAT_NVS_KEY, s_last_chat_id, &chat_len) == ESP_OK &&
+            s_last_chat_id[0]) {
+            ESP_LOGI(TAG, "Restored last active chat: %s", s_last_chat_id);
         }
         nvs_close(nvs);
     }
@@ -733,5 +752,133 @@ esp_err_t telegram_send_photo_to_last_chat(const uint8_t *jpeg_data, size_t jpeg
         return telegram_send_photo(s_last_chat_id, jpeg_data, jpeg_len, caption);
     }
     ESP_LOGW(TAG, "Skipping Telegram photo send: no active Telegram chat ID yet");
-    return ESP_OK;
+    return ESP_ERR_INVALID_STATE;
+}
+
+esp_err_t telegram_send_video(const char *chat_id, const uint8_t *video_data, size_t video_len, const char *caption)
+{
+    if (!chat_id || chat_id[0] == '\0' || !video_data || video_len == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (s_bot_token[0] == '\0') {
+        ESP_LOGW(TAG, "Cannot send video: no bot token");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    char url[256];
+    snprintf(url, sizeof(url), "https://api.telegram.org/bot%s/sendVideo", s_bot_token);
+
+    http_resp_t resp = {
+        .buf = heap_caps_calloc(1, 4096, MALLOC_CAP_SPIRAM),
+        .len = 0,
+        .cap = 4096,
+    };
+    if (!resp.buf) return ESP_ERR_NO_MEM;
+
+    esp_http_client_config_t config = {
+        .url = url,
+        .event_handler = http_event_handler,
+        .user_data = &resp,
+        .timeout_ms = 60000, /* multi-MB uploads take far longer than photos */
+        .buffer_size = 4096,
+        .buffer_size_tx = 4096,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) {
+        free(resp.buf);
+        return ESP_FAIL;
+    }
+
+    const char *boundary = "----WebKitFormBoundaryesp32s3mimi";
+    char header_content_type[128];
+    snprintf(header_content_type, sizeof(header_content_type), "multipart/form-data; boundary=%s", boundary);
+
+    esp_http_client_set_method(client, HTTP_METHOD_POST);
+    esp_http_client_set_header(client, "Content-Type", header_content_type);
+
+    char body_start[512];
+    int start_len = snprintf(body_start, sizeof(body_start),
+        "--%s\r\n"
+        "Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n"
+        "%s\r\n"
+        "--%s\r\n"
+        "Content-Disposition: form-data; name=\"supports_streaming\"\r\n\r\n"
+        "true\r\n"
+        "--%s\r\n"
+        "Content-Disposition: form-data; name=\"video\"; filename=\"capture.avi\"\r\n"
+        "Content-Type: video/avi\r\n\r\n",
+        boundary, chat_id, boundary, boundary);
+
+    char body_end[256];
+    int end_len = 0;
+    if (caption && caption[0] != '\0') {
+        end_len = snprintf(body_end, sizeof(body_end),
+            "\r\n--%s\r\n"
+            "Content-Disposition: form-data; name=\"caption\"\r\n\r\n"
+            "%s\r\n"
+            "--%s--\r\n",
+            boundary, caption, boundary);
+    } else {
+        end_len = snprintf(body_end, sizeof(body_end),
+            "\r\n--%s--\r\n",
+            boundary);
+    }
+
+    int total_len = start_len + video_len + end_len;
+    char len_str[32];
+    snprintf(len_str, sizeof(len_str), "%d", total_len);
+    esp_http_client_set_header(client, "Content-Length", len_str);
+
+    esp_err_t err = esp_http_client_open(client, total_len);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Uploading video to Telegram (%d bytes total)...", total_len);
+        esp_http_client_write(client, body_start, start_len);
+
+        /* Write the video in 4 KB chunks — esp_http_client_write can truncate
+         * large single writes. */
+        size_t sent = 0;
+        while (sent < video_len && err == ESP_OK) {
+            size_t chunk = video_len - sent;
+            if (chunk > 4096) chunk = 4096;
+            int w = esp_http_client_write(client, (const char *)(video_data + sent), chunk);
+            if (w < 0) {
+                ESP_LOGE(TAG, "Video write failed at %u/%u bytes", (unsigned)sent, (unsigned)video_len);
+                err = ESP_FAIL;
+            } else {
+                sent += w;
+            }
+        }
+
+        if (err == ESP_OK) {
+            esp_http_client_write(client, body_end, end_len);
+
+            int content_length = esp_http_client_fetch_headers(client);
+            if (content_length >= 0) {
+                esp_http_client_read_response(client, resp.buf, resp.cap - 1);
+                ESP_LOGI(TAG, "Telegram video send response: %.300s", resp.buf);
+            } else {
+                ESP_LOGE(TAG, "Failed to read response headers");
+                err = ESP_FAIL;
+            }
+        }
+    } else {
+        ESP_LOGE(TAG, "Failed to open HTTP connection: %s", esp_err_to_name(err));
+    }
+
+    esp_http_client_cleanup(client);
+    free(resp.buf);
+
+    return err;
+}
+
+esp_err_t telegram_send_video_to_last_chat(const uint8_t *video_data, size_t video_len, const char *caption)
+{
+    if (s_last_chat_id[0] != '\0') {
+        return telegram_send_video(s_last_chat_id, video_data, video_len, caption);
+    }
+    ESP_LOGW(TAG, "Skipping Telegram video send: no active Telegram chat ID yet");
+    return ESP_ERR_INVALID_STATE;
 }

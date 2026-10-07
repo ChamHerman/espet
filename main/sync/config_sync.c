@@ -1,4 +1,5 @@
 #include "sync/config_sync.h"
+#include "sync/backend_discovery.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -499,7 +500,9 @@ static cJSON *fetch_json(const char *path, size_t buf_size)
 
     char url[160];
     char auth_hdr[96];
-    snprintf(url, sizeof(url), "%s%s", MIMI_BACKEND_URL, path);
+    char base[96];
+    backend_discovery_base_url(base, sizeof(base));
+    snprintf(url, sizeof(url), "%s%s", base, path);
     snprintf(auth_hdr, sizeof(auth_hdr), "Bearer %s", MIMI_BACKEND_API_KEY);
 
     esp_http_client_config_t config = {
@@ -645,6 +648,8 @@ static void sync_task_main(void *arg)
     ESP_LOGI(TAG, "Config sync started (every %us)", (unsigned)s_interval_s);
 
     for (;;) {
+        /* Re-run mDNS discovery each cycle so a changed backend IP self-heals */
+        backend_discovery_start();
         sync_once();
         /* Sleep in 1s slices so a new interval from the web takes effect */
         uint32_t remaining = s_interval_s;

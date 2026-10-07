@@ -15,6 +15,9 @@ dependencies:
   #   # All dependencies of `main` are public by default.
   #   public: true
   espressif/esp_websocket_client: ^1.4.0
+  # mDNS client — runtime discovery of the companion backend ("_espet._tcp")
+  espressif/mdns: "*"
+  # SSD1306 OLED — text status display (driver in display/display_status.c)
   espressif/ssd1306: "*"
   espressif/esp32-camera: "*"
   # WakeWord engine (WakeNet) — on-device "Hi ESP" detection for the voice flow

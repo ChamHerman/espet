@@ -7,6 +7,7 @@ and exposes a single generic endpoint for tool execution.
 """
 
 import logging
+import socket
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -64,12 +65,54 @@ async def lifespan(app: FastAPI):
     logger.info(f"Server listening on {settings.host}:{settings.port}")
     logger.info("=" * 60)
 
+    # Advertise the backend over mDNS/Bonjour as "_espet._tcp.local." so the
+    # ESP32 can discover this machine's current IP at runtime (backend_discovery.c)
+    mdns_zc = None
+    mdns_info = None
+    try:
+        from zeroconf import ServiceInfo, Zeroconf
+
+        lan_ip = settings.host if settings.host not in ("0.0.0.0", "") else _detect_lan_ip()
+        mdns_zc = Zeroconf()
+        mdns_info = ServiceInfo(
+            "_espet._tcp.local.",
+            "espet-backend._espet._tcp.local.",
+            addresses=[socket.inet_aton(lan_ip)],
+            port=settings.port,
+            properties={"version": "1"},
+        )
+        # async API is mandatory here: the sync one raises EventLoopBlocked
+        # when called from inside uvicorn's running event loop
+        await mdns_zc.async_register_service(mdns_info, allow_name_change=True)
+        logger.info(f"mDNS service registered: {mdns_info.name} ({lan_ip}:{settings.port})")
+    except Exception as e:
+        logger.warning(f"mDNS advertisement skipped ({type(e).__name__}: {e!r}) — "
+                       f"ESP32 will use compiled-in fallback IP")
+
     yield  # App is running
 
     # Shutdown
     logger.info("Shutting down ESPET Backend Server...")
+    if mdns_zc and mdns_info:
+        try:
+            await mdns_zc.async_unregister_service(mdns_info)
+            mdns_zc.close()
+        except Exception:
+            pass
     await mcp_client_manager.shutdown()
     logger.info("Goodbye.")
+
+
+def _detect_lan_ip() -> str:
+    """Best-effort LAN IP without sending traffic: UDP 'connect' trick."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
 
 
 # ---------------------------------------------------------------------------

@@ -17,6 +17,5 @@ Behavior Rules:
 Hardware Mapping:
 - White LED: GPIO 42
 - Green Button: GPIO 41
-- OLED Display: GPIO 2 (SCL), GPIO 1 (SDA)
 - Audio: GPIO 38 (BCLK), GPIO 39 (WS), GPIO 21 (Amp DIN), GPIO 40 (Mic SD)
 

@@ -1,0 +1,9 @@
+{
+  "name": "espet",
+  "private": true,
+  "description": "Root convenience scripts — delegates to espet-backend",
+  "scripts": {
+    "dev:mac": "cd espet-backend && source venv/bin/activate && python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000",
+    "dev:win": "cd espet-backend && venv\\Scripts\\python.exe -m uvicorn main:app --reload --host 0.0.0.0 --port 8000"
+  }
+}

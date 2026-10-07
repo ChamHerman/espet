@@ -43,9 +43,10 @@ class Settings(BaseSettings):
     voice_stt_model: str = "base"
     # None = auto-detect language; "en"/"zh" forces a language
     voice_language: str | None = None
-    # TTS: edge-tts voice (neural, free). zh-HK = Cantonese, en-US alternatives:
-    #   zh-HK-HiuMaanNeural / zh-HK-WanLungNeural / en-US-AriaNeural ...
-    voice_tts_voice: str = "zh-HK-HiuMaanNeural"
+    # TTS: edge-tts voice (neural, free). zh-CN = Mandarin, zh-HK = Cantonese:
+    #   zh-CN-XiaoxiaoNeural (female) / zh-CN-YunxiNeural (male)
+    #   zh-HK-HiuMaanNeural / en-US-AriaNeural ...
+    voice_tts_voice: str = "zh-CN-XiaoxiaoNeural"
 
     # --- Database ---
     db_path: str = "db/tokens.db"

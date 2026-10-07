@@ -1,11 +1,11 @@
 #include "agent_loop.h"
 #include "agent/context_builder.h"
 #include "bus/message_bus.h"
+#include "display/display_status.h"
 #include "llm/llm_proxy.h"
 #include "memory/session_mgr.h"
 #include "mimi_config.h"
 #include "tools/tool_registry.h"
-#include "tools/tool_oled.h"
 
 
 #include "cJSON.h"
@@ -198,6 +198,7 @@ static void agent_loop_task(void *arg) {
       continue;
 
     ESP_LOGI(TAG, "Processing message from %s:%s", msg.channel, msg.chat_id);
+    display_status_set("Msg received", msg.channel);
 
     /* Check for /clear or /reset command */
     if (msg.content && (strcmp(msg.content, "/clear") == 0 || strcmp(msg.content, "/reset") == 0)) {
@@ -260,12 +261,13 @@ static void agent_loop_task(void *arg) {
       }
 #endif
 
-      oled_display_status("ESPeting...", "Thinking...");
+      display_status_set("Thinking...", "");
       llm_response_t resp;
       err = llm_chat_tools(system_prompt, messages, tools_json, &resp);
 
       if (err != ESP_OK) {
         ESP_LOGE(TAG, "LLM call failed: %s", esp_err_to_name(err));
+        display_status_set("LLM error", "");
         break;
       }
 
@@ -321,6 +323,7 @@ static void agent_loop_task(void *arg) {
       strncpy(out.channel, msg.channel, sizeof(out.channel) - 1);
       strncpy(out.chat_id, msg.chat_id, sizeof(out.chat_id) - 1);
       out.content = final_text; /* transfer ownership */
+      display_status_set("Replying...", out.channel);
       ESP_LOGI(TAG, "Queue final response to %s:%s (%d bytes)", out.channel,
                out.chat_id, (int)strlen(final_text));
       if (message_bus_push_outbound(&out) != ESP_OK) {
@@ -348,10 +351,10 @@ static void agent_loop_task(void *arg) {
       }
     }
 
-    oled_display_status("MimiClaw Ready", "Waiting input...");
 
     /* Free inbound message content */
     free(msg.content);
+    display_status_idle();
 
     /* Log memory status */
     ESP_LOGI(TAG, "Free PSRAM: %d bytes",

@@ -1,4 +1,5 @@
 #include "tools/button_handler.h"
+#include "tools/tool_audio.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -19,7 +20,20 @@ typedef struct {
 
 static int64_t s_last_snap_time = 0;
 static int64_t s_last_ptt_time = 0;
+/* Presses before this timestamp are coupling glitches: refreshed whenever
+ * the speaker is busy, expiring AUDIO_GLITCH_COOLDOWN_MS after playback. */
+static int64_t s_audio_busy_until = 0;
 #define DEBOUNCE_MS 30
+/* Noise filtering for the camera button (GPIO 41 has only the weak internal
+ * pull-up and sits next to the I2S pins — the wake-ack speaker burst was
+ * coupling in as phantom presses, snapping photos whenever the user said
+ * "Hi ESP"). A real click holds LOW for at least MIN_PRESS_MS, a new click
+ * is ignored within CLICK_LOCKOUT_MS of the previous one, and presses seen
+ * while the speaker is playing (plus a cool-down, since the coupled pulse
+ * can outlast playback by a few ms) are treated as coupling glitches. */
+#define MIN_PRESS_MS    80
+#define CLICK_LOCKOUT_MS 400
+#define AUDIO_GLITCH_COOLDOWN_MS 200
 
 static void IRAM_ATTR gpio_isr_handler(void *arg)
 {
@@ -44,6 +58,13 @@ static void button_task(void *arg)
     const int64_t LONG_PRESS_THRESHOLD_MS = 600; // 600ms hold required
 
     while (1) {
+        /* Refresh the speaker-glitch window every tick so presses arriving
+         * between queue events are still gated while audio plays. */
+        int64_t tick_now = esp_timer_get_time() / 1000;
+        if (tool_audio_is_busy()) {
+            s_audio_busy_until = tick_now + AUDIO_GLITCH_COOLDOWN_MS;
+        }
+
         // Use a 50ms timeout so we can periodically check the hold duration
         if (xQueueReceive(s_btn_evt_queue, &evt, pdMS_TO_TICKS(50))) {
             int64_t now = esp_timer_get_time() / 1000;
@@ -51,8 +72,36 @@ static void button_task(void *arg)
 #if (GPIO_BTN_WHITE_SNAP >= 0)
             if (evt.pin == GPIO_BTN_WHITE_SNAP) {
                 bool current_level_pressed = !evt.level; // LOW means pressed
-                
+
                 if (current_level_pressed && !is_pressed) {
+                    if (tool_audio_is_busy()) {
+                        /* Speaker is driving the I2S bus right now — a press
+                         * edge seen here is coupling from the amp, not a
+                         * click. */
+                        ESP_LOGW(TAG, "White Button (GPIO %d): press dropped — speaker active", GPIO_BTN_WHITE_SNAP);
+                        xQueueReset(s_btn_evt_queue);
+                        continue;
+                    }
+                    if (now < s_audio_busy_until) {
+                        /* Cool-down right after playback: the coupled pulse
+                         * can outlast the speaker burst by a few ms. */
+                        ESP_LOGW(TAG, "White Button (GPIO %d): press dropped — post-playback glitch window", GPIO_BTN_WHITE_SNAP);
+                        xQueueReset(s_btn_evt_queue);
+                        continue;
+                    }
+                    if (gpio_get_level((gpio_num_t)GPIO_BTN_WHITE_SNAP) != 0) {
+                        /* ISR saw LOW but the line has already recovered by
+                         * the time this task ran — transient, not a press. */
+                        ESP_LOGW(TAG, "White Button (GPIO %d): press dropped — pin already released (noise)", GPIO_BTN_WHITE_SNAP);
+                        xQueueReset(s_btn_evt_queue);
+                        continue;
+                    }
+                    if (now - s_last_snap_time < CLICK_LOCKOUT_MS) {
+                        /* Still inside the lockout window after a handled
+                         * click — swallow the trailing noise edges. */
+                        xQueueReset(s_btn_evt_queue);
+                        continue;
+                    }
                     // Pressed
                     is_pressed = true;
                     is_long_pressing = false;
@@ -62,17 +111,21 @@ static void button_task(void *arg)
                 } else if (!current_level_pressed && is_pressed) {
                     // Released
                     is_pressed = false;
-                    
+
                     if (is_long_pressing) {
                         ESP_LOGI(TAG, "White Button (GPIO %d): Long Press Released", GPIO_BTN_WHITE_SNAP);
                         if (s_long_cb) {
                             s_long_cb(false); // Stop
                         }
-                    } else {
+                    } else if ((now - press_time) >= MIN_PRESS_MS) {
                         ESP_LOGI(TAG, "White Button (GPIO %d): Short Click Detected", GPIO_BTN_WHITE_SNAP);
+                        s_last_snap_time = now;
                         if (s_short_cb) {
                             s_short_cb();
                         }
+                    } else {
+                        ESP_LOGW(TAG, "White Button (GPIO %d): %lld ms pulse — below %d ms, treated as noise",
+                                 GPIO_BTN_WHITE_SNAP, (long long)(now - press_time), MIN_PRESS_MS);
                     }
                     // Purge bounce events
                     xQueueReset(s_btn_evt_queue);

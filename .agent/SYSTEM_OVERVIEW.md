@@ -28,7 +28,7 @@
 │                                                                    │
 │  ┌──────────── INPUT ────────────┐   ┌──────── OUTPUT ─────────┐  │
 │  │ INMP441 I²S microphone        │   │ MAX98357A I²S speaker    │  │
-│  │ Green button (PTT / trigger)  │   │ SSD1306 OLED (I²C)       │  │
+│  │ Green button (PTT / trigger)  │   │ (display removed — TBD)  │  │
 │  │ White button (camera / PT)    │   │ Telegram / Feishu reply  │  │
 │  │ Telegram long-poll + Feishu   │   └──────────────────────────┘  │
 │  └───────────────┬───────────────┘                                 │
@@ -46,7 +46,7 @@
 │  └────────────────────────────┘  │  4. Feed result back     │      │
 │                                  │  5. Repeat until done    │      │
 │  ┌──────────── TOOLS ─────────┐  └────────────┬─────────────┘      │
-│  │ LOCAL  : gpio, oled, audio,│               │                    │
+│  │ LOCAL  : gpio, audio,      │               │                    │
 │  │ camera, files, cron, time, │               │ remote tool        │
 │  │ web_search                 │               │                    │
 │  │ REMOTE : gmail / calendar /│               │                    │
@@ -169,7 +169,6 @@ wake-word models, esp-sr), 64 KB coredump.
 
 | Peripheral | Chip / Part | Pins | Notes |
 |---|---|---|---|
-| OLED display | SSD1306 | SCL 2, SDA 1 | I²C, tool results + proactive cards |
 | Microphone | INMP441 (I²S) | SD 40, SCK 38, WS 39 | L/R tied to GND; always-on WakeNet listener ("Hi ESP") |
 | Speaker amp | MAX98357A (I²S) | DIN 21, BCLK 38, LRC 39 | Shares I²S bus with the mic — full-duplex TX+RX pair; tones + TTS WAV playback (§7.1 voice flow) |
 | Camera button | Push (input pull-up) | 41 | Short press = snapshot → Telegram, hold ≥600 ms = video |
@@ -193,7 +192,7 @@ nvs_flash → SPIFFS → message_bus → memory_store → skill_loader → sessi
 │
 wifi start ──fail──▶ captive portal onboarding (blocks, reboots on success)
 │ok
-outbound dispatch task → OLED boot animation → agent_loop_start
+outbound dispatch task → agent_loop_start → backend_discovery_start (last)
 → telegram/feishu start → cron_start → heartbeat_start → ws_server → config_sync_start
 ```
 
@@ -206,9 +205,9 @@ outbound dispatch task → OLED boot animation → agent_loop_start
 2. **LLM call** (`llm_proxy.c`): streams from the configured provider (cloud OpenAI-compatible
    such as `apihub.agnes-ai.com`, local LM Studio via `HOST_IP:1234`, or Anthropic). Optionally emits a working
    status to the caller's channel.
-3. **Dispatch**: the LLM answers with either `text` (→ outbound queue → speaker/OLED/
+3. **Dispatch**: the LLM answers with either `text` (→ outbound queue → speaker/
    chat) or `tool_use`. Each tool_use goes to the **tool registry**:
-   - tool exists locally → executed on-chip (`tool_gpio`, `tool_oled`, `tool_audio`,
+   - tool exists locally → executed on-chip (`tool_gpio`, `tool_audio`,
      `tool_camera`, `tool_files`, `tool_cron`, `tool_get_time`, `tool_web_search`)
    - otherwise → `POST /api/mcp/execute` to the backend (`tool_registry.c`)
 4. **Loop**: the tool result is fed back as a new LLM message. Max 10 iterations /
@@ -230,7 +229,7 @@ outbound dispatch task → OLED boot animation → agent_loop_start
 - **`cron/cron_service.c`** — up to 16 jobs in `/spiffs/cron.json`. Two kinds:
   `every` (interval seconds) and `at` (one-shot epoch, optionally
   `delete_after_run`). When a job fires it pushes a normal message onto the
-  inbound bus with a destination `channel` (`system` = OLED + voice, or
+  inbound bus with a destination `channel` (`system` = voice, or
   `telegram` + `chat_id`), so the agent treats it exactly like a user message
   — and can reply wherever the job says.
   Job schema (device ↔ web, identical):
@@ -249,6 +248,19 @@ outbound dispatch task → OLED boot animation → agent_loop_start
   ```
 - **`heartbeat/heartbeat.c`** — every 30 min injects a heartbeat prompt so the
   agent can check for due context and act unprompted (Herman's proactive loop).
+- **`sync/backend_discovery.c`** — runtime backend discovery. After Wi-Fi
+  connects (and on every config-sync cycle) it queries mDNS for
+  `_espet._tcp.local.` (advertised by the FastAPI backend via python-zeroconf)
+  and caches the base URL `http://<ip>:<port>`. Because PTR/SRV and A records
+  can arrive in separate mDNS response packets, it follows up with
+  `mdns_query_a("<instance>")` (bare hostname, no `.local`) to fetch the IPv4
+  address. Discovery starts only after all boot services are up — the
+  internal-RAM mDNS task starved boot-time allocations (cfg_sync task creation
+  failure, i2c/OLED assert crash) when started mid-boot. All backend
+  callers (`tool_registry.c`, `config_sync.c`, `voice_client.c`) build URLs
+  via `backend_discovery_base_url()`, which falls back to the compile-time
+  `MIMI_BACKEND_URL` until discovery succeeds — so a changing laptop IP no
+  longer requires a rebuild.
 - **`sync/config_sync.c`** — web-config pull (see §5). Also syncs **skill
   files**: when the `skills` config version advances, the device pulls
   `GET /api/skills/sync` (separate endpoint — the bundle is far larger than
@@ -524,7 +536,8 @@ Audio contract: **16 kHz / mono / 16-bit PCM** both ways (raw PCM in, WAV out).
 [LISTEN] voice_wake task streams the mic into WakeNet (30 ms frames)
 [ WAKE ] "Hi ESP" detected (WAKENET_DETECTED)
          → "Yes?" ack (TTS WAV pre-cached in PSRAM at boot, instant)
-[COMMAND] capture until 1.6 s silence or 10 s cap (tool_audio arm/rx_read)
+[COMMAND] capture until 1.6 s trailing silence (5 s lead-in granted before
+          speech starts; RMS > 200 marks speech) or 10 s cap (arm/rx_read)
 [ THINK ] POST /api/voice/transcribe ──▶ backend faster-whisper ──▶ {"text"}
           transcript ──▶ inbound bus as system:"voice" ──▶ agent ReAct loop
 [ SPEAK ] agent reply ──▶ outbound dispatcher (system:"voice")
@@ -555,7 +568,7 @@ voice → INMP441 → agent_loop
   LLM #1 → tool_use(docs_read_document)  → POST /api/mcp/execute → Google Docs MCP
   LLM #2 → tool_use(gmail_send_email)    → POST /api/mcp/execute → Gmail MCP
   LLM #3 → end_turn("Done — summary sent.")
-speaker + OLED reply
+speaker reply
 ```
 
 ### 7.3 Proactive (Herman): scheduled briefing
@@ -564,7 +577,7 @@ speaker + OLED reply
 cron.json job due → cron_service pushes "Give me a summary of my day"
 → agent loop (identical to a user message)
 → tools (calendar_list_events, gmail_search_threads…) → reply to channel
-  (system = OLED + voice, or telegram chat_id)
+  (system = voice, or telegram chat_id)
 ```
 
 ### 7.4 Configuration: dashboard → device
@@ -661,6 +674,96 @@ Herman's full gap analysis and prioritized roadmap of needed tools/functions:
 Append-only session log. Newest first. One line per change:
 `- YYYY-MM-DD — summary (files: ...)`.
 
+- 2026-10-06 — Speaker-blur fix: `play_tone` (beeps) and
+  `tool_audio_play_wav` (ack WAV) did NOT raise `s_speaker_busy`, so the
+  mic feeder kept racing I2S TX during every beep/ack — the project's own
+  field rule (concurrent mic reads corrupt TX) turned beeps and acks into
+  noise ("blur sound"). Both players now gate the mic for the whole
+  playback (idempotent with voice_client's outer session gate), so every
+  speaker output parks the feeder by construction. Pin audit confirmed
+  shared BCLK 38 / WS 39 full-duplex wiring is correct and conflict-free
+  (files: main/tools/tool_audio.c, .agent/SYSTEM_OVERVIEW.md).
+- 2026-10-06 — Phantom camera-snap fix: saying "Hi ESP" auto-captured a photo
+  to Telegram. Root cause: the wake-ack speaker burst (MAX98357A current
+  spike) couples into GPIO 41 (camera button, weak internal pull-up) as
+  edge pairs, and the white-button path had NO debounce — `DEBOUNCE_MS` and
+  `s_last_snap_time` were declared but never used, so any LOW→HIGH pair
+  < 600 ms apart counted as a short click. Added MIN_PRESS_MS 50 minimum
+  pulse width (shorter pulses logged as "treated as noise") and a
+  CLICK_LOCKOUT_MS 400 re-trigger lockout (files:
+  main/tools/button_handler.c, .agent/SYSTEM_OVERVIEW.md).
+- 2026-10-06 — TTS-outage triage + self-heal: backend verified healthy
+  end-to-end (TTS endpoint returns a 16 kHz WAV, mDNS advertises the current
+  IP 192.168.0.179:8000, baked fallback IP matches, device keys match).
+  Gap closed: mDNS discovery ran only once at boot (6 attempts) — a backend
+  that was down at boot or moved IP afterwards left the device on a dead
+  URL until reboot. Added `backend_discovery_invalidate()`; voice STT/TTS
+  failure paths now drop the cached URL and re-discover in the background
+  (files: main/sync/backend_discovery.c, main/sync/backend_discovery.h,
+  main/voice/voice_client.c, .agent/SYSTEM_OVERVIEW.md).
+- 2026-10-06 — Voice reliability fixes: (1) `ack_fetch()` leaked
+  `s_speaker_busy` when `esp_http_client_init` failed → mic feeder parked
+  forever, wake word deaf until reboot; session now released on all paths.
+  (2) `voice_backend_url()` shared static buffer raced between the wake task
+  (STT) and outbound task (speak) — now caller-owned buffers. (3) Command
+  window: 5 s lead-in before the 1.6 s silence stop applies (was: 1.6 s from
+  ack, cutting users off), speech RMS threshold 350→200 (soft trailing words
+  no longer missed), no-speech capture skips the STT round-trip. (4) WakeNet
+  partial-frame carry-over: a partially filled 512-sample model frame is no
+  longer discarded on the next loop pass. (5) STT requests now send
+  `X-Audio-Rate`; backend resamples if it differs from 16 kHz (was: silent
+  assumption). (6) Feeder ring-full comment corrected (drops newest, not
+  oldest) (files: main/voice/voice_client.c, main/tools/tool_audio.c,
+  espet-backend/api/voice_router.py, .agent/SYSTEM_OVERVIEW.md).
+- 2026-10-06 — TTS language fix: default edge-tts voice switched from Cantonese
+  zh-HK-HiuMaanNeural to Mandarin zh-CN-XiaoxiaoNeural (files:
+  espet-backend/config.py, .agent/SYSTEM_OVERVIEW.md).
+- 2026-10-05 — OLED diagnostic: I2C + panel ACK verified via boot capture
+  (display init OK, no assert) but panel stays black. Added boot self-test in
+  display_hw_init: full-screen fill for 0.8 s — visible flash proves panel
+  electrically OK (then software rendering issue); black means panel
+  power/charge-pump fault (files: main/display/display_status.c,
+  .agent/SYSTEM_OVERVIEW.md).
+- 2026-10-06 — OLED hunt hardened after field false-positive (flaky ACK on
+  strap GPIO 0 / addr 0x3D locked the hunt onto bogus pins): require two
+  consecutive ACKs, un-lock and re-hunt if init/refresh NACKs, and only
+  delete the I2C driver when actually installed. Panel confirmed dead on all
+  169 pin combos — module replacement pending (files:
+  main/display/display_status.c, .agent/SYSTEM_OVERVIEW.md).
+- 2026-10-05 — Re-added SSD1306 as the text status display: display_status.c
+  now drives the panel directly (I2C0 GPIO 2/1, two 16px text lines, no eye
+  animation task) and re-registered the oled_print tool ({"text": "..."}).
+  Warning: ssd1306 component asserts on runtime I2C failure — keep panel
+  connected (files: main/display/display_status.c, main/tools/tool_registry.c,
+  main/idf_component.yml, main/CMakeLists.txt, .agent/SYSTEM_OVERVIEW.md).
+- 2026-10-05 — Added main/display/display_status.{c,h}: display-agnostic
+  two-line status module (serial-console output as placeholder; swap
+  display_status_output() for the real driver when new display hardware is
+  chosen). Wired into actions: boot Starting/Ready-idle, msg received,
+  Thinking/Replying/LLM error (agent_loop), Tool:/Done:/Tool failed
+  (tool_registry), Listening/Speaking/Voice err + idle restore (voice_client),
+  WiFi FAILED (wifi_manager), Backend not found (backend_discovery)
+  (files: main/display/display_status.{c,h}, main/mimi.c, main/agent/agent_loop.c,
+  main/tools/tool_registry.c, main/voice/voice_client.c, main/wifi/wifi_manager.c,
+  main/sync/backend_discovery.c, main/CMakeLists.txt, .agent/SYSTEM_OVERVIEW.md).
+- 2026-10-05 — Removed all SSD1306 OLED display code (crashing on i2c alloc
+  assert in ssd1306 component): deleted tool_oled.{c,h}, dropped oled_print tool
+  registration, oled_display_status calls, espressif/ssd1306 dependency, OLED
+  prompt lines, and boot animation start. Display to be replaced later;
+  GPIO 1/2 (I2C0) freed (files: main/tools/tool_oled.{c,h}, main/mimi.c,
+  main/tools/tool_registry.c, main/agent/agent_loop.c, main/agent/context_builder.c,
+  main/CMakeLists.txt, main/idf_component.yml, .agent/SYSTEM_OVERVIEW.md).
+- 2026-10-05 — (rev 2) mDNS A-record lookup fixed to bare hostname; discovery
+  deferred to post-boot to avoid internal-RAM starvation crash.
+- 2026-10-05 — Backend IP is no longer hardcoded at build time: backend
+  advertises `_espet._tcp.local.` via python-zeroconf (new dependency) and the
+  firmware resolves it at runtime with espressif/mdns (new managed component);
+  compile-time `BACKEND_IP` remains the fallback. Fixes TTS/STT/config-sync
+  breakage after router/IP changes (files: main/sync/backend_discovery.{c,h},
+  main/sync/config_sync.c, main/voice/voice_client.c, main/tools/tool_registry.c,
+  main/mimi.c, main/CMakeLists.txt, main/idf_component.yml,
+  espet-backend/main.py, espet-backend/requirements.txt, package.json,
+  .agent/SYSTEM_OVERVIEW.md).
 - 2026-09-09 — Feeder 8 KB .bss stack overflowed (field: StoreProhibited in
   uxListRemove via vTaskDelay from mic_feeder_task; kernel list corruption also took Telegram
   down). i2s_channel_read's TLS/queue call chain is deeper than budgeted. Feeder stack now
@@ -1000,3 +1103,83 @@ Append-only session log. Newest first. One line per change:
 - 2026-09-07 — Added session memory rule: every feature/new implementation must
   auto-update this file in the same change (log entry + touched sections);
   rule added to AGENTS.md (files: AGENTS.md, .agent/SYSTEM_OVERVIEW.md).
+- 2026-10-07 — Phantom camera-snap hardening: the 2026-10-06 pulse-width fix
+  was still insufficient — saying "Hi ESP" snapped a photo because the coupled
+  pulse outlasts MIN_PRESS_MS 50. Camera button (GPIO 41) press acceptance now
+  also requires (a) speaker not busy (`tool_audio_is_busy()`), (b) at least
+  200 ms after playback ends (AUDIO_GLITCH_COOLDOWN_MS — the coupled pulse can
+  outlast the burst), and (c) the live pin still LOW when button_task runs
+  (transient rejection). MIN_PRESS_MS raised 50 → 80 ms (files:
+  main/tools/button_handler.c, .agent/SYSTEM_OVERVIEW.md).
+- 2026-10-07 — Real video capture for the camera button: long-press previously
+  ran a mock task that captured frames and dropped them (nothing was ever sent
+  to Telegram). `tool_camera.c` now records JPEG frames into a 4 MB PSRAM
+  store at ~10 fps (300-frame / 4 MB auto-stop), assembles an in-place MJPEG
+  AVI container (constant 224-byte header written last, idx1 appended after
+  the last chunk — no copies), and returns it via
+  `tool_camera_video_stop_and_get()` / `tool_camera_video_release()`. New
+  `telegram_send_video[_to_last_chat]()` uploads via sendVideo multipart
+  (video/avi, supports_streaming, 60 s timeout, 4 KB chunked writes). mimi.c
+  long-press release path: stop → assemble → send → release (files:
+  main/tools/tool_camera.c, main/tools/tool_camera.h,
+  main/channels/telegram/telegram_bot.c, main/channels/telegram/telegram_bot.h,
+  main/mimi.c, .agent/SYSTEM_OVERVIEW.md).
+- 2026-10-07 — Video task creation fix: first field test showed
+  "Failed to create video task" — the internal heap is too fragmented after
+  WiFi/TLS/Telegram come up to hand out a contiguous 4 KB task stack (same
+  root cause as the mDNS task start failure). video_task now uses a
+  PSRAM-allocated stack via xTaskCreateStatic (3 KB internal-stack
+  xTaskCreate fallback), matching the voice_task pattern (files:
+  main/tools/tool_camera.c, .agent/SYSTEM_OVERVIEW.md).
+- 2026-10-07 — Video send fixes: (1) PSRAM leak — tool_camera_video_stop_and_get
+  transferred the 4.1 MB AVI store by nulling its internal pointer, so
+  tool_camera_video_release() freed nothing; ownership now stays inside
+  tool_camera (release() frees the store, start() refuses to run while an
+  unreleased capture exists). (2) "no active Telegram chat ID yet" skip on the
+  first button press after a reboot — s_last_chat_id is now persisted to NVS
+  (tg_config/last_chat, written only on change) and restored at bot init.
+  (3) photo/video to_last_chat wrappers return ESP_ERR_INVALID_STATE instead
+  of fake ESP_OK on skip; mimi.c logs a clear hint (files:
+  main/tools/tool_camera.c, main/channels/telegram/telegram_bot.c, main/mimi.c,
+  .agent/SYSTEM_OVERVIEW.md).
+- 2026-10-07 — OLED hunt removal + public DNS fallback: the display driver
+  hunted 25 SCL×SDA pin pairs on EVERY display update (25-pair I2C scan per
+  status change) and its candidate list included GPIO 41 (camera button) and
+  42 (LED) — pulsing them caused phantom button edges and ~1 s stalls.
+  display_status.c now probes only the authoritative pins from
+  .agent/ESPET_PINS.MD (SCL=2, SDA=1) once; on NACK (panel dead/unwired) the
+  display is disabled until reboot with a single clear error, and 5
+  consecutive refresh failures disable it too. wifi_manager.c sets public DNS
+  fallbacks (8.8.8.8, 1.1.1.1) on the STA netif at GOT_IP — when the
+  DHCP-provided router DNS is unresponsive, lwIP retries these instead of
+  failing all TLS connects (field-observed outage windows) (files:
+  main/display/display_status.c, main/wifi/wifi_manager.c,
+  .agent/SYSTEM_OVERVIEW.md).
+- 2026-10-07 — Outbound Telegram retry: during network outage windows the
+  outbound dispatcher dropped replies after a single failed send (field log:
+  a fully-processed reply was lost). Telegram sends in the outbound task now
+  retry 6× at 5 s intervals (~30 s resilience) before giving up; voice speak
+  still only fires on final success (files: main/mimi.c,
+  .agent/SYSTEM_OVERVIEW.md).
+- 2026-10-07 — lwIP socket starvation fix (root cause of flappy
+  "network outages"): device logs showed `esp-tls: Failed to create socket`
+  and failures against the LOCAL backend too — not the router/ISP. Arithmetic:
+  bot opens a fresh TLS connection per ~6 s poll, each closed client socket
+  sits in TIME_WAIT for 2*MSL; defaults needed ~20 TIME_WAIT slots
+  (120 s each) against CONFIG_LWIP_MAX_SOCKETS=10 → all new connections
+  (LAN + WAN) stalled until slots aged out, then recovered — matching every
+  observed outage window. Raised CONFIG_LWIP_MAX_SOCKETS 10 → 16 and
+  CONFIG_LWIP_TCP_MSL 60000 → 10000 (TIME_WAIT ≈ 20 s) in sdkconfig +
+  sdkconfig.defaults.esp32s3; fullclean rebuild. Voice pipeline ("Hi ESP"
+  wake word, mic feeder, TTS/STT) DISABLED for field debug at the user's
+  request — voice_client_start() and voice_client_speak() call sites commented
+  in mimi.c (esp-sr is a large internal-RAM consumer and TTS held sockets for
+  30 s); re-enable via those markers once stable (files: sdkconfig,
+  sdkconfig.defaults.esp32s3, main/mimi.c, .agent/SYSTEM_OVERVIEW.md).
+- 2026-10-07 — Added docs/ARCH_COMPARISON_DIRECT_VS_CLOUD.md: design study
+  comparing Plan A (current direct-connect: device polls Telegram + calls LLM
+  itself, LAN backend for tools) vs Plan C (cloud gateway: single persistent
+  device WSS connection to a hosted server running the Telegram gateway, LLM
+  orchestration, and registry) — data flows, ASCII diagrams, adv/disadv,
+  side-by-side table, and a firmware/backend migration map for productization
+  (files: docs/ARCH_COMPARISON_DIRECT_VS_CLOUD.md, .agent/SYSTEM_OVERVIEW.md).

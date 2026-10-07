@@ -1,11 +1,13 @@
 #include "tool_registry.h"
 #include "mimi_config.h"
+#include "sync/backend_discovery.h"
+#include "display/display_status.h"
+#include "cJSON.h"
 #include "tools/tool_web_search.h"
 #include "tools/tool_get_time.h"
 #include "tools/tool_files.h"
 #include "tools/tool_cron.h"
 #include "tools/tool_gpio.h"
-#include "tools/tool_oled.h"
 #include "tools/tool_audio.h"
 
 #include <string.h>
@@ -59,6 +61,25 @@ static void build_tools_json(void)
     cJSON_Delete(arr);
 
     ESP_LOGI(TAG, "Tools JSON built (%d tools)", s_tool_count);
+}
+
+static esp_err_t oled_print_execute(const char *input_json, char *output, size_t output_size)
+{
+    cJSON *root = cJSON_Parse(input_json);
+    if (!root) {
+        snprintf(output, output_size, "{\"error\": \"Invalid JSON\"}");
+        return ESP_OK;
+    }
+    cJSON *text_item = cJSON_GetObjectItem(root, "text");
+    if (cJSON_IsString(text_item) && text_item->valuestring[0]) {
+        display_status_set(text_item->valuestring, "");
+        snprintf(output, output_size, "{\"status\": \"success\", \"displayed\": \"%s\"}",
+                 text_item->valuestring);
+    } else {
+        snprintf(output, output_size, "{\"error\": \"Missing text parameter\"}");
+    }
+    cJSON_Delete(root);
+    return ESP_OK;
 }
 
 esp_err_t tool_registry_init(void)
@@ -186,6 +207,18 @@ esp_err_t tool_registry_init(void)
     };
     register_tool(&cr);
 
+    /* Register oled_print — display text on the status screen */
+    mimi_tool_t op = {
+        .name = "oled_print",
+        .description = "Show a short text message on the OLED display screen.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{\"text\":{\"type\":\"string\",\"description\":\"Text to display (max ~20 chars per line)\"}},"
+            "\"required\":[\"text\"]}",
+        .execute = oled_print_execute,
+    };
+    register_tool(&op);
+
     /* Register GPIO tools */
     tool_gpio_init();
 
@@ -223,8 +256,6 @@ esp_err_t tool_registry_init(void)
     };
     register_tool(&ga);
 
-    /* Register OLED tool */
-    register_tool(&oled_tool);
 
     /* Register Audio tools */
     tool_audio_init();
@@ -311,7 +342,9 @@ static esp_err_t tool_remote_execute(const char *name, const char *input_json,
     snprintf(auth_hdr, sizeof(auth_hdr), "Bearer %s", MIMI_BACKEND_API_KEY);
 
     char url[256];
-    snprintf(url, sizeof(url), "%s/api/mcp/execute", MIMI_BACKEND_URL);
+    char base[96];
+    backend_discovery_base_url(base, sizeof(base));
+    snprintf(url, sizeof(url), "%s/api/mcp/execute", base);
 
     esp_http_client_config_t config = {
         .url = url,
@@ -380,7 +413,9 @@ static void psram_free(void *ptr) {
 
 esp_err_t tool_registry_fetch_remote_tools(void)
 {
-    ESP_LOGI(TAG, "Fetching remote tools from backend (%s/api/tools)...", MIMI_BACKEND_URL);
+    char base[96];
+    backend_discovery_base_url(base, sizeof(base));
+    ESP_LOGI(TAG, "Fetching remote tools from backend (%s/api/tools)...", base);
 
     char *response_buf = heap_caps_calloc(1, 131072, MALLOC_CAP_SPIRAM);
     if (!response_buf) {
@@ -401,7 +436,7 @@ esp_err_t tool_registry_fetch_remote_tools(void)
     snprintf(auth_hdr, sizeof(auth_hdr), "Bearer %s", MIMI_BACKEND_API_KEY);
 
     char url[256];
-    snprintf(url, sizeof(url), "%s/api/tools", MIMI_BACKEND_URL);
+    snprintf(url, sizeof(url), "%s/api/tools", base);
 
     esp_http_client_config_t config = {
         .url = url,
@@ -490,33 +525,27 @@ esp_err_t tool_registry_fetch_remote_tools(void)
 esp_err_t tool_registry_execute(const char *name, const char *input_json,
                                 char *output, size_t output_size)
 {
-    bool is_oled_tool = (strcmp(name, "oled_print") == 0);
-    if (!is_oled_tool) {
-        oled_display_status("Processing...", name);
-    }
 
     esp_err_t ret = ESP_FAIL;
     for (int i = 0; i < s_tool_count; i++) {
         if (strcmp(s_tools[i].name, name) == 0) {
             ESP_LOGI(TAG, "Executing tool: %s", name);
+            display_status_set("Tool:", name);
             if (s_tools[i].execute) {
                 ret = s_tools[i].execute(input_json, output, output_size);
             } else {
                 ret = tool_remote_execute(name, input_json, output, output_size);
             }
-            if (!is_oled_tool) {
-                oled_display_status("Done:", name);
-            }
+            display_status_set(ret == ESP_OK ? "Done:" : "Tool failed:", name);
             return ret;
         }
     }
 
     /* Fallback: try remote execution if tool name wasn't registered locally */
     ESP_LOGI(TAG, "Tool '%s' not registered locally, trying remote execution...", name);
+    display_status_set("Tool:", name);
     ret = tool_remote_execute(name, input_json, output, output_size);
-    if (!is_oled_tool) {
-        oled_display_status("Done:", name);
-    }
+    display_status_set(ret == ESP_OK ? "Done:" : "Tool failed:", name);
     return ret;
 }
 

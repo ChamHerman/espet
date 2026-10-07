@@ -56,3 +56,11 @@ CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
 # allocations that intermittently fail under memory pressure ("esp-aes: Failed
 # to allocate memory" -> LLM call fails). Payloads here are tiny; SW AES is fine.
 CONFIG_MBEDTLS_HARDWARE_AES=n
+
+# Field-debug 2026-10-07: lwIP socket starvation — the Telegram bot opens a
+# fresh TLS connection every ~6 s and each closed client socket sits in
+# TIME_WAIT for 2*MSL; at defaults (10 sockets, 60 s MSL) that needs ~20
+# TIME_WAIT slots against a limit of 10, stalling ALL new connections
+# (LAN included) until slots age out.
+CONFIG_LWIP_MAX_SOCKETS=16
+CONFIG_LWIP_TCP_MSL=10000

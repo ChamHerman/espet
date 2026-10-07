@@ -25,12 +25,13 @@
 #include "cron/cron_service.h"
 #include "heartbeat/heartbeat.h"
 #include "sync/config_sync.h"
+#include "sync/backend_discovery.h"
+#include "display/display_status.h"
 #include "skills/skill_loader.h"
 #include "onboard/wifi_onboard.h"
 #include "tools/button_handler.h"
 #include "tools/tool_audio.h"
 #include "voice/voice_client.h"
-#include "tools/tool_oled.h"
 #include "tools/tool_camera.h"
 
 static const char *TAG = "mimi";
@@ -64,7 +65,27 @@ static void on_white_button_long_press(bool is_starting)
         tool_camera_video_start();
     } else {
         ESP_LOGI(TAG, "[WHITE BUTTON] Long Press Released: Stopping Video Capture");
-        tool_camera_video_stop();
+        uint8_t *avi = NULL;
+        size_t avi_len = 0;
+        esp_err_t verr = tool_camera_video_stop_and_get(&avi, &avi_len);
+        if (verr != ESP_OK || !avi) {
+            ESP_LOGW(TAG, "Video capture produced nothing (err=%d)", verr);
+            return;
+        }
+
+        ESP_LOGI(TAG, "Video captured (%u bytes). Sending to Telegram...",
+                 (unsigned)avi_len);
+        esp_err_t err = telegram_send_video_to_last_chat(
+            avi, avi_len, "What do you want to know about this video?");
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "Video sent successfully!");
+        } else if (err == ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "No Telegram chat known yet — send the bot a "
+                          "message once, then hold the button again");
+        } else {
+            ESP_LOGE(TAG, "Failed to send video: %d", err);
+        }
+        tool_camera_video_release();
     }
 }
 
@@ -105,6 +126,12 @@ static esp_err_t init_spiffs(void)
     return ESP_OK;
 }
 
+/* Replies must not die in a network outage window: the bot can hit
+ * multi-minute stretches where every outbound TLS connection fails
+ * (router/ISP drops) — retry instead of dropping the message. */
+#define TG_SEND_RETRIES   6
+#define TG_SEND_RETRY_MS  5000
+
 /* Outbound dispatch task: reads from outbound queue and routes to channels */
 static void outbound_dispatch_task(void *arg)
 {
@@ -120,14 +147,30 @@ static void outbound_dispatch_task(void *arg)
             if (msg.chat_id[0] == '\0') {
                 ESP_LOGW(TAG, "Skipping Telegram send: chat_id is empty");
             } else {
-                esp_err_t send_err = telegram_send_message(msg.chat_id, msg.content);
+                esp_err_t send_err = ESP_FAIL;
+                for (int attempt = 1; attempt <= TG_SEND_RETRIES; attempt++) {
+                    send_err = telegram_send_message(msg.chat_id, msg.content);
+                    if (send_err == ESP_OK) {
+                        break;
+                    }
+                    if (attempt < TG_SEND_RETRIES) {
+                        ESP_LOGW(TAG, "Telegram send failed (attempt %d/%d) — "
+                                      "retrying in %d s", attempt,
+                                 TG_SEND_RETRIES, TG_SEND_RETRY_MS / 1000);
+                        vTaskDelay(pdMS_TO_TICKS(TG_SEND_RETRY_MS));
+                    }
+                }
                 if (send_err != ESP_OK) {
-                    ESP_LOGE(TAG, "Telegram send failed for %s: %s", msg.chat_id, esp_err_to_name(send_err));
+                    ESP_LOGE(TAG, "Telegram send failed for %s after %d attempts: %s",
+                             msg.chat_id, TG_SEND_RETRIES,
+                             esp_err_to_name(send_err));
                 } else {
                     ESP_LOGI(TAG, "Telegram send success for %s (%d bytes)", msg.chat_id, (int)strlen(msg.content));
                     /* Final agent replies are spoken too (user request):
                      * every text answer also comes out of the speaker. */
-                    voice_client_speak(msg.content);
+                    /* VOICE DISABLED (field debug 2026-10-07) — see
+                     * voice_client_start() comment in app_main. */
+                    /* voice_client_speak(msg.content); */
                 }
             }
         } else if (strcmp(msg.channel, MIMI_CHAN_FEISHU) == 0) {
@@ -148,7 +191,9 @@ static void outbound_dispatch_task(void *arg)
              * last Telegram chat AND speak it through the MAX98357A. */
             if (strcmp(msg.chat_id, "voice") == 0) {
                 telegram_send_to_last_chat(msg.content);
-                voice_client_speak(msg.content);   /* final answers AND the
+                /* VOICE DISABLED (field debug 2026-10-07) — see
+                 * voice_client_start() comment in app_main. */
+                /* voice_client_speak(msg.content); */  /* final answers AND the
                                                       "ESPeting..." status are
                                                       spoken */
             }
@@ -168,6 +213,8 @@ void app_main(void)
     ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, "  MimiClaw - ESP32-S3 AI Agent");
     ESP_LOGI(TAG, "========================================");
+    display_status_init();
+    display_status_set("Starting...", "");
 
     /* Print memory info */
     ESP_LOGI(TAG, "Internal free: %d bytes",
@@ -239,7 +286,6 @@ void app_main(void)
             ? ESP_OK : ESP_FAIL);
 
         /* Start network-dependent services */
-        tool_oled_init_animation();
         ESP_ERROR_CHECK(agent_loop_start());
         ESP_ERROR_CHECK(telegram_bot_start());
         ESP_ERROR_CHECK(feishu_bot_start());
@@ -248,13 +294,23 @@ void app_main(void)
         ESP_ERROR_CHECK(ws_server_start());
         config_sync_start();
 
-        /* Hands-free wake word listener ("Hi ESP" -> Yes? -> command). */
-        esp_err_t v_err = voice_client_start();
+        /* VOICE DISABLED (field debug 2026-10-07): "Hi ESP" wake-word listener
+         * and mic pipeline intentionally OFF. The esp-sr stack is a large
+         * internal-RAM consumer and TTS fetches hold a socket for up to 30 s;
+         * lwIP socket starvation was breaking all connections (LAN included).
+         * Re-enable once the socket fixes are proven stable. */
+        /* esp_err_t v_err = voice_client_start();
         if (v_err != ESP_OK) {
             ESP_LOGW(TAG, "voice wake listener not started: %s", esp_err_to_name(v_err));
-        }
+        } */
+
+        /* mDNS resolve of backend URL — deliberately LAST so the internal-RAM
+         * mDNS task doesn't starve boot-time task creation; falls back to the
+         * compile-time IP until discovery succeeds. */
+        backend_discovery_start();
 
         ESP_LOGI(TAG, "All services started!");
+        display_status_idle();   /* shows "Hi ESP to wake" */
     }
 
     ESP_LOGI(TAG, "MimiClaw ready. Type 'help' for CLI commands.");

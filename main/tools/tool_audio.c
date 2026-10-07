@@ -455,10 +455,15 @@ static esp_err_t play_tone(uint32_t freq_hz, uint32_t duration_ms, float vol)
     }
 
     s_playing = true;
+    /* Gate the mic for the whole tone: the feeder parks via s_speaker_busy.
+     * (Ungated beeps raced the mic feeder — field: the 220 Hz error beep came
+     * out as a blur of noise instead of a tone.) */
+    s_speaker_busy = true;
 
     int32_t *chunk = (int32_t *)malloc(AUDIO_TX_CHUNK_BYTES);
     if (!chunk) {
         s_playing = false;
+        s_speaker_busy = false;
         return ESP_ERR_NO_MEM;
     }
 
@@ -491,6 +496,7 @@ static esp_err_t play_tone(uint32_t freq_hz, uint32_t duration_ms, float vol)
 
     free(chunk);
     s_playing = false;
+    s_speaker_busy = false;
 
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "[SPK] Tone done (%u frames)", (unsigned)played_frames);
@@ -651,7 +657,8 @@ static void mic_feeder_task(void *arg)
             frame_energy += (s < 0 ? -s : s);
             size_t used = (s_rx_ring_w - s_rx_ring_r) & RX_RING_MASK;
             if (used >= RX_RING_SAMPLES - 1) {
-                break;   /* ring full — drop oldest implicitly by not writing */
+                break;   /* ring full — backpressure: keep what's buffered,
+                          * drop the rest of THIS read (newest audio) */
             }
             s_rx_ring[s_rx_ring_w] = s;
             s_rx_ring_w = (s_rx_ring_w + 1) & RX_RING_MASK;
@@ -1191,6 +1198,11 @@ esp_err_t tool_audio_play_wav(const uint8_t *wav, size_t len)
     }
 
     s_playing = true;
+    /* Gate the mic for the whole playback (feeder parks via s_speaker_busy).
+     * voice_client wraps TTS in a wider session (download + play), but the
+     * ack/beeps/other callers relied on this alone — ungated playback raced
+     * the mic feeder (field: noise burst instead of speech). */
+    s_speaker_busy = true;
     ESP_LOGI(TAG, "[SPK] WAV playback: data=%u bytes (~%lu ms), %lu Hz, %u ch, %u bit",
              (unsigned)data_len,
              (unsigned long)((uint64_t)data_len / (channels * 2) * 1000 / sample_rate),
@@ -1203,6 +1215,7 @@ esp_err_t tool_audio_play_wav(const uint8_t *wav, size_t len)
     int32_t *chunk = (int32_t *)malloc(AUDIO_TX_CHUNK_BYTES);
     if (!chunk) {
         s_playing = false;
+        s_speaker_busy = false;
         return ESP_ERR_NO_MEM;
     }
 
@@ -1248,6 +1261,7 @@ esp_err_t tool_audio_play_wav(const uint8_t *wav, size_t len)
 
     free(chunk);
     s_playing = false;
+    s_speaker_busy = false;
     ESP_LOGI(TAG, "[SPK] WAV done (%u bytes played)", (unsigned)played);
     return err;
 }

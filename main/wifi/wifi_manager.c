@@ -1,4 +1,5 @@
 #include "wifi_manager.h"
+#include "display/display_status.h"
 #include "mimi_config.h"
 
 #include <string.h>
@@ -58,6 +59,7 @@ static void event_handler(void *arg, esp_event_base_t event_base,
             s_retry_count++;
         } else {
             ESP_LOGE(TAG, "Failed to connect after %d retries", MIMI_WIFI_MAX_RETRY);
+            display_status_set("WiFi FAILED", "check router");
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
         }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
@@ -67,6 +69,21 @@ static void event_handler(void *arg, esp_event_base_t event_base,
         s_retry_count = 0;
         s_connected = true;
         esp_wifi_set_ps(WIFI_PS_NONE);
+
+        /* Public DNS fallbacks: the DHCP-provided (router) DNS stays primary,
+         * but when it is unresponsive lwIP retries these instead of failing
+         * outright — field logs showed whole outage windows where every TLS
+         * connect failed while the LAN stayed up. Idempotent per (re)connect. */
+        esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+        if (sta_netif) {
+            esp_netif_dns_info_t dns = {0};
+            dns.ip.type = ESP_IPADDR_TYPE_V4;
+            dns.ip.u_addr.ip4.addr = esp_ip4addr_aton("8.8.8.8");
+            esp_netif_set_dns_info(sta_netif, ESP_NETIF_DNS_FALLBACK, &dns);
+            dns.ip.u_addr.ip4.addr = esp_ip4addr_aton("1.1.1.1");
+            esp_netif_set_dns_info(sta_netif, ESP_NETIF_DNS_BACKUP, &dns);
+            ESP_LOGI(TAG, "Public DNS fallback set (8.8.8.8, 1.1.1.1)");
+        }
 
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }

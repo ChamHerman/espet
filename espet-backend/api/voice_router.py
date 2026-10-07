@@ -204,12 +204,16 @@ async def transcribe(request: Request):
 
     ctype = (request.headers.get("content-type") or "").lower()
     try:
+        raw_rate = int(request.headers.get("x-audio-rate") or ESP_SAMPLE_RATE)
+    except ValueError:
+        raw_rate = ESP_SAMPLE_RATE
+    rate = raw_rate if raw_rate > 0 else ESP_SAMPLE_RATE
+    try:
         if "wav" in ctype or body[:4] == b"RIFF":
             pcm = wav_bytes_to_pcm16(body)
         else:
             raw = np.frombuffer(body[: len(body) // 2 * 2], dtype="<i2").copy()
-            # Guard against insane sample rates mis-sized by the caller
-            pcm = raw
+            pcm = resample_to_16k(raw, rate) if rate != ESP_SAMPLE_RATE else raw
         text = await _run_stt(pcm)
     except HTTPException:
         raise
