@@ -10,7 +10,6 @@ static const char *TAG = "button_handler";
 
 static button_short_press_cb_t s_short_cb = NULL;
 static button_long_press_cb_t s_long_cb = NULL;
-static button_ptt_cb_t s_ptt_cb = NULL;
 static QueueHandle_t s_btn_evt_queue = NULL;
 
 typedef struct {
@@ -19,7 +18,6 @@ typedef struct {
 } btn_evt_t;
 
 static int64_t s_last_snap_time = 0;
-static int64_t s_last_ptt_time = 0;
 /* Presses before this timestamp are coupling glitches: refreshed whenever
  * the speaker is busy, expiring AUDIO_GLITCH_COOLDOWN_MS after playback. */
 static int64_t s_audio_busy_until = 0;
@@ -49,9 +47,8 @@ static void IRAM_ATTR gpio_isr_handler(void *arg)
 static void button_task(void *arg)
 {
     btn_evt_t evt;
-    bool last_green_state = false;
     
-    // State variables for the dual-action white button
+    // State variables for the camera button (short=snap photo, hold=video)
     int64_t press_time = 0;
     bool is_pressed = false;
     bool is_long_pressing = false;
@@ -76,23 +73,22 @@ static void button_task(void *arg)
                 if (current_level_pressed && !is_pressed) {
                     if (tool_audio_is_busy()) {
                         /* Speaker is driving the I2S bus right now — a press
-                         * edge seen here is coupling from the amp, not a
-                         * click. */
-                        ESP_LOGW(TAG, "White Button (GPIO %d): press dropped — speaker active", GPIO_BTN_WHITE_SNAP);
+                         * edge seen here is coupling from the amp, not a click. */
+                        ESP_LOGW(TAG, "Camera Button (GPIO %d): press dropped — speaker active", GPIO_BTN_WHITE_SNAP);
                         xQueueReset(s_btn_evt_queue);
                         continue;
                     }
                     if (now < s_audio_busy_until) {
                         /* Cool-down right after playback: the coupled pulse
                          * can outlast the speaker burst by a few ms. */
-                        ESP_LOGW(TAG, "White Button (GPIO %d): press dropped — post-playback glitch window", GPIO_BTN_WHITE_SNAP);
+                        ESP_LOGW(TAG, "Camera Button (GPIO %d): press dropped — post-playback glitch window", GPIO_BTN_WHITE_SNAP);
                         xQueueReset(s_btn_evt_queue);
                         continue;
                     }
                     if (gpio_get_level((gpio_num_t)GPIO_BTN_WHITE_SNAP) != 0) {
                         /* ISR saw LOW but the line has already recovered by
                          * the time this task ran — transient, not a press. */
-                        ESP_LOGW(TAG, "White Button (GPIO %d): press dropped — pin already released (noise)", GPIO_BTN_WHITE_SNAP);
+                        ESP_LOGW(TAG, "Camera Button (GPIO %d): press dropped — pin already released (noise)", GPIO_BTN_WHITE_SNAP);
                         xQueueReset(s_btn_evt_queue);
                         continue;
                     }
@@ -113,48 +109,34 @@ static void button_task(void *arg)
                     is_pressed = false;
 
                     if (is_long_pressing) {
-                        ESP_LOGI(TAG, "White Button (GPIO %d): Long Press Released", GPIO_BTN_WHITE_SNAP);
+                        ESP_LOGI(TAG, "Camera Button (GPIO %d): Long Press Released", GPIO_BTN_WHITE_SNAP);
                         if (s_long_cb) {
                             s_long_cb(false); // Stop
                         }
                     } else if ((now - press_time) >= MIN_PRESS_MS) {
-                        ESP_LOGI(TAG, "White Button (GPIO %d): Short Click Detected", GPIO_BTN_WHITE_SNAP);
+                        ESP_LOGI(TAG, "Camera Button (GPIO %d): Short Click Detected", GPIO_BTN_WHITE_SNAP);
                         s_last_snap_time = now;
                         if (s_short_cb) {
                             s_short_cb();
                         }
                     } else {
-                        ESP_LOGW(TAG, "White Button (GPIO %d): %lld ms pulse — below %d ms, treated as noise",
+                        ESP_LOGW(TAG, "Camera Button (GPIO %d): %lld ms pulse — below %d ms, treated as noise",
                                  GPIO_BTN_WHITE_SNAP, (long long)(now - press_time), MIN_PRESS_MS);
                     }
                     // Purge bounce events
                     xQueueReset(s_btn_evt_queue);
                 }
-            } else
-#endif
-            if (evt.pin == GPIO_BTN_GREEN_PTT) {
-                bool is_green_pressed = !evt.level;
-                if (is_green_pressed != last_green_state) {
-                    if (now - s_last_ptt_time > 300) { /* 300ms debounce */
-                        s_last_ptt_time = now;
-                        last_green_state = is_green_pressed;
-                        ESP_LOGI(TAG, "Green Button (GPIO %d): %s", GPIO_BTN_GREEN_PTT, is_green_pressed ? "Pressed" : "Released");
-                        if (s_ptt_cb) {
-                            s_ptt_cb(is_green_pressed);
-                        }
-                        xQueueReset(s_btn_evt_queue);
-                    }
-                }
             }
+#endif
         }
 
 #if (GPIO_BTN_WHITE_SNAP >= 0)
-        // --- TIMEOUT CHECK for White Button ---
+        // --- TIMEOUT CHECK for Camera Button Long Press ---
         if (is_pressed && !is_long_pressing) {
             int64_t now = esp_timer_get_time() / 1000;
             if ((now - press_time) >= LONG_PRESS_THRESHOLD_MS) {
                 is_long_pressing = true;
-                ESP_LOGI(TAG, "White Button (GPIO %d): Long Press Triggered", GPIO_BTN_WHITE_SNAP);
+                ESP_LOGI(TAG, "Camera Button (GPIO %d): Long Press Triggered", GPIO_BTN_WHITE_SNAP);
                 if (s_long_cb) {
                     s_long_cb(true); // Start
                 }
@@ -164,11 +146,10 @@ static void button_task(void *arg)
     }
 }
 
-esp_err_t button_handler_init(button_short_press_cb_t short_cb, button_long_press_cb_t long_cb, button_ptt_cb_t ptt_cb)
+esp_err_t button_handler_init(button_short_press_cb_t short_cb, button_long_press_cb_t long_cb)
 {
     s_short_cb = short_cb;
     s_long_cb = long_cb;
-    s_ptt_cb = ptt_cb;
 
     s_btn_evt_queue = xQueueCreate(10, sizeof(btn_evt_t));
     if (!s_btn_evt_queue) {
@@ -179,9 +160,6 @@ esp_err_t button_handler_init(button_short_press_cb_t short_cb, button_long_pres
     uint64_t pin_mask = 0;
 #if (GPIO_BTN_WHITE_SNAP >= 0)
     pin_mask |= (1ULL << GPIO_BTN_WHITE_SNAP);
-#endif
-#if (GPIO_BTN_GREEN_PTT >= 0)
-    pin_mask |= (1ULL << GPIO_BTN_GREEN_PTT);
 #endif
 
     gpio_config_t io_conf = {
@@ -208,12 +186,9 @@ esp_err_t button_handler_init(button_short_press_cb_t short_cb, button_long_pres
 #if (GPIO_BTN_WHITE_SNAP >= 0)
     gpio_isr_handler_add(GPIO_BTN_WHITE_SNAP, gpio_isr_handler, (void *)GPIO_BTN_WHITE_SNAP);
 #endif
-#if (GPIO_BTN_GREEN_PTT >= 0)
-    gpio_isr_handler_add(GPIO_BTN_GREEN_PTT, gpio_isr_handler, (void *)GPIO_BTN_GREEN_PTT);
-#endif
 
-    ESP_LOGI(TAG, "Button handler initialized (Cam=%d: short=snap/hold=video, PTT=%d disabled)",
-             GPIO_BTN_WHITE_SNAP, GPIO_BTN_GREEN_PTT);
+    ESP_LOGI(TAG, "Button handler initialized (Cam Button=%d: short=snap photo, hold=video)",
+             GPIO_BTN_WHITE_SNAP);
     return ESP_OK;
 }
 
@@ -221,15 +196,6 @@ bool button_is_white_pressed(void)
 {
 #if (GPIO_BTN_WHITE_SNAP >= 0)
     return gpio_get_level(GPIO_BTN_WHITE_SNAP) == 0;
-#else
-    return false;
-#endif
-}
-
-bool button_is_green_pressed(void)
-{
-#if (GPIO_BTN_GREEN_PTT >= 0)
-    return gpio_get_level(GPIO_BTN_GREEN_PTT) == 0;
 #else
     return false;
 #endif

@@ -24,3 +24,13 @@ _STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 )
 async def dashboard():
     return FileResponse(_STATIC_DIR / "index.html")
+
+
+@router.get(
+    "/cloud",
+    response_class=FileResponse,
+    summary="Hybrid Cloud Gateway & LLM Config",
+    description="Dedicated configuration page for Telegram bot token, server-side LLM relay, and chat bindings.",
+)
+async def cloud_dashboard():
+    return FileResponse(_STATIC_DIR / "cloud.html")

@@ -1,19 +1,20 @@
 /*
- * voice_client.c — hands-free voice pipeline (esp-sr WakeNet + backend STT/TTS)
+ * voice_client.c — hands-free voice pipeline (VAD + backend Whisper wake-word verification & TTS)
  *
- * Flow (no button — the mic is always the entry point):
- *
- *   LISTEN   WakeNet ("Hi ESP" model, WN9) consumes the I2S RX stream.
- *   WAKE     → "Yes?" ack (pre-cached TTS WAV in PSRAM, plays instantly)
- *            → command window opens: capture until ~1.6 s silence or 10 s.
- *   THINK    → POST PCM /api/voice/transcribe → transcript
- *            → inbound bus as system:"voice" message → agent ReAct loop
- *   SPEAK    → agent reply routed back by mimi.c → voice_client_speak()
- *            → POST /api/voice/tts → WAV → MAX98357A.
- *
- * The wake engine and the speaker share the bus: the listener pauses while
- * anything plays or records (tool_audio_is_busy), so the device never
- * hears itself.
+ * Flow:
+ *   LISTEN   VAD monitors the I2S mic stream for speech activity (RMS > threshold).
+ *            Continuous listening consumes virtually 0% CPU (simple RMS calculation).
+ *   CAPTURE  When speech is detected, arms capture with a 250ms pre-roll from the
+ *            ring buffer (so initial syllables like "Mi-" or "Hey" are preserved).
+ *            Captures until 1.2s silence or 8s cap.
+ *   VERIFY   Audio is sent to backend /api/voice/transcribe (Whisper).
+ *            Whisper transcribes and checks for configured wake words ("Mimi", "Hey Mimi", "米米", etc.).
+ *            - If wake word NOT present: silently ignored (zero false actions).
+ *            - If one-shot command ("Hey Mimi turn on LED"):
+ *                Remaining command is queued directly to agent ReAct loop!
+ *            - If wake word only ("Mimi"):
+ *                Plays pre-cached "Yes?" ack, opens command window, then queues follow-up.
+ *   SPEAK    Agent reply routed to voice_client_speak() -> /api/voice/tts -> MAX98357A speaker.
  */
 
 #include "voice/voice_client.h"
@@ -26,9 +27,6 @@
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_timer.h"
-#include "esp_wn_iface.h"
-#include "esp_wn_models.h"
-#include "model_path.h"   /* esp_srmodel_init / esp_srmodel_filter */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "cJSON.h"
@@ -38,42 +36,56 @@
 #include <stdbool.h>
 #include <math.h>
 
-/* debug: feeder-side DMA counters (defined in tool_audio.c) */
+/* debug: feeder-side DMA counters + ambient floor (defined in tool_audio.c) */
 extern volatile uint32_t s_feeder_reads;
 extern volatile uint32_t s_feeder_zeros;
 extern volatile uint32_t s_ring_written;
+extern volatile int32_t  s_mic_floor;   /* ambient RMS, updated by the feeder */
 
 static const char *TAG = "voice";
 
 /* -----------------------------------------------------------------------
  * Tuning
  * --------------------------------------------------------------------- */
-#define VOICE_TASK_STACK       (12 * 1024)  /* stack lives in PSRAM (see start) */
-#define VOICE_TASK_PRIO        3           /* MUST stay low: the wake loop is CPU-hungry
-                                               (continuous I2S reads + WakeNet); at prio 5 it
-                                               starved IDLE0 (field WDT spam) and TLS/AES */
-#define VOICE_TASK_CORE        0           /* networking core; WakeNet is light */
+#define VOICE_TASK_STACK       (12 * 1024)  /* stack lives in PSRAM */
+#define VOICE_TASK_PRIO        3            /* low priority to not starve IDLE0 */
+#define VOICE_TASK_CORE        0            /* Core 0 */
 
-#define WAKE_CHUNK_MS          30          /* feed WakeNet in 30 ms frames */
-#define WAKE_CHUNK_SAMPLES     (TOOL_AUDIO_SAMPLE_RATE * WAKE_CHUNK_MS / 1000)
+#define VAD_CHUNK_MS           32           /* 32 ms frame */
+#define VAD_CHUNK_SAMPLES      (TOOL_AUDIO_SAMPLE_RATE * VAD_CHUNK_MS / 1000) /* 512 samples */
+#define VAD_SPEECH_RMS_START   420          /* minimum trigger floor (quiet room).
+                                             * Real threshold = max(this, 1.33x ambient floor),
+                                             * capped at VAD_RMS_THRESHOLD_MAX: the field room sat
+                                             * at ~9500 RMS steady (fan/TV + 2.5x mic gain) — 20x
+                                             * this value — and re-triggered every ~1.5s while
+                                             * nobody spoke. */
+#define VAD_RMS_THRESHOLD_MAX  14000        /* adaptive cap. The field room sits at ~9500 RMS
+                                             * steady (speech peaks only 10~16k), so the cap must
+                                             * stay below speech peaks — 14000 keeps the device
+                                             * responsive while pushing the trigger above most of
+                                             * the ambient. Residual noise captures are silently
+                                             * rejected by the backend confidence gate. */
+#define VAD_TRIGGER_CONSEC     3            /* 3 consecutive frames (~96ms) required to trigger */
+#define VAD_PREROLL_SAMPLES    4000         /* 250 ms pre-roll to capture full wake word prefix */
 
-#define ACK_CACHE_BYTES        (96 * 1024) /* "Yes?" WAV cache in PSRAM */
+#define ECHO_GUARD_MS          700          /* mic discarded after ANY playback: the amp + room
+                                             * keep ringing for hundreds of ms; field showed VAD
+                                             * re-triggering 330 ms after TTS end and Whisper
+                                             * hallucinating the wake word from the tail. */
+#define ACK_SETTLE_MS          450          /* wait after the "Yes?" ack before opening the command
+                                             * window so the ack echo is not captured as a command */
 
-#define CMD_MAX_MS             10000       /* hard cap on command capture */
+#define ACK_CACHE_BYTES        (96 * 1024)  /* "Yes?" WAV cache in PSRAM */
+
+#define UTTERANCE_MAX_MS       2500         /* cap on wake word utterance (2.5s) */
+#define CMD_MAX_MS             4500         /* hard cap on command capture (4.5s) */
 #define CMD_MAX_SAMPLES        (TOOL_AUDIO_SAMPLE_RATE * CMD_MAX_MS / 1000)
-#define CMD_LEAD_MS            5000        /* grace to START talking: silence
-                                               stop only applies once speech
-                                               was heard (RMS > threshold) */
-#define CMD_SILENCE_MS         1600        /* stop after this much trailing
-                                               silence */
-#define CMD_SILENCE_RMS        200         /* voice @1m ≈ 300–1000 RMS, quiet
-                                               room floor <100 — 350 clipped
-                                               soft trailing words */
+#define CMD_LEAD_MS            4000         /* grace to START talking in 2-step command */
+#define CMD_SILENCE_MS         700          /* stop after 700 ms trailing silence for fast cutoff */
+#define CMD_SILENCE_RMS        280          /* trailing silence baseline threshold */
 
 #define VOICE_HTTP_TIMEOUT_MS  30000
-#define VOICE_HTTP_RX_MAX      (2 * 1024 * 1024)  /* PSRAM; long replies hit the
-                                                   old 256 KB cap (field: a 194-char
-                                                   reply made a 262 KB WAV -> oom=1) */
+#define VOICE_HTTP_RX_MAX      (2 * 1024 * 1024)  /* PSRAM */
 #define VOICE_TX_CHUNK         (4 * 1024)
 
 #define BEEP_ACK_FALLBACK_HZ   880
@@ -85,26 +97,72 @@ static const char *TAG = "voice";
 /* -----------------------------------------------------------------------
  * State
  * --------------------------------------------------------------------- */
-static srmodel_list_t      *s_srmodels       = NULL;
-static char                *s_wn_name        = NULL;   /* e.g. "wn9_hiesp" */
-static const esp_wn_iface_t *s_wn_iface      = NULL;
-static model_iface_data_t  *s_wn_data        = NULL;
-static int                  s_wn_chunk       = 512;    /* samples per detect() */
-static int16_t             *s_wn_buf         = NULL;   /* accumulation buffer */
 static TaskHandle_t         s_voice_task     = NULL;
 static StackType_t         *s_voice_stack    = NULL;  /* PSRAM-allocated */
 static StaticTask_t        *s_voice_tcb      = NULL;  /* internal RAM */
 static volatile bool        s_running        = false;
 static volatile bool        s_busy           = false;  /* pipeline in flight */
+static int64_t              s_busy_start_ms  = 0;      /* watchdog timer for agent thinking */
+static volatile int64_t     s_mic_guard_until_ms = 0;  /* post-playback echo guard deadline */
 static uint8_t             *s_ack_wav        = NULL;   /* "Yes?" cache */
 static size_t               s_ack_wav_len    = 0;
+
+/* -----------------------------------------------------------------------
+ * Signal Processing Helpers
+ * --------------------------------------------------------------------- */
+
+/* Zero-mean (AC) RMS calculation:
+ * Measures true acoustic waveform energy without being misled by DC bias,
+ * ground bounce, or power-rail noise from OLED/peripherals. */
+static inline int32_t calc_ac_rms(const int16_t *samples, size_t count)
+{
+    if (count == 0) return 0;
+    int64_t sum = 0;
+    for (size_t i = 0; i < count; i++) {
+        sum += samples[i];
+    }
+    int32_t mean = (int32_t)(sum / (int64_t)count);
+    int64_t var_sum = 0;
+    for (size_t i = 0; i < count; i++) {
+        int32_t diff = (int32_t)samples[i] - mean;
+        var_sum += (int64_t)diff * diff;
+    }
+    return (int32_t)sqrt((double)var_sum / (double)count);
+}
+
+/* Adaptive trigger threshold: fixed 420 was calibrated for a quiet room, but
+ * the field room floor sits at ~9000 RMS (fan/TV + 2.5x mic gain), making the
+ * device fire every ~1.5s on non-speech. The floor is measured by the always-
+ * running mic feeder (s_mic_floor, see tool_audio.c); require a margin above it. */
+static inline int32_t vad_trigger_threshold(void)
+{
+    int32_t floor = s_mic_floor;
+    int32_t thr = floor + floor / 3;                           /* 1.33x floor */
+    if (thr < VAD_SPEECH_RMS_START) thr = VAD_SPEECH_RMS_START;
+    if (thr > VAD_RMS_THRESHOLD_MAX) thr = VAD_RMS_THRESHOLD_MAX;
+    return thr;
+}
+
+/* Arm the post-playback echo guard: drop mic input for ECHO_GUARD_MS so the
+ * amp tail + room reverb can't trigger VAD (and then Whisper-hallucinate the
+ * wake word from the TTS tail). */
+static void mic_guard_start(uint32_t ms)
+{
+    int64_t until = esp_timer_get_time() / 1000 + (int64_t)ms;
+    if (until > s_mic_guard_until_ms) {
+        s_mic_guard_until_ms = until;
+    }
+}
+
+static bool mic_guard_active(void)
+{
+    return (esp_timer_get_time() / 1000) < s_mic_guard_until_ms;
+}
 
 /* -----------------------------------------------------------------------
  * HTTP helpers (PSRAM buffers)
  * --------------------------------------------------------------------- */
 
-/* Writes into a caller-owned buffer: called from both the wake task (STT)
- * and the outbound task (speak) — a shared static buffer would race. */
 static void voice_backend_url(char *out, size_t out_sz, const char *path)
 {
     char base[96];
@@ -163,9 +221,7 @@ static bool ack_fetch(void)
     };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (!client) {
-        tool_audio_speaker_session_end();   /* never leak the gate: feeder
-                                               would park forever and the
-                                               wake word would go deaf */
+        tool_audio_speaker_session_end();
         return false;
     }
     esp_http_client_set_header(client, "Authorization", "Bearer " MIMI_BACKEND_API_KEY);
@@ -199,18 +255,23 @@ static void ack_play(void)
 }
 
 /* -----------------------------------------------------------------------
- * STT: POST raw PCM → {"text": ...}
+ * STT: POST raw PCM → {"text": ..., "raw_text": ..., "wake_matched": ...}
  * --------------------------------------------------------------------- */
 
-static char *voice_transcribe(const int16_t *pcm, size_t samples)
+bool voice_client_transcribe_full(const int16_t *pcm, size_t samples, voice_stt_result_t *out_res)
 {
+    if (!out_res) return false;
+    memset(out_res, 0, sizeof(*out_res));
+    if (!pcm || samples == 0) return false;
+
     size_t body_len = samples * sizeof(int16_t);
     rx_buf_t *rx = heap_caps_calloc(1, sizeof(rx_buf_t), MALLOC_CAP_SPIRAM);
+    if (!rx) return false;
     rx->cap = 8 * 1024;
     rx->buf = heap_caps_calloc(1, rx->cap, MALLOC_CAP_SPIRAM);
-    if (!rx || !rx->buf) {
+    if (!rx->buf) {
         free(rx);
-        return NULL;
+        return false;
     }
 
     char url[128];
@@ -229,11 +290,11 @@ static char *voice_transcribe(const int16_t *pcm, size_t samples)
     if (!client) {
         free(rx->buf);
         free(rx);
-        return NULL;
+        return false;
     }
     esp_http_client_set_header(client, "Authorization", "Bearer " MIMI_BACKEND_API_KEY);
     esp_http_client_set_header(client, "Content-Type", "application/octet-stream");
-    {   /* tell the backend the capture rate so a mismatch can be converted */
+    {
         char rate_hdr[12];
         snprintf(rate_hdr, sizeof(rate_hdr), "%d", TOOL_AUDIO_SAMPLE_RATE);
         esp_http_client_set_header(client, "X-Audio-Rate", rate_hdr);
@@ -246,27 +307,65 @@ static char *voice_transcribe(const int16_t *pcm, size_t samples)
     esp_http_client_cleanup(client);
     uint32_t dt = (uint32_t)(esp_timer_get_time() / 1000) - t0;
 
-    char *text = NULL;
+    bool ok = false;
     if (err == ESP_OK && status == 200 && !rx->oom && rx->len > 0) {
         rx->buf[rx->len < rx->cap - 1 ? rx->len : rx->cap - 1] = '\0';
         cJSON *j = cJSON_Parse((const char *)rx->buf);
-        cJSON *t = j ? cJSON_GetObjectItem(j, "text") : NULL;
-        if (cJSON_IsString(t) && t->valuestring[0] != '\0') {
-            text = strdup(t->valuestring);
+        if (j) {
+            cJSON *w_match = cJSON_GetObjectItem(j, "wake_matched");
+            if (cJSON_IsBool(w_match)) {
+                out_res->wake_matched = cJSON_IsTrue(w_match);
+            }
+            cJSON *w_word = cJSON_GetObjectItem(j, "wake_word");
+            if (cJSON_IsString(w_word) && w_word->valuestring[0] != '\0') {
+                out_res->wake_word = strdup(w_word->valuestring);
+            }
+            cJSON *t = cJSON_GetObjectItem(j, "text");
+            if (cJSON_IsString(t) && t->valuestring[0] != '\0') {
+                out_res->text = strdup(t->valuestring);
+            }
+            cJSON *raw = cJSON_GetObjectItem(j, "raw_text");
+            if (cJSON_IsString(raw) && raw->valuestring[0] != '\0') {
+                out_res->raw_text = strdup(raw->valuestring);
+            }
+            cJSON_Delete(j);
+            ok = true;
+            ESP_LOGI(TAG, "STT %u ms, %u -> %u bytes: wake=%d ('%s'), cmd='%.60s', raw='%.60s'",
+                     (unsigned)dt, (unsigned)body_len, (unsigned)rx->len,
+                     out_res->wake_matched,
+                     out_res->wake_word ? out_res->wake_word : "",
+                     out_res->text ? out_res->text : "",
+                     out_res->raw_text ? out_res->raw_text : "");
         }
-        cJSON_Delete(j);
-        ESP_LOGI(TAG, "STT %u ms, %u -> %u bytes: %.60s",
-                 (unsigned)dt, (unsigned)body_len, (unsigned)rx->len, text ? text : "(empty)");
     } else {
         ESP_LOGE(TAG, "STT FAILED: err=%s status=%d oom=%d len=%u (%u ms)",
                  esp_err_to_name(err), status, rx->oom, (unsigned)rx->len, (unsigned)dt);
-        /* Backend may have moved IP or come up after boot — re-discover */
         backend_discovery_invalidate();
     }
 
     free(rx->buf);
     free(rx);
-    return text;
+    return ok;
+}
+
+char *voice_client_transcribe(const int16_t *pcm, size_t samples)
+{
+    voice_stt_result_t res;
+    if (!voice_client_transcribe_full(pcm, samples, &res)) {
+        return NULL;
+    }
+    char *ret = NULL;
+    if (res.text && res.text[0] != '\0') {
+        ret = res.text;
+        res.text = NULL;
+    } else if (res.raw_text && res.raw_text[0] != '\0') {
+        ret = res.raw_text;
+        res.raw_text = NULL;
+    }
+    free(res.text);
+    free(res.raw_text);
+    free(res.wake_word);
+    return ret;
 }
 
 /* -----------------------------------------------------------------------
@@ -331,7 +430,6 @@ static uint8_t *voice_tts_fetch(const char *text, size_t *out_len)
         ESP_LOGE(TAG, "TTS FAILED: err=%s status=%d oom=%d len=%u (%u ms)",
                  esp_err_to_name(err), status, rx->oom, (unsigned)rx->len, (unsigned)dt);
         display_status_set("Voice err", "check backend");
-        /* Backend may have moved IP or come up after boot — re-discover */
         backend_discovery_invalidate();
         free(rx->buf);
         free(rx);
@@ -341,9 +439,6 @@ static uint8_t *voice_tts_fetch(const char *text, size_t *out_len)
 
 static void voice_speak_internal(const char *text)
 {
-    /* Whole session gated: RX feeder parks for download AND playback.
-     * (Gating only playback left the download racing the feeder and TX
-     * audio came out as noise — field: "ESPeting..." sounded like static.) */
     tool_audio_speaker_session_begin();
     size_t wav_len = 0;
     uint8_t *wav = voice_tts_fetch(text, &wav_len);
@@ -362,59 +457,72 @@ static void voice_speak_internal(const char *text)
 }
 
 /* -----------------------------------------------------------------------
- * Command phase: capture → STT → agent bus
+ * Command phase: capture → STT → agent bus (used for 2-step wake)
  * --------------------------------------------------------------------- */
 
 static void voice_run_command(void)
 {
+    /* Wait out the "Yes?" ack echo before opening the command window: the amp
+     * tail + room reverb outlive the ack by hundreds of ms (field: the window
+     * captured the echo and Whisper hallucinated a wake word from it →
+     * "no command given" loop). */
+    vTaskDelay(pdMS_TO_TICKS(ACK_SETTLE_MS));
+
+    /* Clear cache right before arming so no pre-existing audio is read */
+    tool_audio_clear_cache();
+
     if (!tool_audio_capture_arm(CMD_MAX_SAMPLES)) {
         ESP_LOGW(TAG, "command capture could not arm (bus busy)");
+        tool_audio_clear_cache();
+        s_busy = false;
+        s_busy_start_ms = 0;
+        display_status_idle();
         return;
     }
 
-    ESP_LOGI(TAG, "[CMD] Listening for your command (%d s to start, then %d ms of silence stops)...",
-             CMD_LEAD_MS / 1000, CMD_SILENCE_MS);
+    display_status_set("Listening...", "Say command");
+    ESP_LOGI(TAG, "[CMD] Listening for command (countdown %d ms starts now after 'Yes?')...", CMD_MAX_MS);
 
-    int16_t scratch[WAKE_CHUNK_SAMPLES];
+    int16_t scratch[VAD_CHUNK_SAMPLES];
     size_t total = 0;
-    int64_t last_voice_ms = esp_timer_get_time() / 1000;
-    int64_t start_ms = last_voice_ms;
+    int64_t start_ms = esp_timer_get_time() / 1000;
+    int64_t last_speech_ms = 0;
     bool heard_speech = false;
 
     bool capturing = true;
-    while (capturing) {
+    while (capturing && s_running) {
         size_t written = 0;
         bool full = false;
-        capturing = tool_audio_rx_read(scratch, WAKE_CHUNK_SAMPLES, &written,
-                                       &total, &full, WAKE_CHUNK_MS);
+        capturing = tool_audio_rx_read(scratch, VAD_CHUNK_SAMPLES, &written,
+                                       &total, &full, VAD_CHUNK_MS);
 
         if (written > 0) {
-            /* track speech activity on the scratch chunk */
-            int64_t ssq = 0;
-            for (size_t i = 0; i < written; i++) {
-                ssq += (int64_t)scratch[i] * scratch[i];
-            }
-            double rms = sqrt((double)ssq / (double)written);
-            if (rms > CMD_SILENCE_RMS) {
+            int32_t rms = calc_ac_rms(scratch, written);
+            /* Only count as real speech if rms reaches speech level */
+            if (rms >= vad_trigger_threshold()) {
                 heard_speech = true;
-                last_voice_ms = esp_timer_get_time() / 1000;
+                last_speech_ms = esp_timer_get_time() / 1000;
             }
         }
         if (full) {
             break;
         }
+
         int64_t now = esp_timer_get_time() / 1000;
-        if (!heard_speech) {
-            if (now - start_ms >= CMD_LEAD_MS) {
-                ESP_LOGI(TAG, "[CMD] no speech within %d s lead-in", CMD_LEAD_MS / 1000);
-                break;
-            }
-        } else if (now - last_voice_ms >= CMD_SILENCE_MS) {
-            ESP_LOGI(TAG, "[CMD] silence timeout");
+
+        /* Early stop ONLY IF:
+         * 1. User actually spoke real speech (heard_speech == true)
+         * 2. At least 2.5s have elapsed since we started listening (guaranteed minimum speaking time)
+         * 3. User has been silent for at least 1.2s since their last speech
+         */
+        if (heard_speech && (now - start_ms >= 2500) && (now - last_speech_ms >= 1200)) {
+            ESP_LOGI(TAG, "[CMD] speech ended with %lld ms trailing silence", (long long)(now - last_speech_ms));
             break;
         }
+
+        /* Hard cap at 4.5 seconds countdown */
         if (now - start_ms >= CMD_MAX_MS) {
-            ESP_LOGI(TAG, "[CMD] max duration reached");
+            ESP_LOGI(TAG, "[CMD] full %d ms countdown reached", CMD_MAX_MS);
             break;
         }
     }
@@ -423,189 +531,340 @@ static void voice_run_command(void)
     uint32_t dur = (uint32_t)(esp_timer_get_time() / 1000) - (uint32_t)start_ms;
     ESP_LOGI(TAG, "[CMD] captured %u samples (%u ms)", (unsigned)total, (unsigned)dur);
 
-    if (!heard_speech) {
-        ESP_LOGW(TAG, "no speech detected in the lead-in window — nothing to ask");
-        tool_audio_beep(BEEP_TIMEOUT_HZ, BEEP_MS, BEEP_VOL);
-        return;
-    }
-
     if (total < TOOL_AUDIO_SAMPLE_RATE / 2) {
-        ESP_LOGW(TAG, "command too short — nothing to ask");
+        ESP_LOGW(TAG, "command capture too short (< 500ms)");
         tool_audio_beep(BEEP_TIMEOUT_HZ, BEEP_MS, BEEP_VOL);
+        tool_audio_clear_cache();
+        s_busy = false;
+        s_busy_start_ms = 0;
+        display_status_idle();
         return;
     }
 
     size_t samples = 0;
     const int16_t *pcm = tool_audio_get_last_capture(&samples, &dur);
     if (!pcm) {
+        tool_audio_clear_cache();
+        s_busy = false;
+        s_busy_start_ms = 0;
+        display_status_idle();
         return;
     }
 
     ESP_LOGI(TAG, "=== voice pipeline: STT (%u samples / %u ms) ===",
              (unsigned)samples, (unsigned)dur);
 
-    char *text = voice_transcribe(pcm, samples);
-    if (!text) {
-        tool_audio_beep(BEEP_ERR_HZ, BEEP_MS * 2, BEEP_VOL);
-        return;
-    }
-    if (strlen(text) < 1) {
-        ESP_LOGW(TAG, "transcript empty — nothing to ask");
-        free(text);
+    voice_stt_result_t stt_res = {0};
+    bool ok = voice_client_transcribe_full(pcm, samples, &stt_res);
+    if (!ok) {
+        ESP_LOGW(TAG, "transcript failed or backend unavailable");
         tool_audio_beep(BEEP_TIMEOUT_HZ, BEEP_MS, BEEP_VOL);
+        tool_audio_clear_cache();
+        s_busy = false;
+        s_busy_start_ms = 0;
+        display_status_idle();
         return;
     }
 
-    /* Transcript → agent loop as a system:"voice" message. */
+    /* Extract actual command:
+     * - If wake_matched and text is non-empty: user gave a command.
+     * - If wake_matched but text is empty: user ONLY repeated wake word ("米米"), no command!
+     * - If !wake_matched and raw_text is non-empty: user gave a direct command ("开灯").
+     */
+    char *cmd_text = NULL;
+    if (stt_res.wake_matched) {
+        if (stt_res.text && strlen(stt_res.text) > 0) {
+            cmd_text = strdup(stt_res.text);
+        } else {
+            ESP_LOGW(TAG, "[CMD] only wake word ('%s') heard during command phase — no command given",
+                     stt_res.wake_word ? stt_res.wake_word : "mimi");
+        }
+    } else {
+        if (stt_res.raw_text && strlen(stt_res.raw_text) > 0) {
+            cmd_text = strdup(stt_res.raw_text);
+        }
+    }
+
+    free(stt_res.text);
+    free(stt_res.raw_text);
+    free(stt_res.wake_word);
+
+    if (!cmd_text || strlen(cmd_text) < 1) {
+        ESP_LOGW(TAG, "no valid command text — clearing cache and returning to listen");
+        if (cmd_text) free(cmd_text);
+        tool_audio_beep(BEEP_TIMEOUT_HZ, BEEP_MS, BEEP_VOL);
+        tool_audio_clear_cache();
+        s_busy = false;
+        s_busy_start_ms = 0;
+        display_status_idle();
+        return;
+    }
+
     mimi_msg_t msg = {0};
     strlcpy(msg.channel, MIMI_CHAN_SYSTEM, sizeof(msg.channel));
     strlcpy(msg.chat_id, "voice", sizeof(msg.chat_id));
-    msg.content = text;                    /* bus takes ownership */
+    msg.content = cmd_text;                    /* bus takes ownership */
     esp_err_t perr = message_bus_push_inbound(&msg);
     if (perr != ESP_OK) {
         ESP_LOGE(TAG, "inbound push failed: %s", esp_err_to_name(perr));
-        free(text);
+        free(cmd_text);
+        tool_audio_clear_cache();
+        s_busy = false;
+        s_busy_start_ms = 0;
+        display_status_idle();
     } else {
-        ESP_LOGI(TAG, "transcript queued to agent: %.60s", text);
+        ESP_LOGI(TAG, "transcript queued to agent: %.60s", cmd_text);
+        s_busy = true;
+        s_busy_start_ms = esp_timer_get_time() / 1000;
+        display_status_set("Thinking...", "");
+        ESP_LOGI(TAG, "mic paused while agent is thinking/replying");
     }
 }
 
 /* -----------------------------------------------------------------------
- * Wake listener task
+ * VAD Wake listener task
  * --------------------------------------------------------------------- */
 
 static void voice_task(void *arg)
 {
-    /* NOTE: sized for s_wn_chunk (512) — the ring read fills up to a full
-     * wakenet frame; WAKE_CHUNK_SAMPLES (480) is only the per-read slice. */
-    int16_t chunk[512];
-    size_t wn_filled = 0;   /* partial WakeNet frame carried across iterations
-                             * (resetting it discarded already-consumed audio) */
-    size_t written = 0;
+    int16_t vad_chunk[VAD_CHUNK_SAMPLES];
+    size_t  vad_filled = 0;
+    int     consec_speech = 0;
 
     /* ---- listen diagnostics (rate-limited) ---- */
-    uint32_t dbg_frames   = 0;      /* wakenet frames processed */
-    uint64_t dbg_rms_sum  = 0;      /* sum of per-frame RMS */
-    int32_t  dbg_rms_peak = 0;      /* loudest frame since last report */
-    uint32_t dbg_loud     = 0;      /* frames above speech level */
-    uint32_t dbg_empties  = 0;      /* paused/empty iterations */
+    uint32_t dbg_frames   = 0;
+    uint64_t dbg_rms_sum  = 0;
+    int32_t  dbg_rms_peak = 0;
+    uint32_t dbg_loud     = 0;
+    uint32_t dbg_empties  = 0;
     int64_t  dbg_last_report_ms = esp_timer_get_time() / 1000;
-    int64_t  dbg_last_loud_log = 0;
     bool     was_paused = false;
 
-    ESP_LOGI(TAG, "wake listener running — say \"Hi ESP\" (debug stats every 5 s)");
+    ESP_LOGI(TAG, "software wake listener running — say \"Hey Expert\" or \"Mimi\" "
+                  "(adaptive VAD: feeder floor, base thr=%d, x1.33)",
+             VAD_SPEECH_RMS_START);
 
     while (s_running) {
-        /* Pause while the speaker plays or another capture runs — the
-         * device must not hear itself. */
-        if (s_busy || tool_audio_is_busy()) {
+        /* ---- 5-second debug report ---- */
+        int64_t now = esp_timer_get_time() / 1000;
+        if (now - dbg_last_report_ms >= 5000) {
+            uint32_t avg = dbg_frames ? (uint32_t)(dbg_rms_sum / dbg_frames) : 0;
+            ESP_LOGI(TAG, "[listen] 5s: frames=%u avg_rms=%u peak_rms=%d loud=%u paused/empty=%u",
+                     (unsigned)dbg_frames, avg, (int)dbg_rms_peak,
+                     (unsigned)dbg_loud, (unsigned)dbg_empties);
+            ESP_LOGI(TAG, "[debug] feeder: dma_reads=%u zero_reads=%u ring_written=%u | busy=%d spk_busy=%d",
+                     (unsigned)s_feeder_reads, (unsigned)s_feeder_zeros,
+                     (unsigned)s_ring_written,
+                     s_busy, tool_audio_is_busy());
+            dbg_frames = 0; dbg_rms_sum = 0; dbg_rms_peak = 0; dbg_loud = 0; dbg_empties = 0;
+            dbg_last_report_ms = now;
+        }
+
+        /* Pause while speaker plays, agent is thinking, capture runs, or the
+         * post-playback echo guard is still active (amp tail + room reverb) */
+        if (s_busy || tool_audio_is_busy() || mic_guard_active()) {
+            int64_t now_ms = esp_timer_get_time() / 1000;
+            if (s_busy && s_busy_start_ms > 0 && (now_ms - s_busy_start_ms >= 60000)) {
+                ESP_LOGW(TAG, "agent thinking timeout (60s) — resuming wake listener");
+                s_busy = false;
+                s_busy_start_ms = 0;
+                display_status_idle();
+            }
             dbg_empties++;
             was_paused = true;
-            vTaskDelay(pdMS_TO_TICKS(100));
+            consec_speech = 0;
+            vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
         if (was_paused) {
             was_paused = false;
-            tool_audio_ring_flush();   /* drop stale audio buffered while paused */
-            wn_filled = 0;             /* a carried partial frame is stale too */
+            tool_audio_clear_cache();   /* drop everything buffered during the pause */
+            vad_filled = 0;
+            consec_speech = 0;
         }
 
-        if (!s_wn_iface || !s_wn_data) {
-            vTaskDelay(pdMS_TO_TICKS(200));
-            continue;
-        }
-
-        /* Read the mic from the ring buffer STRAIGHT INTO s_wn_buf —
-         * detect() consumes s_wn_buf. (An earlier refactor read into
-         * `chunk` and never filled s_wn_buf: the model was fed calloc'd
-         * zeros — field rms=0, no detection.) The prio-7 mic_feed task
-         * owns the I2S DMA; the ring keeps the stream gap-free. */
-        while (wn_filled < (size_t)s_wn_chunk) {
-            size_t got = tool_audio_ring_read(s_wn_buf + wn_filled,
-                                              (size_t)s_wn_chunk - wn_filled,
-                                              WAKE_CHUNK_MS);
+        /* Read one VAD chunk from the ring */
+        while (vad_filled < VAD_CHUNK_SAMPLES) {
+            size_t got = tool_audio_ring_read(vad_chunk + vad_filled,
+                                              VAD_CHUNK_SAMPLES - vad_filled,
+                                              20);
             if (got == 0) {
                 dbg_empties++;
                 break;
             }
-            wn_filled += got;
+            vad_filled += got;
         }
-        if (wn_filled < (size_t)s_wn_chunk) {
-            vTaskDelay(1);   /* no full frame yet — keep the partial and yield */
+        if (vad_filled < VAD_CHUNK_SAMPLES) {
+            vTaskDelay(1);
             continue;
         }
-        wn_filled = 0;   /* full frame consumed — detect() below uses s_wn_buf */
+        vad_filled = 0;
 
-        /* Yield before inference: without this the read-then-detect loop runs
-         * flat out and starves IDLE0 (task watchdog fired every 5 s in the
-         * field) and every CPU-0 network task. One tick per 32 ms of audio
-         * still consumes faster than the mic produces. */
-        vTaskDelay(1);
+        /* Calculate AC-RMS of the chunk (zero-mean) */
+        int32_t rms = calc_ac_rms(vad_chunk, VAD_CHUNK_SAMPLES);
+        int32_t vad_thr = vad_trigger_threshold();
+        dbg_frames++;
+        dbg_rms_sum += rms;
+        if (rms > dbg_rms_peak) dbg_rms_peak = rms;
 
-        /* ---- per-frame debug stats ---- */
-        {
-            int64_t ssq = 0;
-            for (int i = 0; i < s_wn_chunk; i++) {
-                ssq += (int64_t)s_wn_buf[i] * s_wn_buf[i];
-            }
-            int32_t rms = (int32_t)sqrt((double)ssq / (double)s_wn_chunk);
-            dbg_frames++;
-            dbg_rms_sum += rms;
-            if (rms > dbg_rms_peak) dbg_rms_peak = rms;
-            if (rms > 1500) {
-                dbg_loud++;
-                int64_t now = esp_timer_get_time() / 1000;
-                if (now - dbg_last_loud_log > 1000) {
-                    dbg_last_loud_log = now;
-                    ESP_LOGI(TAG, "[listen] voice-level audio: rms=%d (mic hears you)", rms);
-                }
-            }
+        if (rms >= vad_thr) {
+            consec_speech++;
+            dbg_loud++;
+            ESP_LOGI(TAG, "🎤 [VAD] speech energy: rms=%d (frame %d/%d, thr=%d)",
+                     rms, consec_speech, VAD_TRIGGER_CONSEC, vad_thr);
+        } else {
+            consec_speech = 0;
         }
 
-        wakenet_state_t state = s_wn_iface->detect(s_wn_data, s_wn_buf);
-        if (state != WAKENET_NO_DETECT && state != WAKENET_DETECTED) {
-            ESP_LOGI(TAG, "[listen] wakenet intermediate state=%d", state);
-        }
-        if (state == WAKENET_DETECTED) {
-            ESP_LOGI(TAG, "*** WAKE WORD DETECTED ***");
-            display_status_set("Listening...", "");
+        /* Noise floor is maintained by the always-running mic feeder
+         * (s_mic_floor in tool_audio.c) — it keeps updating even while this
+         * task is blocked in capture/STT, which is exactly when the old
+         * in-loop estimator fell behind and never converged. */
+
+        /* Need N consecutive frames (~96 ms) above the adaptive threshold */
+        if (consec_speech >= VAD_TRIGGER_CONSEC) {
+            consec_speech = 0;
             s_busy = true;
+            ESP_LOGI(TAG, ">>> SPEECH DETECTED (rms=%d) — capturing utterance with 250ms pre-roll...", rms);
 
-            ack_play();
-            vTaskDelay(pdMS_TO_TICKS(150));   /* let the ack finish cleanly */
-
-            voice_run_command();
-
-            s_busy = false;
-            display_status_idle();
-            ESP_LOGI(TAG, "pipeline done — listening for \"Hi ESP\" again");
-        }
-
-        /* ---- 5-second debug report ---- */
-        {
-            int64_t now = esp_timer_get_time() / 1000;
-            if (now - dbg_last_report_ms >= 5000) {
-                uint32_t avg = dbg_frames ? (uint32_t)(dbg_rms_sum / dbg_frames) : 0;
-                ESP_LOGI(TAG, "[listen] 5s: frames=%u avg_rms=%u peak_rms=%d loud=%u paused/empty=%u",
-                         (unsigned)dbg_frames, avg, (int)dbg_rms_peak,
-                         (unsigned)dbg_loud, (unsigned)dbg_empties);
-                ESP_LOGI(TAG, "[debug] feeder: dma_reads=%u zero_reads=%u ring_written=%u | frame[0..3]=%d %d %d %d",
-                         (unsigned)s_feeder_reads, (unsigned)s_feeder_zeros,
-                         (unsigned)s_ring_written,
-                         (int)s_wn_buf[0], (int)s_wn_buf[1],
-                         (int)s_wn_buf[2], (int)s_wn_buf[3]);
-                if (dbg_frames == 0) {
-                    ESP_LOGW(TAG, "[listen] NO AUDIO FRAMES — mic stream not reaching WakeNet!");
-                } else if (dbg_rms_peak < 800) {
-                    ESP_LOGW(TAG, "[listen] audio flows but quiet (peak %d) — speak closer/louder",
-                             (int)dbg_rms_peak);
-                }
-                dbg_frames = 0; dbg_rms_sum = 0; dbg_rms_peak = 0; dbg_loud = 0; dbg_empties = 0;
-                dbg_last_report_ms = now;
+            /* Arm capture with 250ms (4000 samples) pre-roll from the ring */
+            if (!tool_audio_capture_arm_preroll(CMD_MAX_SAMPLES, VAD_PREROLL_SAMPLES)) {
+                ESP_LOGW(TAG, "could not arm capture (bus busy)");
+                s_busy = false;
+                continue;
             }
+
+            int32_t floor = s_mic_floor;
+            int32_t silence_cutoff = floor + floor / 4;  /* 1.25x floor */
+            if (silence_cutoff < CMD_SILENCE_RMS) silence_cutoff = CMD_SILENCE_RMS;
+            if (silence_cutoff > VAD_RMS_THRESHOLD_MAX) silence_cutoff = VAD_RMS_THRESHOLD_MAX;
+
+            int16_t scratch[VAD_CHUNK_SAMPLES];
+            size_t total = 0;
+            int64_t last_voice_ms = esp_timer_get_time() / 1000;
+            int64_t start_ms = last_voice_ms;
+
+            bool capturing = true;
+            while (capturing && s_running) {
+                size_t written = 0;
+                bool full = false;
+                capturing = tool_audio_rx_read(scratch, VAD_CHUNK_SAMPLES, &written,
+                                               &total, &full, VAD_CHUNK_MS);
+
+                if (written > 0) {
+                    int32_t chunk_rms = calc_ac_rms(scratch, written);
+                    if (chunk_rms >= silence_cutoff) {
+                        last_voice_ms = esp_timer_get_time() / 1000;
+                    }
+                }
+                if (full) {
+                    break;
+                }
+                int64_t cur_ms = esp_timer_get_time() / 1000;
+                /* Stop on trailing silence */
+                if (cur_ms - last_voice_ms >= CMD_SILENCE_MS) {
+                    ESP_LOGI(TAG, "[utterance] silence timeout (%d ms)", CMD_SILENCE_MS);
+                    break;
+                }
+                /* Hard cap at 1.5s for wake word utterance */
+                if (cur_ms - start_ms >= UTTERANCE_MAX_MS) {
+                    ESP_LOGI(TAG, "[utterance] max %d ms reached", UTTERANCE_MAX_MS);
+                    break;
+                }
+            }
+
+            tool_audio_capture_disarm();
+            uint32_t dur = (uint32_t)(esp_timer_get_time() / 1000) - (uint32_t)start_ms;
+            ESP_LOGI(TAG, "[utterance] captured %u samples (%u ms)", (unsigned)total, (unsigned)dur);
+
+            /* If captured audio is too short (< 0.25s), discard */
+            if (total < TOOL_AUDIO_SAMPLE_RATE / 4) {
+                ESP_LOGI(TAG, "[utterance] too short (< 250ms), ignoring");
+                s_busy = false;
+                continue;
+            }
+
+            size_t cap_samples = 0;
+            uint32_t cap_dur = 0;
+            const int16_t *pcm = tool_audio_get_last_capture(&cap_samples, &cap_dur);
+            if (!pcm || cap_samples == 0) {
+                s_busy = false;
+                continue;
+            }
+
+            voice_stt_result_t stt_res;
+            bool ok = voice_client_transcribe_full(pcm, cap_samples, &stt_res);
+            if (!ok) {
+                ESP_LOGW(TAG, "[utterance] STT failed or backend unavailable");
+                s_busy = false;
+                continue;
+            }
+
+            if (!stt_res.wake_matched) {
+                ESP_LOGI(TAG, "[wake] not matched — raw='%.60s' (ignoring ambient talk)",
+                         stt_res.raw_text ? stt_res.raw_text : "");
+                free(stt_res.text);
+                free(stt_res.raw_text);
+                free(stt_res.wake_word);
+                tool_audio_ring_flush();
+                consec_speech = 0;
+                vad_filled = 0;
+                s_busy = false;
+                continue;
+            }
+
+            /* --- WAKE WORD MATCHED! --- */
+            ESP_LOGI(TAG, "*** WAKE WORD MATCHED: '%s' (raw='%.60s') ***",
+                     stt_res.wake_word ? stt_res.wake_word : "",
+                     stt_res.raw_text ? stt_res.raw_text : "");
+
+            display_status_set("Listening...", "");
+
+            if (stt_res.text && strlen(stt_res.text) > 0) {
+                /* Case 1: One-shot command! E.g. "Hey Mimi turn on the LED" */
+                ESP_LOGI(TAG, "*** ONE-SHOT COMMAND: '%.60s' ***", stt_res.text);
+                display_status_set("Thinking...", "");
+
+                mimi_msg_t msg = {0};
+                strlcpy(msg.channel, MIMI_CHAN_SYSTEM, sizeof(msg.channel));
+                strlcpy(msg.chat_id, "voice", sizeof(msg.chat_id));
+                msg.content = strdup(stt_res.text);
+                esp_err_t perr = message_bus_push_inbound(&msg);
+                if (perr != ESP_OK) {
+                    ESP_LOGE(TAG, "inbound push failed: %s", esp_err_to_name(perr));
+                    free(msg.content);
+                    tool_audio_clear_cache();
+                    s_busy = false;
+                    s_busy_start_ms = 0;
+                    display_status_idle();
+                } else {
+                    ESP_LOGI(TAG, "one-shot command queued to agent: %.60s", stt_res.text);
+                    s_busy = true;
+                    s_busy_start_ms = esp_timer_get_time() / 1000;
+                    ESP_LOGI(TAG, "mic paused while agent is thinking/replying");
+                }
+            } else {
+                /* Case 2: Wake word only! E.g. "Mimi" or "Hey Mimi" */
+                ESP_LOGI(TAG, "*** WAKE WORD ONLY — playing 'Yes?' and listening for command ***");
+                ack_play();
+                /* voice_run_command() waits out ACK_SETTLE_MS internally, which
+                 * covers the ack's amp tail + room reverb. Only the ring/DMA
+                 * needs flushing here. */
+                tool_audio_clear_cache();
+
+                voice_run_command();
+            }
+
+            free(stt_res.text);
+            free(stt_res.raw_text);
+            free(stt_res.wake_word);
+            /* Note: s_busy remains true until voice_client_speak finishes */
         }
+
+        vTaskDelay(1);
     }
-    ESP_LOGI(TAG, "wake listener stopped");
+
+    ESP_LOGI(TAG, "voice task stopped");
     s_voice_task = NULL;
     vTaskDelete(NULL);
 }
@@ -617,30 +876,26 @@ static void voice_task(void *arg)
 bool voice_client_speak(const char *text)
 {
     if (!text || !*text) {
-        return false;
-    }
-    if (s_busy) {
-        ESP_LOGW(TAG, "pipeline busy — dropping speak request (%.40s)", text);
+        tool_audio_clear_cache();
+        s_busy = false;
+        s_busy_start_ms = 0;
+        display_status_idle();
         return false;
     }
     s_busy = true;
     voice_speak_internal(text);
+    /* Echo guard: drop mic input for ECHO_GUARD_MS after playback. The amp
+     * tail + room reverb outlive the WAV by hundreds of ms; without this the
+     * VAD re-triggered 330 ms after TTS end and Whisper hallucinated the wake
+     * word from the tail — an endless self-wake loop (field log 2026-10-09). */
+    mic_guard_start(ECHO_GUARD_MS);
+    /* Clear cache so wake listener starts completely fresh */
+    tool_audio_clear_cache();
     s_busy = false;
+    s_busy_start_ms = 0;
+    display_status_idle();
+    ESP_LOGI(TAG, "voice reply complete — %d ms echo guard, listening for wake up again", ECHO_GUARD_MS);
     return true;
-}
-
-/* Retained for compatibility: PTT-style trigger now just opens the command
- * window directly (wake word bypassed). Not wired to any button. */
-void voice_client_on_ptt_stop(void)
-{
-    if (s_busy) {
-        return;
-    }
-    s_busy = true;
-    ack_play();
-    vTaskDelay(pdMS_TO_TICKS(150));
-    voice_run_command();
-    s_busy = false;
 }
 
 esp_err_t voice_client_start(void)
@@ -649,44 +904,12 @@ esp_err_t voice_client_start(void)
         return ESP_OK;
     }
 
-    /* WakeNet: "Hi ESP" WN9 model from the "model" partition */
-    s_srmodels = esp_srmodel_init("model");
-    if (!s_srmodels) {
-        ESP_LOGE(TAG, "esp_srmodel_init(\"model\") failed — check partitions.csv");
-        return ESP_FAIL;
-    }
-    s_wn_name = esp_srmodel_filter(s_srmodels, ESP_WN_PREFIX, "hiesp");
-    if (!s_wn_name) {
-        ESP_LOGE(TAG, "no hiesp WakeNet model — check CONFIG_SR_WN_WN9_HIESP");
-        return ESP_ERR_NOT_FOUND;
-    }
-    s_wn_iface = esp_wn_handle_from_name(s_wn_name);
-    if (!s_wn_iface) {
-        ESP_LOGE(TAG, "no handler for model %s", s_wn_name);
-        return ESP_ERR_NOT_FOUND;
-    }
-    s_wn_data = s_wn_iface->create(s_wn_name, DET_MODE_90);
-    if (!s_wn_data) {
-        ESP_LOGE(TAG, "wakenet create failed for %s", s_wn_name);
-        return ESP_FAIL;
-    }
-    s_wn_chunk = s_wn_iface->get_samp_chunksize(s_wn_data);
-    s_wn_buf = heap_caps_calloc(s_wn_chunk, sizeof(int16_t), MALLOC_CAP_SPIRAM);
-    if (!s_wn_buf) {
-        return ESP_ERR_NO_MEM;
-    }
-    ESP_LOGI(TAG, "WakeNet \"%s\" ready (wake word: \"%s\", chunk=%d, rate=%d, det_threshold=%.2f)",
-             s_wn_name, s_wn_iface->get_word_name(s_wn_data, 1),
-             s_wn_chunk, s_wn_iface->get_samp_rate(s_wn_data),
-             s_wn_iface->get_det_threshold(s_wn_data, 1));
-
     /* Cache the "Yes?" ack at boot so it plays instantly on wake */
     if (!ack_fetch()) {
         ESP_LOGW(TAG, "ack not cached (backend down?) — falling back to beep");
     }
 
-    /* Gap-free mic stream for the wake engine (prio-7 mic_feed task shovels
-     * DMA into a PSRAM ring; without it the wake task loses DMA data). */
+    /* Gap-free mic stream for VAD listening */
     esp_err_t serr = tool_audio_rx_stream_start();
     if (serr != ESP_OK) {
         ESP_LOGE(TAG, "mic feeder failed to start: %s", esp_err_to_name(serr));
@@ -695,10 +918,7 @@ esp_err_t voice_client_start(void)
 
     s_running = true;
 
-    /* The internal heap is too fragmented after WiFi/TLS/telegram come up to
-     * hand out a contiguous task stack (field failure), so the stack lives in
-     * PSRAM via xTaskCreateStatic
-     * (needs CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y). */
+    /* Stack allocated in PSRAM via xTaskCreateStatic if available */
     s_voice_stack = heap_caps_malloc(VOICE_TASK_STACK * sizeof(StackType_t),
                                      MALLOC_CAP_SPIRAM);
     s_voice_tcb = heap_caps_malloc(sizeof(StaticTask_t),
@@ -732,5 +952,5 @@ esp_err_t voice_client_start(void)
 void voice_client_stop(void)
 {
     s_running = false;
-    tool_audio_rx_stream_stop();   /* stop the mic feeder too */
+    tool_audio_rx_stream_stop();
 }

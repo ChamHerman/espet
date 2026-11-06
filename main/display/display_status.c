@@ -12,10 +12,14 @@
 #include "mimi_config.h"
 #include "ssd1306.h"
 
+#include "driver/gpio.h"
+#include "esp_timer.h"
+#include "esp_rom_sys.h"
+
 static const char *TAG = "display";
 
 #define DISPLAY_I2C_PORT   I2C_NUM_0
-#define DISPLAY_I2C_FREQ   400000
+#define DISPLAY_I2C_FREQ   100000   /* 100 kHz standard mode for breadboard/cold-boot reliability */
 #define DISPLAY_W          128
 #define DISPLAY_H          64
 
@@ -30,26 +34,48 @@ static bool s_hw_ready;
  * keep the panel connected — unplugging it at runtime will
  * trigger the component assert.
  * Pins are fixed by the authoritative pin map (.agent/ESPET_PINS.MD):
- * SCL=2, SDA=1 via MIMI_GPIO_OLED_SCL/SDA. There is deliberately NO pin
- * hunting — probing other GPIOs pulsed the camera button (GPIO 41) and the
- * LED (42), caused phantom button events, and stalled every display update
- * with a 25-pair I2C scan. If the panel does not respond here, the display
- * is disabled until reboot instead of re-hunting. */
+ * SCL=2, SDA=1 via MIMI_GPIO_OLED_SCL/SDA. */
 static const uint8_t s_oled_addrs[2] = {0x3C, 0x3D};
 
 static int s_found_addr = -1;
 static bool s_bus_installed;
-static bool s_display_dead;      /* panel unavailable — no I2C until reboot */
+static bool s_display_dead;
 static int  s_refresh_fails;
 
+/* Recover stuck I2C bus: clock SCL up to 9 times with SDA pulled up, then STOP */
+static void i2c_bus_clear(int scl, int sda)
+{
+    gpio_config_t conf = {
+        .pin_bit_mask = (1ULL << scl) | (1ULL << sda),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&conf);
+
+    gpio_set_direction((gpio_num_t)scl, GPIO_MODE_OUTPUT_OD);
+    for (int i = 0; i < 9; i++) {
+        gpio_set_level((gpio_num_t)scl, 0);
+        esp_rom_delay_us(5);
+        gpio_set_level((gpio_num_t)scl, 1);
+        esp_rom_delay_us(5);
+        if (gpio_get_level((gpio_num_t)sda) == 1) {
+            break;
+        }
+    }
+}
+
 /* Configure the port on the configured (scl, sda) pin pair and probe both
- * OLED addresses. */
+ * OLED addresses using standard I2C address ping. */
 static bool probe_pin_pair(int scl, int sda)
 {
     if (s_bus_installed) {
         i2c_driver_delete(DISPLAY_I2C_PORT);
         s_bus_installed = false;
     }
+
+    i2c_bus_clear(scl, sda);
 
     i2c_config_t conf = {
         .mode = I2C_MODE_MASTER,
@@ -63,16 +89,14 @@ static bool probe_pin_pair(int scl, int sda)
     if (i2c_driver_install(DISPLAY_I2C_PORT, I2C_MODE_MASTER, 0, 0, 0) != ESP_OK) return false;
     s_bus_installed = true;
 
-    uint8_t probe = 0x00;
     for (int a = 0; a < 2; a++) {
-        /* require two consecutive ACKs — a single flaky ACK on a floating
-         * pin must not derail the probe */
-        bool ack1 = i2c_master_write_to_device(DISPLAY_I2C_PORT, s_oled_addrs[a], &probe, 1,
-                                               pdMS_TO_TICKS(20)) == ESP_OK;
-        if (!ack1) continue;
-        bool ack2 = i2c_master_write_to_device(DISPLAY_I2C_PORT, s_oled_addrs[a], &probe, 1,
-                                               pdMS_TO_TICKS(20)) == ESP_OK;
-        if (ack2) {
+        i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+        i2c_master_start(cmd);
+        i2c_master_write_byte(cmd, (s_oled_addrs[a] << 1) | I2C_MASTER_WRITE, true);
+        i2c_master_stop(cmd);
+        esp_err_t ret = i2c_master_cmd_begin(DISPLAY_I2C_PORT, cmd, pdMS_TO_TICKS(50));
+        i2c_cmd_link_delete(cmd);
+        if (ret == ESP_OK) {
             s_found_addr = s_oled_addrs[a];
             return true;
         }
@@ -98,22 +122,48 @@ static esp_err_t display_hw_init(void)
     if (s_hw_ready) return ESP_OK;
     if (s_display_dead) return ESP_FAIL;
 
-    ESP_LOGI(TAG, "Probing OLED on configured pins (SCL=%d, SDA=%d)...",
-             MIMI_GPIO_OLED_SCL, MIMI_GPIO_OLED_SDA);
-    if (!probe_pin_pair(MIMI_GPIO_OLED_SCL, MIMI_GPIO_OLED_SDA)) {
-        ESP_LOGE(TAG, "OLED not ACKing on configured pins SCL=%d/SDA=%d — panel "
-                      "dead or disconnected. Display disabled until reboot.",
-                 MIMI_GPIO_OLED_SCL, MIMI_GPIO_OLED_SDA);
-        display_bus_teardown();
-        s_display_dead = true;
+    /* Rate limit probe attempts so we don't stall message loops if panel is truly missing */
+    static int64_t s_last_probe_us = 0;
+    static int s_fail_count = 0;
+    int64_t now_us = esp_timer_get_time();
+    if (s_last_probe_us != 0 && (now_us - s_last_probe_us) < 1000000) {
         return ESP_FAIL;
     }
+    s_last_probe_us = now_us;
+
+    ESP_LOGI(TAG, "Probing OLED on configured pins (SCL=%d, SDA=%d)...",
+             MIMI_GPIO_OLED_SCL, MIMI_GPIO_OLED_SDA);
+
+    /* Allow power rails to stabilize on cold boot */
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    bool probed = false;
+    for (int attempt = 1; attempt <= 4; attempt++) {
+        if (probe_pin_pair(MIMI_GPIO_OLED_SCL, MIMI_GPIO_OLED_SDA)) {
+            probed = true;
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    if (!probed) {
+        if (++s_fail_count >= 15) {
+            ESP_LOGE(TAG, "OLED not responding after multiple attempts — disabled until reboot.");
+            display_bus_teardown();
+            s_display_dead = true;
+            return ESP_FAIL;
+        }
+        ESP_LOGW(TAG, "OLED probe not ready on SCL=%d/SDA=%d (attempt %d/15, will retry on next message)",
+                 MIMI_GPIO_OLED_SCL, MIMI_GPIO_OLED_SDA, s_fail_count);
+        display_bus_teardown();
+        return ESP_FAIL;
+    }
+    s_fail_count = 0;
 
     s_dev = ssd1306_create(DISPLAY_I2C_PORT, s_found_addr);
     if (s_dev == NULL) {
         ESP_LOGE(TAG, "SSD1306 create failed");
         display_bus_teardown();
-        s_display_dead = true;
         return ESP_FAIL;
     }
     /* Full controller reset: re-send the entire init sequence (charge pump,
@@ -193,5 +243,5 @@ void display_status_set(const char *line1, const char *line2)
 
 void display_status_idle(void)
 {
-    display_status_set("Hi ESP to wake", "");
+    display_status_set("Say Hey Expert", "");
 }

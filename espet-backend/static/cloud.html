@@ -1,0 +1,635 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>ESPET Cloud Gateway &amp; LLM Configuration</title>
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#050505">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="icon" type="image/jpeg" href="/static/brand/espet_logo.jpg">
+  <style>
+    :root {
+      --bg: #050505;
+      --card-bg: rgba(255, 255, 255, 0.055);
+      --card-border: rgba(255, 255, 255, 0.10);
+      --card-inner: rgba(255, 255, 255, 0.035);
+      --text: #f5f5f5;
+      --text-muted: #a3a3a3;
+      --text-dim: #737373;
+      --accent: #93c5fd;
+      --accent-dim: rgba(147, 197, 253, 0.15);
+      --mint: #8fd9ae;
+      --mint-bg: rgba(143, 217, 174, 0.10);
+      --mint-border: rgba(143, 217, 174, 0.28);
+      --red: #eda7a7;
+      --red-bg: rgba(237, 167, 167, 0.10);
+      --red-border: rgba(237, 167, 167, 0.28);
+      --yellow: #e6cf94;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Outfit', system-ui, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 20px 20px 90px;
+      line-height: 1.5;
+    }
+    .container { width: 100%; max-width: 820px; display: flex; flex-direction: column; gap: 24px; position: relative; z-index: 1; }
+    header {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--card-border);
+    }
+    header h1 { font-size: 1.35rem; font-weight: 700; letter-spacing: -0.2px; }
+    header p { font-size: 0.9rem; color: var(--text-muted); }
+
+    /* Floating GlassNav matching the main Control Center */
+    .espet-nav-spacer {
+      height: 70px;
+      margin-bottom: 24px;
+      flex: none;
+    }
+    .espet-navbar {
+      position: fixed;
+      top: 14px;
+      left: 16px;
+      right: 16px;
+      margin-inline: auto;
+      width: fit-content;
+      max-width: calc(100vw - 32px);
+      z-index: 100;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      height: 70px;
+      padding: 0 20px;
+      border-radius: 20px;
+      background: rgba(255, 255, 255, 0.06);
+      backdrop-filter: blur(20px) saturate(1.1);
+      -webkit-backdrop-filter: blur(20px) saturate(1.1);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      box-shadow: 0 10px 40px rgba(0, 0, 0, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.1);
+    }
+    .espet-brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      text-decoration: none;
+      color: inherit;
+      flex: none;
+    }
+    .espet-logo {
+      border-radius: 12px;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      object-fit: cover;
+      transition: transform 0.2s cubic-bezier(0.34, 1.56, 0.64, 1);
+    }
+    .espet-brand:hover .espet-logo {
+      transform: scale(1.1) rotate(-4deg);
+    }
+    .espet-brand-text {
+      display: flex;
+      flex-direction: column;
+    }
+    .espet-brand-name {
+      font-weight: 700;
+      font-size: 1rem;
+      letter-spacing: 0.2px;
+      color: #f5f5f5;
+    }
+    .espet-brand-sub {
+      font-size: 11px;
+      color: #737373;
+      margin-top: -3px;
+    }
+    .espet-nav-links {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      flex: none;
+    }
+    .espet-nav-link {
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 14px;
+      border-radius: 12px;
+      font-size: 0.9rem;
+      font-weight: 500;
+      color: #a3a3a3;
+      text-decoration: none;
+      user-select: none;
+      white-space: nowrap;
+      transition: color 0.15s ease, transform 0.15s ease;
+    }
+    .espet-nav-link:hover {
+      color: #e5e5e5;
+    }
+    .espet-nav-link.active {
+      color: #ffffff;
+    }
+    .espet-active-pill {
+      position: absolute;
+      inset: 0;
+      z-index: 0;
+      border-radius: 12px;
+      background: linear-gradient(120deg, rgba(255, 255, 255, 0.14), rgba(255, 255, 255, 0.09));
+      border: 1px solid rgba(255, 255, 255, 0.3);
+      box-shadow: 0 2px 14px rgba(255, 255, 255, 0.1);
+    }
+    .espet-nav-link span, .espet-nav-link svg {
+      position: relative;
+      z-index: 1;
+    }
+    @media (max-width: 819px) {
+      .espet-navbar {
+        height: auto;
+        padding: 8px 12px;
+        flex-wrap: wrap;
+        justify-content: center;
+      }
+      .espet-nav-links {
+        overflow-x: auto;
+        max-width: 100%;
+        padding-bottom: 2px;
+      }
+      .espet-nav-spacer {
+        height: 90px;
+      }
+    }
+
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 18px;
+      padding: 24px;
+      backdrop-filter: blur(16px);
+      box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+    }
+    .card-title {
+      font-size: 16px; font-weight: 600; margin-bottom: 4px;
+      display: flex; align-items: center; gap: 10px;
+    }
+    .card-subtitle {
+      font-size: 13px; color: var(--text-muted); margin-bottom: 20px;
+    }
+
+    .status-row {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px;
+      margin-bottom: 8px;
+    }
+    .status-box {
+      background: var(--card-inner);
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      padding: 14px 16px;
+    }
+    .status-box .label { font-size: 12px; color: var(--text-dim); text-transform: uppercase; letter-spacing: .5px; }
+    .status-box .val { font-size: 15px; font-weight: 500; margin-top: 4px; display: flex; align-items: center; gap: 8px; }
+    .badge {
+      display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 500;
+    }
+    .badge-mint { color: var(--mint); background: var(--mint-bg); border: 1px solid var(--mint-border); }
+    .badge-red { color: var(--red); background: var(--red-bg); border: 1px solid var(--red-border); }
+    .badge-neutral { color: var(--text-muted); background: var(--card-inner); border: 1px solid var(--card-border); }
+
+    .form-group { margin-bottom: 18px; }
+    .form-group:last-child { margin-bottom: 0; }
+    label { display: block; font-size: 13px; font-weight: 500; margin-bottom: 6px; color: var(--text); }
+    .hint { font-size: 12px; color: var(--text-dim); margin-top: 4px; }
+    input[type="text"], input[type="password"], input[type="number"], select {
+      width: 100%;
+      background: #000;
+      border: 1px solid var(--card-border);
+      color: var(--text);
+      font-family: inherit;
+      font-size: 14px;
+      border-radius: 10px;
+      padding: 10px 14px;
+      outline: none;
+      transition: border-color .15s;
+    }
+    input[type="text"]:focus, input[type="password"]:focus, input[type="number"]:focus, select:focus {
+      border-color: var(--accent);
+    }
+    .mono { font-family: 'JetBrains Mono', monospace; font-size: 13px; }
+
+    .toggle-row {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 12px 16px; background: var(--card-inner); border: 1px solid var(--card-border);
+      border-radius: 12px; margin-bottom: 18px;
+    }
+    .switch {
+      position: relative; display: inline-block; width: 44px; height: 24px;
+    }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider {
+      position: absolute; cursor: pointer; inset: 0; background: #262626;
+      border-radius: 24px; transition: .2s; border: 1px solid var(--card-border);
+    }
+    .slider:before {
+      position: absolute; content: ""; height: 16px; width: 16px; left: 3px; bottom: 3px;
+      background: #fff; border-radius: 50%; transition: .2s;
+    }
+    input:checked + .slider { background: #3b82f6; }
+    input:checked + .slider:before { transform: translateX(20px); }
+
+    .btn-row {
+      display: flex; gap: 10px; align-items: center; justify-content: flex-end; margin-top: 20px;
+    }
+    button {
+      font-family: inherit; font-size: 13px; font-weight: 500;
+      padding: 9px 18px; border-radius: 10px; cursor: pointer;
+      border: 1px solid var(--card-border); background: var(--card-inner); color: var(--text);
+      transition: all .15s;
+    }
+    button:hover { background: rgba(255,255,255,0.08); border-color: rgba(255,255,255,0.22); }
+    button.primary {
+      background: var(--accent); color: #050505; font-weight: 600; border: none;
+    }
+    button.primary:hover { background: #bfdbfe; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .toast {
+      position: fixed; bottom: 24px; right: 24px;
+      padding: 12px 20px; border-radius: 12px; font-size: 13px; font-weight: 500;
+      background: rgba(16,16,16,0.92); border: 1px solid var(--card-border);
+      box-shadow: 0 10px 30px rgba(0,0,0,0.6);
+      transform: translateY(100px); opacity: 0; transition: all .25s ease;
+      z-index: 1000;
+    }
+    .toast.show { transform: translateY(0); opacity: 1; }
+    .toast.mint { border-color: var(--mint-border); color: var(--mint); }
+    .toast.red { border-color: var(--red-border); color: var(--red); }
+
+    .table-box {
+      width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px;
+    }
+    .table-box th, .table-box td {
+      text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--card-border);
+    }
+    .table-box th { color: var(--text-dim); font-size: 11px; text-transform: uppercase; letter-spacing: .5px; }
+    .del-btn { color: var(--red); background: none; border: none; padding: 4px 8px; cursor: pointer; }
+    .del-btn:hover { text-decoration: underline; background: none; }
+  </style>
+</head>
+<body>
+  <!-- Top Navigation Bar matching Control Center -->
+  <div class="espet-navbar">
+    <a href="/#overview" class="espet-brand">
+      <img src="/static/brand/espet_logo.jpg" alt="ESPET" width="46" height="46" class="espet-logo">
+      <div class="espet-brand-text">
+        <div class="espet-brand-name">ESPET</div>
+        <div class="espet-brand-sub">Control Center</div>
+      </div>
+    </a>
+    <nav class="espet-nav-links" aria-label="Primary">
+      <a href="/#overview" class="espet-nav-link">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="7" height="9" x="3" y="3" rx="1"></rect><rect width="7" height="5" x="14" y="3" rx="1"></rect><rect width="7" height="9" x="14" y="12" rx="1"></rect><rect width="7" height="5" x="3" y="16" rx="1"></rect></svg>
+        <span>Home</span>
+      </a>
+      <a href="/#agent" class="espet-nav-link">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8V4H8"></path><rect width="16" height="12" x="4" y="8" rx="2"></rect><path d="M2 14h2"></path><path d="M20 14h2"></path><path d="M15 13v2"></path><path d="M9 13v2"></path></svg>
+        <span>Agent</span>
+      </a>
+      <a href="/cloud" class="espet-nav-link active">
+        <span class="espet-active-pill"></span>
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="8" x="2" y="2" rx="2"></rect><rect width="20" height="8" x="2" y="14" rx="2"></rect><path d="M6 6h.01M6 18h.01"></path></svg>
+        <span>Cloud</span>
+      </a>
+      <a href="/#chat" class="espet-nav-link">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z"></path></svg>
+        <span>Chat</span>
+      </a>
+      <a href="/#camera" class="espet-nav-link">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"></path><circle cx="12" cy="13" r="3"></circle></svg>
+        <span>Camera</span>
+      </a>
+      <a href="/#assistant" class="espet-nav-link">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3-1.9 5.8a2 2 0 0 1-1.3 1.3L3 12l5.8 1.9a2 2 0 0 1 1.3 1.3L12 21l1.9-5.8a2 2 0 0 1 1.3-1.3L21 12l-5.8-1.9a2 2 0 0 1-1.3-1.3L12 3Z"></path></svg>
+        <span>Assistant</span>
+      </a>
+      <a href="/#system" class="espet-nav-link">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="16" height="16" x="4" y="4" rx="2"></rect><rect width="6" height="6" x="9" y="9" rx="1"></rect><path d="M15 2v2M15 20v2M2 15h2M2 9h2M20 15h2M20 9h2M9 2v2M9 20v2"></path></svg>
+        <span>System</span>
+      </a>
+    </nav>
+  </div>
+  <div class="espet-nav-spacer"></div>
+
+  <div class="container">
+    <header>
+      <div>
+        <h1>Cloud Gateway</h1>
+        <p>Hybrid Mode configuration: Telegram bot poller, server-side LLM relay, and chat bindings.</p>
+      </div>
+    </header>
+
+    <!-- LIVE STATUS -->
+    <div class="card">
+      <div class="card-title">Live Status</div>
+      <div class="card-subtitle">Current runtime state of the gateway background worker and device WebSocket links.</div>
+      <div class="status-row">
+        <div class="status-box">
+          <div class="label">Telegram Poller</div>
+          <div class="val" id="st-poller"><span class="badge badge-neutral">Checking…</span></div>
+        </div>
+        <div class="status-box">
+          <div class="label">Connected ESP32 Devices</div>
+          <div class="val" id="st-devices"><span class="badge badge-neutral">0 online</span></div>
+        </div>
+        <div class="status-box">
+          <div class="label">Chat ⇄ Device Bindings</div>
+          <div class="val" id="st-bindings"><span class="badge badge-neutral">0 bound</span></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- TELEGRAM CONFIG -->
+    <div class="card">
+      <div class="card-title">Telegram Bot Gateway</div>
+      <div class="card-subtitle">
+        The server long-polls Telegram on this token and relays messages over WebSocket to the bound ESP32.
+        The device never creates Telegram HTTPS sockets.
+      </div>
+
+      <div class="toggle-row">
+        <div>
+          <div style="font-weight: 500; font-size: 14px;">Enable Cloud Telegram Gateway</div>
+          <div class="hint">When off, the backend does not poll Telegram.</div>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="cfg-tg-enabled">
+          <span class="slider"></span>
+        </label>
+      </div>
+
+      <div class="form-group">
+        <label for="cfg-tg-token">Telegram Bot Token</label>
+        <input type="password" id="cfg-tg-token" class="mono" placeholder="123456789:ABCdefGhIJKlmNoPQRstuVWXyz">
+        <div class="hint">From @BotFather. Saved on server; never transmitted to ESP32 firmware.</div>
+      </div>
+
+
+      <div class="btn-row">
+        <button id="btn-test-tg">Test Bot Token</button>
+      </div>
+    </div>
+
+    <!-- LLM CONFIG -->
+    <div class="card">
+      <div class="card-title">Server-Side LLM Relay</div>
+      <div class="card-subtitle">
+        The ESP32 agent builds chat completion prompts; the backend injects the API key and forwards
+        them to the provider. The device never holds the LLM key.
+      </div>
+
+      <div class="form-group">
+        <label for="cfg-llm-url">API Base URL</label>
+        <input type="text" id="cfg-llm-url" class="mono" placeholder="https://api.openai.com/v1" value="https://api.openai.com/v1">
+        <div class="hint">OpenAI-compatible endpoint (OpenAI, DeepSeek, OpenRouter, Ollama, vLLM).</div>
+      </div>
+
+      <div class="form-group">
+        <label for="cfg-llm-key">API Key</label>
+        <input type="password" id="cfg-llm-key" class="mono" placeholder="sk-...">
+        <div class="hint">Stored safely on this server. Never shared with the microcontroller.</div>
+      </div>
+
+      <div class="form-group">
+        <label for="cfg-llm-model">Model Override (optional)</label>
+        <input type="text" id="cfg-llm-model" class="mono" placeholder="gpt-4o-mini, deepseek-chat, claude-3-5-sonnet...">
+        <div class="hint">If left empty, the device's requested model is preserved.</div>
+      </div>
+
+      <div class="btn-row">
+        <button id="btn-test-llm">Test LLM Connection</button>
+      </div>
+    </div>
+
+    <!-- CHAT-DEVICE BINDINGS -->
+    <div class="card">
+      <div class="card-title">Telegram Chat ⇄ Device Bindings</div>
+      <div class="card-subtitle">
+        Incoming Telegram messages from a chat ID are forwarded only to the matching ESP32 device ID.
+        Auto-binds on the first message if exactly one device is online.
+      </div>
+
+      <table class="table-box">
+        <thead>
+          <tr>
+            <th>Telegram Chat ID</th>
+            <th>ESP32 Device ID</th>
+            <th>Action</th>
+          </tr>
+        </thead>
+        <tbody id="bindings-tbody">
+          <tr><td colspan="3" style="color: var(--text-dim); text-align: center;">No bindings yet.</td></tr>
+        </tbody>
+      </table>
+
+      <div style="display: grid; grid-template-columns: 1fr 1fr auto; gap: 10px; margin-top: 14px;">
+        <input type="text" id="new-chat-id" placeholder="Chat ID (e.g. 123456789)" class="mono">
+        <input type="text" id="new-device-id" placeholder="Device ID (e.g. mimi-espet)" class="mono">
+        <button id="btn-add-bind">+ Bind</button>
+      </div>
+    </div>
+
+    <!-- BOTTOM ACTION BAR -->
+    <div class="btn-row" style="margin-top: 10px;">
+      <button class="primary" id="btn-save-all" style="padding: 12px 28px; font-size: 14px;">Save Configuration &amp; Restart Gateway</button>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    const API_KEY = "espet_secret_device_key_2026";
+    const headers = {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${API_KEY}`
+    };
+
+    function showToast(msg, kind = "mint") {
+      const t = document.getElementById("toast");
+      t.textContent = msg;
+      t.className = `toast show ${kind}`;
+      setTimeout(() => { t.className = "toast"; }, 3500);
+    }
+
+    async function fetchJSON(url, opts = {}) {
+      const res = await fetch(url, { ...opts, headers: { ...headers, ...(opts.headers || {}) } });
+      if (!res.ok) {
+        let err = res.statusText;
+        try { const b = await res.json(); err = b.detail || b.error || err; } catch {}
+        throw new Error(err);
+      }
+      return res.json();
+    }
+
+    async function loadAll() {
+      try {
+        const cfg = await fetchJSON("/api/cloud/gateway-config");
+        document.getElementById("cfg-tg-enabled").checked = !!cfg.cloud_gateway_enabled;
+        document.getElementById("cfg-tg-token").value = cfg.telegram_bot_token || "";
+
+        document.getElementById("cfg-llm-url").value = cfg.llm_base_url || "https://api.openai.com/v1";
+        document.getElementById("cfg-llm-key").value = cfg.llm_api_key || "";
+        document.getElementById("cfg-llm-model").value = cfg.llm_model || "";
+
+        const pollerEl = document.getElementById("st-poller");
+        if (cfg.poller_running) {
+          pollerEl.innerHTML = '<span class="badge badge-mint">Active · Polling</span>';
+        } else {
+          pollerEl.innerHTML = '<span class="badge badge-neutral">Stopped / Disabled</span>';
+        }
+
+        const devRes = await fetchJSON("/api/cloud/devices");
+        const devs = devRes.connected || [];
+        document.getElementById("st-devices").innerHTML =
+          devs.length > 0
+            ? `<span class="badge badge-mint">${devs.length} online (${devs.join(", ")})</span>`
+            : '<span class="badge badge-neutral">0 online (device disconnected)</span>';
+
+        const bindRes = await fetchJSON("/api/cloud/bindings");
+        const binds = bindRes.bindings || {};
+        const count = Object.keys(binds).length;
+        document.getElementById("st-bindings").innerHTML =
+          `<span class="badge badge-mint">${count} bound</span>`;
+
+        renderBindings(binds);
+      } catch (e) {
+        showToast("Load error: " + e.message, "red");
+      }
+    }
+
+    function renderBindings(binds) {
+      const tbody = document.getElementById("bindings-tbody");
+      const keys = Object.keys(binds);
+      if (keys.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="3" style="color: var(--text-dim); text-align: center;">No bindings yet.</td></tr>';
+        return;
+      }
+      tbody.innerHTML = keys.map(k => `
+        <tr>
+          <td class="mono">${k}</td>
+          <td class="mono">${binds[k]}</td>
+          <td><button class="del-btn" onclick="unbindChat('${k}')">Unbind</button></td>
+        </tr>
+      `).join("");
+    }
+
+    async function unbindChat(chatId) {
+      try {
+        await fetchJSON("/api/cloud/unbind", {
+          method: "POST",
+          body: JSON.stringify({ chat_id: String(chatId) })
+        });
+        showToast(`Unbound chat ${chatId}`);
+        loadAll();
+      } catch (e) {
+        showToast("Unbind failed: " + e.message, "red");
+      }
+    }
+
+    document.getElementById("btn-add-bind").addEventListener("click", async () => {
+      const cid = document.getElementById("new-chat-id").value.trim();
+      const did = document.getElementById("new-device-id").value.trim();
+      if (!cid || !did) {
+        showToast("Enter both Chat ID and Device ID", "red");
+        return;
+      }
+      try {
+        await fetchJSON("/api/cloud/bind", {
+          method: "POST",
+          body: JSON.stringify({ chat_id: cid, device_id: did })
+        });
+        document.getElementById("new-chat-id").value = "";
+        document.getElementById("new-device-id").value = "";
+        showToast(`Bound ${cid} -> ${did}`);
+        loadAll();
+      } catch (e) {
+        showToast("Bind failed: " + e.message, "red");
+      }
+    });
+
+    document.getElementById("btn-test-tg").addEventListener("click", async () => {
+      const token = document.getElementById("cfg-tg-token").value.trim();
+      if (!token) {
+        showToast("Enter a bot token first", "red");
+        return;
+      }
+      showToast("Testing bot token...", "mint");
+      try {
+        const res = await fetchJSON("/api/cloud/test-telegram", {
+          method: "POST",
+          body: JSON.stringify({ token })
+        });
+        if (res.ok && res.bot) {
+          showToast(`Token valid! Bot: @${res.bot.username} (${res.bot.first_name})`, "mint");
+        } else {
+          showToast("Telegram check failed: " + (res.error || "unknown"), "red");
+        }
+      } catch (e) {
+        showToast("Telegram test failed: " + e.message, "red");
+      }
+    });
+
+    document.getElementById("btn-test-llm").addEventListener("click", async () => {
+      const api_key = document.getElementById("cfg-llm-key").value.trim();
+      const base_url = document.getElementById("cfg-llm-url").value.trim();
+      const model = document.getElementById("cfg-llm-model").value.trim();
+      if (!api_key || !base_url) {
+        showToast("Enter API key and Base URL first", "red");
+        return;
+      }
+      showToast("Sending ping prompt to LLM...", "mint");
+      try {
+        const res = await fetchJSON("/api/cloud/test-llm", {
+          method: "POST",
+          body: JSON.stringify({ api_key, base_url, model })
+        });
+        if (res.ok) {
+          showToast(`LLM OK! [${res.model}] replied: "${res.reply}"`, "mint");
+        } else {
+          showToast("LLM check failed: " + (res.error || `HTTP ${res.status}`), "red");
+        }
+      } catch (e) {
+        showToast("LLM test failed: " + e.message, "red");
+      }
+    });
+
+    document.getElementById("btn-save-all").addEventListener("click", async () => {
+      const payload = {
+        cloud_gateway_enabled: document.getElementById("cfg-tg-enabled").checked,
+        telegram_bot_token: document.getElementById("cfg-tg-token").value.trim(),
+        llm_base_url: document.getElementById("cfg-llm-url").value.trim(),
+        llm_api_key: document.getElementById("cfg-llm-key").value.trim(),
+        llm_model: document.getElementById("cfg-llm-model").value.trim()
+      };
+      try {
+        await fetchJSON("/api/cloud/gateway-config", {
+          method: "PUT",
+          body: JSON.stringify(payload)
+        });
+        showToast("Gateway & LLM configuration saved!", "mint");
+        setTimeout(loadAll, 600);
+      } catch (e) {
+        showToast("Save failed: " + e.message, "red");
+      }
+    });
+
+    loadAll();
+  </script>
+</body>
+</html>

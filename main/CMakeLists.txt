@@ -5,6 +5,7 @@ idf_component_register(
         "display/display_status.c"
         "wifi/wifi_manager.c"
         "channels/telegram/telegram_bot.c"
+        "channels/cloud_link/cloud_link.c"
         "channels/feishu/feishu_bot.c"
         "llm/llm_proxy.c"
         "agent/agent_loop.c"

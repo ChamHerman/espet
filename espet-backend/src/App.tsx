@@ -16,6 +16,7 @@ import { AppProviders } from "./theme";
 const views: Record<string, React.ComponentType<{ section?: string }>> = {
   overview: lazy(() => import("./views/Home").then((m) => ({ default: m.HomeView }))),
   agent: lazy(() => import("./views/Agent").then((m) => ({ default: m.AgentView }))),
+  cloud: lazy(() => import("./views/Cloud").then((m) => ({ default: m.CloudView }))),
   chat: lazy(() => import("./views/Chat").then((m) => ({ default: m.ChatView }))),
   camera: lazy(() => import("./views/Camera").then((m) => ({ default: m.CameraView }))),
   assistant: lazy(() => import("./views/AssistantPage").then((m) => ({ default: m.AssistantPage }))),

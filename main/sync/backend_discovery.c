@@ -55,26 +55,30 @@ static bool resolve_once(char *out, size_t out_sz)
         ESP_LOGI(TAG, "mDNS result: %s port=%u", r->instance_name ? r->instance_name : "?",
                  (unsigned)r->port);
 
-        /* PTR/SRV often arrive before the A record (separate response
-         * packet), so resolve the instance's address explicitly.
-         * mdns_query_a takes a bare hostname — it must NOT contain the
-         * '.local' domain (mdns_querier warns otherwise). */
-        if (r->instance_name && r->instance_name[0]) {
-            esp_ip4_addr_t addr;
-            if (mdns_query_a(r->instance_name, LOOKUP_TIMEOUT_MS, &addr) == ESP_OK) {
-                char ip[16];
-                esp_ip4addr_ntoa(&addr, ip, sizeof(ip));
-                snprintf(out, out_sz, "http://%s:%u", ip, (unsigned)r->port);
-                found = true;
-            }
-        }
-
         for (mdns_ip_addr_t *a = r->addr; a && !found; a = a->next) {
             if (a->addr.type != ESP_IPADDR_TYPE_V4) continue;
             char ip[16];
             esp_ip4addr_ntoa(&a->addr.u_addr.ip4, ip, sizeof(ip));
             snprintf(out, out_sz, "http://%s:%u", ip, (unsigned)r->port);
             found = true;
+        }
+
+        /* If no IP in PTR record, resolve hostname or instance name via mdns_query_a */
+        const char *candidates[2] = { r->hostname, r->instance_name };
+        for (int c = 0; c < 2 && !found; c++) {
+            const char *h = candidates[c];
+            if (!h || !h[0]) continue;
+            char clean_host[64];
+            strlcpy(clean_host, h, sizeof(clean_host));
+            char *dot = strstr(clean_host, ".local");
+            if (dot) *dot = '\0';
+            esp_ip4_addr_t addr;
+            if (mdns_query_a(clean_host, LOOKUP_TIMEOUT_MS, &addr) == ESP_OK) {
+                char ip[16];
+                esp_ip4addr_ntoa(&addr, ip, sizeof(ip));
+                snprintf(out, out_sz, "http://%s:%u", ip, (unsigned)r->port);
+                found = true;
+            }
         }
     }
     mdns_query_results_free(results);
@@ -97,7 +101,7 @@ static void discovery_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(RETRY_DELAY_MS));
     }
     if (s_base_url[0] == '\0') {
-        display_status_set("Backend not found", "using fallback");
+        ESP_LOGI(TAG, "Backend discovery using compiled-in fallback: %s", MIMI_BACKEND_URL);
     }
     s_task_running = false;
     vTaskDelete(NULL);

@@ -82,6 +82,15 @@ bool tool_audio_is_busy(void);
 bool tool_audio_capture_arm(size_t max_samples);
 
 /**
+ * @brief Arm capture with pre-roll samples preserved from the RX ring.
+ *
+ * @param max_samples     Capture limit in samples.
+ * @param preroll_samples Samples from before the trigger moment to preserve
+ *                        (e.g. 4000 = 250 ms so the first syllable isn't cut off).
+ */
+bool tool_audio_capture_arm_preroll(size_t max_samples, size_t preroll_samples);
+
+/**
  * @brief Read one RX chunk while a capture is armed.
  *
  * Copies the converted mono samples into out (up to max_out) AND
@@ -137,6 +146,11 @@ size_t tool_audio_ring_available(void);
  * @brief Drop all buffered audio in the RX ring (resumes from "now").
  */
 void tool_audio_ring_flush(void);
+
+/**
+ * @brief Clear all audio caches (drains both I2S hardware DMA FIFO and software ring buffer).
+ */
+void tool_audio_clear_cache(void);
 
 /**
  * @brief Begin/end a speaker session: the RX feeder parks for the whole

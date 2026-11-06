@@ -207,6 +207,13 @@ export function HomeView() {
         action: () => go("#device"),
         icon: "cpu",
       },
+      {
+        label: "Cloud Gateway & LLM configured",
+        done: false,
+        hint: "Hybrid mode: Telegram polling & LLM relay on the server.",
+        action: () => { window.location.href = "/cloud"; },
+        icon: "bot",
+      },
     ];
     return items;
   }, [health, auth, config, loginWithGoogle]);
@@ -368,14 +375,44 @@ export function HomeView() {
               {connectedServers.length}/{servers.length} connected
             </Badge>
           </div>
-          {donutData.length ? (
-            <div style={{ display: "grid", placeItems: "center" }}>
-              <DonutChart
-                data={donutData}
-                variant="pie"
-                height={220}
-                colors={CHART_GRAYSCALE}
-              />
+          {servers.length ? (
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {servers.map(([name, s]) => {
+                let displayName = name.replace("google-", "Google ");
+                displayName = displayName.charAt(0).toUpperCase() + displayName.slice(1);
+                return (
+                  <div
+                    key={name}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      padding: "9px 12px",
+                      borderRadius: 10,
+                      background: "rgba(255, 255, 255, 0.03)",
+                      border: "1px solid rgba(255, 255, 255, 0.06)",
+                    }}
+                  >
+                    <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
+                      <span
+                        style={{
+                          width: 7,
+                          height: 7,
+                          borderRadius: "50%",
+                          background: s.connected ? "#8fd9ae" : "#eda7a7",
+                          boxShadow: s.connected ? "0 0 6px rgba(143,217,174,0.5)" : "none",
+                        }}
+                      />
+                      <span style={{ fontWeight: 500, fontSize: 13.5, color: "#f5f5f5" }}>
+                        {displayName}
+                      </span>
+                    </div>
+                    <span style={{ fontSize: 12.5, color: "#a3a3a3" }}>
+                      {s.tool_count} tools
+                    </span>
+                  </div>
+                );
+              })}
             </div>
           ) : (
             <div className={styles.empty}>

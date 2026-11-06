@@ -124,26 +124,128 @@ def _get_stt_model():
     return _stt_model
 
 
-def _transcribe_pcm(pcm16: np.ndarray, language: str | None) -> str:
-    """Write a temp WAV, run faster-whisper, return the transcript text."""
+def _transcribe_pcm(pcm16: np.ndarray, language: str | None) -> tuple[str, float, float]:
+    """Write a temp WAV, run faster-whisper.
+
+    Returns (text, first_segment_avg_logprob, first_segment_no_speech_prob).
+    The two confidence numbers let the caller reject hallucinated wake words:
+    Whisper readily invents short phrases on noise/echo, and those segments
+    carry tell-tale stats (high no_speech_prob / low avg_logprob).
+
+    IMPORTANT: never put the wake words themselves in initial_prompt. The
+    prompt biases the decoder and was verified to turn room noise / TTS echo
+    into exactly the wake word (field: endless self-wake loop). Keep the
+    prompt neutral, or empty (settings.voice_stt_prompt).
+    """
     if len(pcm16) < ESP_SAMPLE_RATE // 5:  # < 0.2 s of audio
-        return ""
+        return "", 0.0, 1.0
     model = _get_stt_model()
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-        f.write(pcm_to_wav_bytes(pcm16))
+        wav_bytes = pcm_to_wav_bytes(pcm16)
+        f.write(wav_bytes)
         tmp_path = f.name
+    # Save last audio capture for inspection
+    try:
+        debug_file = Path("data/last_capture.wav")
+        debug_file.parent.mkdir(parents=True, exist_ok=True)
+        debug_file.write_bytes(wav_bytes)
+    except Exception:
+        pass
     try:
         segments, info = model.transcribe(
             tmp_path,
             language=language or None,
-            beam_size=1,           # latency over accuracy for voice assistant use
-            vad_filter=True,       # skip silence — big win on noisy captures
+            beam_size=3,
+            best_of=3,
+            repetition_penalty=1.2,
+            no_repeat_ngram_size=3,
+            max_new_tokens=96,
+            vad_filter=True,
+            vad_parameters=dict(min_silence_duration_ms=500),
+            initial_prompt=settings.voice_stt_prompt or None,
+            condition_on_previous_text=False,
         )
-        text = " ".join(seg.text.strip() for seg in segments).strip()
-        logger.info("STT ok (lang=%s, %.1f s audio): %.80s", info.language, info.duration, text)
-        return text
+        segs = list(segments)
+        text = " ".join(seg.text.strip() for seg in segs).strip()
+
+        # If vad_filter pruned out the short utterance, retry with vad_filter=False
+        if not text:
+            logger.info("vad_filter=True returned empty segments; retrying with vad_filter=False...")
+            segments, info = model.transcribe(
+                tmp_path,
+                language=language or None,
+                beam_size=3,
+                best_of=3,
+                repetition_penalty=1.2,
+                no_repeat_ngram_size=3,
+                max_new_tokens=96,
+                vad_filter=False,
+                initial_prompt=settings.voice_stt_prompt or None,
+                condition_on_previous_text=False,
+            )
+            segs = list(segments)
+            text = " ".join(seg.text.strip() for seg in segs).strip()
+
+        if segs:
+            avg_logprob = float(segs[0].avg_logprob)
+            no_speech_prob = float(segs[0].no_speech_prob)
+        else:
+            avg_logprob, no_speech_prob = 0.0, 1.0
+        logger.info("STT ok (lang=%s, %.1f s audio, logp=%.2f nsp=%.2f): %.80s",
+                    info.language, info.duration, avg_logprob, no_speech_prob, text)
+        return text, avg_logprob, no_speech_prob
     finally:
         Path(tmp_path).unlink(missing_ok=True)
+
+
+def check_wake_word(text: str, wake_words: list[str]) -> tuple[bool, str, str]:
+    """
+    Check if transcript begins with any of the configured wake words.
+    Strips repeated leading wake words ("米米 米米" -> wake-only, no command).
+    Returns (matched: bool, matched_wake_word: str, command: str).
+    """
+    cleaned = text.strip()
+    if not cleaned:
+        return False, "", ""
+
+    # Normalize Japanese Whisper hallucination for "mimi" (耳 = ear in ja)
+    if cleaned in ("耳", "耳。", "耳！", "耳？", "にみ", "ミミ"):
+        return True, "mimi", ""
+
+    # Normalize internal punctuation (commas, hyphens, colons) to spaces
+    # so "Hey, Mimi." -> "Hey Mimi."
+    norm = _re.sub(r"^[^\w\s\u4e00-\u9fff]+", "", cleaned)
+    norm = _re.sub(r"[,，:：\-—_]+", " ", norm)
+    norm = _re.sub(r"\s+", " ", norm).strip()
+
+    # Sort wake words longest first so "hey mimi" matches before "mimi"
+    sorted_words = sorted([w.strip().lower() for w in wake_words if w.strip()], key=len, reverse=True)
+
+    matched_word = ""
+    while True:
+        hit = None
+        for w in sorted_words:
+            is_ascii = w.isascii()
+            boundary = r"\b" if is_ascii else ""
+            pat = r"^(?:(?:hey|hi|ok|hello)\s+)?" + _re.escape(w) + boundary + r"[\s!！?？.]*"
+            m = _re.match(pat, norm, flags=_re.IGNORECASE)
+            if m:
+                hit = (w, m.end())
+                break
+        if not hit:
+            break
+        if not matched_word:
+            matched_word = hit[0]
+        norm = norm[hit[1]:].strip()
+        # Guard: never loop forever on a zero-length match
+        if hit[1] == 0:
+            break
+
+    if not matched_word:
+        return False, "", ""
+
+    cmd = _re.sub(r"^[,\s，!！?？:：\-—.]+", "", norm).strip()
+    return True, matched_word, cmd
 
 
 # ---------------------------------------------------------------------------
@@ -214,17 +316,48 @@ async def transcribe(request: Request):
         else:
             raw = np.frombuffer(body[: len(body) // 2 * 2], dtype="<i2").copy()
             pcm = resample_to_16k(raw, rate) if rate != ESP_SAMPLE_RATE else raw
-        text = await _run_stt(pcm)
+        rms = float(np.sqrt(np.mean(pcm.astype(np.float64) ** 2))) if len(pcm) else 0.0
+        logger.info("STT request: %d bytes (%.2fs @ %dHz), RMS=%.1f (threshold=%.1f)",
+                    len(pcm) * 2, len(pcm) / ESP_SAMPLE_RATE, rate, rms, settings.voice_min_rms)
+        if rms < settings.voice_min_rms:
+            # Pure silence / faint electrical noise: skip Whisper entirely.
+            logger.info("STT skipped: rms=%.0f < voice_min_rms=%.0f", rms, settings.voice_min_rms)
+            return {"text": "", "raw_text": "", "wake_matched": False, "wake_word": ""}
+        text, avg_logprob, no_speech_prob = await _run_stt(pcm)
     except HTTPException:
         raise
     except Exception as e:
         logger.exception("STT failed")
         raise HTTPException(500, f"transcription failed: {e}")
 
-    return {"text": text}
+    wake_list = [w.strip() for w in settings.voice_wake_words.split(",") if w.strip()]
+    wake_matched, wake_word, cmd = check_wake_word(text, wake_list)
+
+    # Confidence gate: reject hallucinated wake words. Whisper invents short
+    # phrases on noise/TTS-echo; measured on this pipeline, genuine wake
+    # utterances have avg_logprob > -1.0 while hallucinations sit near/below
+    # it with high no_speech_prob. Keep the device from self-waking forever.
+    if wake_matched and (
+        avg_logprob < settings.voice_min_avg_logprob
+        or no_speech_prob > settings.voice_max_no_speech_prob
+    ):
+        logger.warning(
+            "wake word REJECTED by confidence gate: word='%s' logp=%.2f nsp=%.2f raw='%.60s'",
+            wake_word, avg_logprob, no_speech_prob, text)
+        wake_matched, wake_word, cmd = False, "", ""
+
+    logger.info("STT: raw='%s' | wake_matched=%s (word='%s') | cmd='%s'",
+                text, wake_matched, wake_word, cmd)
+
+    return {
+        "text": cmd if wake_matched else "",
+        "raw_text": text,
+        "wake_matched": wake_matched,
+        "wake_word": wake_word,
+    }
 
 
-async def _run_stt(pcm: np.ndarray) -> str:
+async def _run_stt(pcm: np.ndarray) -> tuple[str, float, float]:
     """Offload the blocking Whisper call to a worker thread."""
     import asyncio
     return await asyncio.to_thread(_transcribe_pcm, pcm, settings.voice_language)

@@ -274,7 +274,13 @@ outbound dispatch task → agent_loop_start → backend_discovery_start (last)
 
 - **Telegram** (`telegram_bot.c`) — long-polling inbound, outbound text + photos
   (`telegram_bot_photo.c`). Bot token stored in NVS (`telegram_set_token`),
-  set once via serial CLI. Replies go to the originating chat.
+  set once via serial CLI. Replies go to the originating chat. (Note: when
+  hybrid cloud link is active, polling is offloaded to backend gateway).
+- **Cloud Gateway Link** (`channels/cloud_link/cloud_link.c`) — persistent
+  outbound WebSocket connection (`/api/cloud/ws/device`) to the backend.
+  Transports inbound Telegram updates (`message_in`), outbound replies
+  (`message_out`, `photo_out`), and tunnels LLM inference requests
+  (`llm.request` / `llm.response`) for keyless device execution.
 - **Feishu / Lark** (`feishu_bot.c`) — app credentials in NVS, webhook receiver
   on :18790.
 - **Serial CLI** (`cli/serial_cli.c`) — local console for setup/debug, works
@@ -322,6 +328,11 @@ first-boot setup from a phone). `ota/` for firmware updates.
 | `GET/PUT` | `/api/ui/avatar` | device key | Agent avatar dress-up state (dashboard-only) |
 | `POST` | `/api/voice/transcribe` | device key | Raw 16 kHz mono PCM (or WAV) in → faster-whisper STT → `{"text"}` out |
 | `POST` | `/api/voice/tts` | device key | `{"text"}` in → edge-tts + ffmpeg → 16 kHz mono 16-bit WAV out |
+| `WS` | `/api/cloud/ws/device` | query `?key=` | Bidirectional WebSocket link for hybrid device operation |
+| `GET/POST` | `/api/cloud/bindings` · `/bind` · `/unbind` | device key | Manage Telegram `chat_id` to `device_id` routing bindings |
+| `GET/PUT` | `/api/cloud/gateway-config` | device key | View/update runtime Telegram bot token and LLM relay settings |
+| `POST` | `/api/cloud/test-telegram` · `/test-llm` | device key | Live diagnostic tests for bot token and LLM endpoint |
+| `GET` | `/cloud` | — | Web configuration dashboard for hybrid cloud gateway |
 
 Auth model: one shared **device API key** (`Bearer`, set in `.env` and
 `main/mimi_config.h`) for everything — single-user scope by design. CORS open
@@ -526,39 +537,65 @@ by MimiClaw".
 
 ## 7. End-to-end flows
 
-### 7.1 Voice pipeline (hands-free: "Hi ESP" → Yes? → command → spoken reply)
+### 7.1 Voice pipeline (hands-free: "Hey Expert" / "Mimi" → software wake verification → command → spoken reply)
 
-Wake word runs **on-device** (esp-sr WakeNet WN9 "hiesp" model from the 2 MB
-`model` partition); STT/TTS run on the backend. The ESP32 only moves bytes.
-Audio contract: **16 kHz / mono / 16-bit PCM** both ways (raw PCM in, WAV out).
+Wake word runs via **VAD + Backend Whisper wake word verification**:
+The ESP32 runs continuous low-overhead energy VAD listening (32 ms frames, adaptive threshold:
+`max(420, 1.33× ambient floor)` capped at 14000, 3 consecutive frames ≈ 96 ms required).
+The ambient floor is a min-statistics estimator (instant fall, bounded rise ~750 RMS/s) that
+runs on **every** frame, so it converges even in a loud room where all frames exceed the fixed
+threshold. When speech is detected, it captures the utterance with a 250ms pre-roll (rewinding
+the I2S ring buffer by 4000 samples so the wake word prefix is preserved intact) until 700ms
+silence or 1.5 s cap, then sends it to the FastAPI backend (`POST /api/voice/transcribe`).
+Whisper (with a **neutral/empty** `initial_prompt` — wake words in the prompt were verified to
+bias the decoder into hallucinating the wake word from noise/echo) verifies whether the utterance
+begins with any configured wake word (e.g., `"expert"`, `"hey expert"`, `"mimi"`, `"hey mimi"`,
+`"espet"`, `"米米"`), then applies a **confidence gate** (`voice_min_avg_logprob` −1.1,
+`voice_max_no_speech_prob` 0.75) plus a pre-Whisper RMS gate (`voice_min_rms` 250) to reject
+hallucinated wake words:
+- If wake word does NOT match (or is rejected by the confidence gate): silently ignored.
+- If one-shot command ("Hey Expert turn on the LED"): backend strips the wake word (repeated
+  leading wake words are also stripped, e.g. "米米 米米" → no command) and returns the command
+  text; ESP32 queues it immediately to the ReAct agent loop!
+- If wake word only ("Hey Expert"): ESP32 plays the pre-cached "Yes?" ack, waits `ACK_SETTLE_MS`
+  (450 ms) for the ack echo to decay, then opens the command window.
+Agent replies are routed via `voice_client_speak()` → `POST /api/voice/tts` → MAX98357A speaker.
+
+**Half-Duplex Turn-Taking, Paused Mic & Echo Guard**:
+Once a command is queued to the LLM agent, the voice client enters `s_busy = true`:
+- The microphone listening and VAD tasks are completely paused while the LLM thinks,
+  runs tools, and speaks its reply. This prevents self-triggering from the speaker,
+  eliminates Wi-Fi socket contention during tool use, and avoids wasting CPU/STT on ambient noise.
+- After playback, `voice_client_speak()` arms a **700 ms echo guard** (`ECHO_GUARD_MS`): VAD is
+  skipped and the ring/DMA are flushed until the amp tail + room reverb decay. Without it the
+  VAD re-triggered ~330 ms after TTS end and Whisper hallucinated the wake word from the tail
+  (endless self-wake loop — field log 2026-10-09).
 
 ```
-[LISTEN] voice_wake task streams the mic into WakeNet (30 ms frames)
-[ WAKE ] "Hi ESP" detected (WAKENET_DETECTED)
-         → "Yes?" ack (TTS WAV pre-cached in PSRAM at boot, instant)
-[COMMAND] capture until 1.6 s trailing silence (5 s lead-in granted before
-          speech starts; RMS > 200 marks speech) or 10 s cap (arm/rx_read)
-[ THINK ] POST /api/voice/transcribe ──▶ backend faster-whisper ──▶ {"text"}
-          transcript ──▶ inbound bus as system:"voice" ──▶ agent ReAct loop
-[ SPEAK ] agent reply ──▶ outbound dispatcher (system:"voice")
-          └─▶ mirrored to last Telegram chat AND spoken:
-              voice_client_speak(): POST /api/voice/tts {"text"}
-                ──▶ backend edge-tts (zh-HK-HiuMaanNeural) + ffmpeg
-                ──▶ 16 kHz mono WAV ──▶ tool_audio_play_wav() ──▶ MAX98357A 🔊
+[LISTEN ] voice_wake task monitors mic stream via energy VAD (32 ms frames, adaptive threshold,
+          floor-tracked: max(420, 1.33×ambient), cap 14000; 3 consecutive frames to trigger)
+[CAPTURE] Speech detected → arm capture with 250 ms pre-roll from ring buffer
+          Captures until 700 ms silence (adaptive cutoff ≈1.25×ambient) or 1.5 s utterance cap
+[VERIFY ] POST /api/voice/transcribe ──▶ backend faster-whisper (neutral prompt)
+          ├─ rms < voice_min_rms ──▶ skip STT, no wake
+          ├─ Wake not matched ──▶ silent ignore, flush ring, resume listening
+          ├─ Wake matched but confidence gate rejects (logp/nsp) ──▶ no wake
+          ├─ One-shot command ("Hey Expert what's the weather") ──▶ push to agent bus
+          │                                                       (mic enters s_busy pause)
+          └─ Wake only ("Hey Expert") ──▶ play "Yes?" ack ──▶ ACK_SETTLE_MS (450 ms) ──▶ record follow-up command
+              (if no command/only wake word heard, ignore & clear cache, do not queue to agent)
+[ THINK ] Agent ReAct loop executes tools & LLM API (mic is PAUSED)
+[ SPEAK ] voice_client_speak(): POST /api/voice/tts {"text"}
+          ──▶ backend edge-tts + ffmpeg ──▶ 16 kHz WAV ──▶ MAX98357A 🔊
+          ──▶ playback done ──▶ ECHO_GUARD_MS (700 ms) ──▶ tool_audio_clear_cache() (DMA+ring) ──▶ s_busy = false ──▶ resume LISTEN!
 ```
 
-Echo control: the listener pauses while anything plays/records
-(`tool_audio_is_busy`), so the device never wakes on its own voice.
-GPIO 41 is now camera-only (short = snapshot → Telegram, hold = video);
-the PTT path is retired (voice_client_on_ptt_stop kept for manual CLI tests).
-Settings (`espet-backend/config.py` / `.env`): `voice_stt_model` (default `base`),
-`voice_language` (None = auto), `voice_tts_voice` (default `zh-HK-HiuMaanNeural`).
-Backend deps: `faster-whisper`, `edge-tts`, `numpy` (+ system `ffmpeg`);
-firmware component: `espressif/esp-sr` ( pulls esp-dl; app partitions are 3 MB).
-Known limits: "Hi ESP" is the free WakeNet phrase (closest to "Hey ESPET";
-custom phrases need Espressif's commercial models); wake latency ~0.5 s;
-re-pressing while a command uploads can overwrite the PCM (single buffer);
-voice flow needs the backend reachable.
+Echo control: the listener pauses while anything plays/records (`tool_audio_is_busy`, `s_busy`)
+or the post-playback echo guard is active, so the device never wakes on its own voice.
+Configurable in `espet-backend/config.py` / `.env`: `voice_wake_words` (default: `"expert,hey expert,hi expert,espet,hey espet,mimi,hey mimi,hi mimi,ok mimi,hi esp,米米,咪咪,小米"`),
+`voice_stt_model` (default `small`), `voice_language` (None = auto), `voice_tts_voice`,
+`voice_stt_prompt` (default empty — never put wake words here), `voice_min_avg_logprob`,
+`voice_max_no_speech_prob`, `voice_min_rms`.
 
 ### 7.2 Reactive (Jeff): *"Email Dr Wong a summary of my proposal doc"*
 
@@ -674,6 +711,9 @@ Herman's full gap analysis and prioritized roadmap of needed tools/functions:
 Append-only session log. Newest first. One line per change:
 `- YYYY-MM-DD — summary (files: ...)`.
 
+- 2026-10-09 — OLED cold-boot readiness fix: added 100 ms power stabilization delay and 5-attempt retry loop (50 ms spacing) in display_status.c to accommodate SSD1306 power-on reset / charge pump ramp-up latency on USB cold plug (files: main/display/display_status.c, .agent/SYSTEM_OVERVIEW.md).
+- 2026-10-08 — STT recognition accuracy & tolerance upgrade: upgraded backend Whisper default from 'base' (74M) to 'small' (244M); enabled beam search (beam_size=3, best_of=3) and context priming initial_prompt in voice_router.py to drastically improve accent and conversational tolerance; added +8 dB (2.5x) digital gain to capture_task in tool_audio.c so audio_record_test captures healthy RMS amplitudes instead of low-signal whisper noise (files: espet-backend/config.py, espet-backend/api/voice_router.py, main/tools/tool_audio.c, .agent/SYSTEM_OVERVIEW.md).
+- 2026-10-08 — Hybrid mode implementation (Plan C-Hybrid): offload Telegram long polling and credentials to FastAPI backend; persistent `/api/cloud/ws/device` WebSocket link; keyless LLM inference tunneling (`llm.request` / `llm.response`) via `cloud_link.c` and `llm_proxy.c`; runtime gateway settings persistence in `data/gateway_config.json` with dynamic poller restart; `/cloud` standalone configuration dashboard with live diagnostics; 10/10 automated host E2E tests verified (files: main/channels/cloud_link/cloud_link.c, main/channels/cloud_link/cloud_link.h, main/llm/llm_proxy.c, espet-backend/api/cloud_router.py, espet-backend/services/gateway_settings.py, espet-backend/static/cloud.html, espet-backend/tests/test_cloud_gateway.py, docs/HYBRID_MODE_PLAN.md, .agent/SYSTEM_OVERVIEW.md).
 - 2026-10-06 — Speaker-blur fix: `play_tone` (beeps) and
   `tool_audio_play_wav` (ack WAV) did NOT raise `s_speaker_busy`, so the
   mic feeder kept racing I2S TX during every beep/ack — the project's own
@@ -1183,3 +1223,62 @@ Append-only session log. Newest first. One line per change:
   orchestration, and registry) — data flows, ASCII diagrams, adv/disadv,
   side-by-side table, and a firmware/backend migration map for productization
   (files: docs/ARCH_COMPARISON_DIRECT_VS_CLOUD.md, .agent/SYSTEM_OVERVIEW.md).
+- 2026-10-07 — Hybrid mode implemented (branch `newplan`, Plan C-Hybrid slice,
+  docs/HYBRID_MODE_PLAN.md): the backend gains a cloud-gateway role —
+  `services/device_registry.py` (device connections + chat bindings, JSON
+  persistence), `services/telegram_gateway.py` (single getUpdates poller,
+  routes updates to the owning device, send_text/send_photo), and
+  `api/cloud_router.py` (WS `/api/cloud/ws/device` with device-key auth,
+  hello handshake, message_in/message_out/photo_out frames, binding REST).
+  Gated by `CLOUD_GATEWAY_ENABLED`/`TELEGRAM_BOT_TOKEN` in settings.
+  Firmware: NEW `main/channels/cloud_link/` (esp_websocket_client, one
+  persistent outbound WSS to /ws/device, hello/hello_ack, frame reassembly,
+  message_in → bus channel "cloud"); `MIMI_CHAN_CLOUD` added to message_bus;
+  when `MIMI_CLOUD_LINK_ENABLE=1` (default) mimi.c starts cloud_link instead
+  of telegram polling and the outbound dispatcher sends "cloud" replies with
+  6×5 s retries. Agent loop/memory/tools unchanged. Host E2E tests
+  (espet-backend/tests/test_cloud_gateway.py, mock Telegram HTTP server +
+  real WS device client): 8/8 passed (auth, handshake, inbound routing,
+  outbound send, auto-bind, persistence, disconnect safety, photo). Hardware
+  build/flash + TC-09 deferred by request (files: espet-backend/services/*,
+  espet-backend/api/cloud_router.py, espet-backend/main.py,
+  espet-backend/config.py, espet-backend/tests/test_cloud_gateway.py,
+  main/channels/cloud_link/*, main/bus/message_bus.h, main/mimi_config.h,
+  main/CMakeLists.txt, main/mimi.c, docs/HYBRID_MODE_PLAN.md,
+  .agent/SYSTEM_OVERVIEW.md).
+- 2026-10-08 — Fixed firmware compile errors and WebSocket 403 handshake in hybrid mode:
+  removed non-existent `esp_websocket_client_config_t.buffer_size_tx`, corrected event
+  registration API to `esp_websocket_register_events` (was `esp_websocket_client_register_events`),
+  included `esp_crt_bundle.h` for `crt_bundle_attach`, updated firmware WS URL path to
+  `/api/cloud/ws/device`, and added `/ws/device` alias in `espet-backend/main.py`
+  (files: main/channels/cloud_link/cloud_link.c, espet-backend/main.py, .agent/SYSTEM_OVERVIEW.md).
+- 2026-10-08 — Fixed hybrid mode Telegram gateway dispatch and reconnection:
+  made `ws_device` frame loop in `api/cloud_router.py` query `get_gateway()` dynamically
+  so runtime gateway restarts apply to existing client sockets, enabled `enable_close_reconnect`
+  in `cloud_link.c` so the ESP32 survives backend restarts, and added bootstrap env keys to `.env`
+  (files: espet-backend/api/cloud_router.py, main/channels/cloud_link/cloud_link.c, espet-backend/.env, .agent/SYSTEM_OVERVIEW.md).
+- 2026-10-08 — Added docs/VOICE_AUDIO_STATUS.md: detailed audit document in Chinese
+  listing all commented-out and active microphone, speaker, TTS, and STT code locations,
+  field-debug context, and recovery steps (files: docs/VOICE_AUDIO_STATUS.md, .agent/SYSTEM_OVERVIEW.md).
+- 2026-10-08 — Upgraded hybrid Telegram gateway to 30s seamless long-polling with 0s idle rest delay; removed redundant poll interval UI field from cloud dashboard (files: espet-backend/services/telegram_gateway.py, espet-backend/api/cloud_router.py, espet-backend/config.py, espet-backend/static/cloud.html, .agent/SYSTEM_OVERVIEW.md).
+- 2026-10-08 — Restored Telegram reply TTS audio output in mimi.c (both direct and cloud-link channels); purged obsolete PTT (Push-To-Talk) button code and configs from button_handler and voice_client, retaining single GPIO 41 button strictly for camera snap and video capture; updated docs/VOICE_AUDIO_STATUS.md (files: main/mimi.c, main/tools/button_handler.h, main/tools/button_handler.c, main/mimi_config.h, main/voice/voice_client.h, main/voice/voice_client.c, docs/VOICE_AUDIO_STATUS.md, .agent/SYSTEM_OVERVIEW.md).
+- 2026-10-08 — Re-enabled hands-free wake word listener (voice_client_start) in mimi.c; completely decoupled voice replies from Telegram (voice chat responses go directly to MAX98357A speaker with zero Telegram traffic); updated docs/VOICE_AUDIO_STATUS.md (files: main/mimi.c, main/voice/voice_client.c, docs/VOICE_AUDIO_STATUS.md, .agent/SYSTEM_OVERVIEW.md).
+- 2026-10-08 — Fixed wake word diagnostics and I2S RX arbitration: moved 5s WakeNet debug report to the top of voice_task loop in voice_client.c so frame/feeder stats output unconditionally; added rate-limited warning logging for feeder DMA read failures in tool_audio.c and paused mic_feeder_task during standalone s_recording sessions to prevent I2S RX contention (files: main/voice/voice_client.c, main/tools/tool_audio.c, .agent/SYSTEM_OVERVIEW.md).
+- 2026-10-08 — Fixed mic_feeder_task DMA read starvation: reduced feeder read buffer from oversized 16 KB (4096 samples) to AUDIO_READ_CHUNK_BYTES (2048 bytes / 256 frames / 16 ms) with 500ms timeout matching proven capture_task, preventing persistent 200ms DMA timeouts; preserved partial reads (files: main/tools/tool_audio.c, main/voice/voice_client.c, .agent/SYSTEM_OVERVIEW.md).
+- 2026-10-08 — Boosted wake word sensitivity: applied 2.5x digital gain (+8 dB) to INMP441 samples in mic_feeder_task, switched WakeNet to DET_MODE_95 (aggressive detection), and lowered detection threshold from 0.63 to 0.45 (files: main/tools/tool_audio.c, main/voice/voice_client.c, .agent/SYSTEM_OVERVIEW.md).
+- 2026-10-08 — Added direct STT testing in audio_record_test: exposed voice_client_transcribe and wired audio_record_test to send captured PCM directly to /api/voice/transcribe and print recognized speech in serial terminal (files: main/voice/voice_client.h, main/voice/voice_client.c, main/tools/tool_audio.c, .agent/SYSTEM_OVERVIEW.md).
+- 2026-10-08 — Implemented Option 3 Software Wake Word pipeline with custom wake words ("Mimi" / "Hey Mimi" / "米米"): replaced rigid on-chip "Hi ESP" WakeNet with low-overhead energy VAD (RMS > 950 for 2 frames) and 250ms pre-roll capture on ESP32; added backend wake word verification filter (`check_wake_word`, `voice_wake_words` in config.py) in `/api/voice/transcribe`; supported both one-shot commands ("Hey Mimi turn on LED" -> direct ReAct execution) and two-step wake ("Mimi" -> "Yes?" ack -> follow-up command); ambient talk without wake word is silently ignored; updated idle OLED message to "Say Mimi to wake" (files: main/voice/voice_client.c, main/voice/voice_client.h, main/tools/tool_audio.c, main/tools/tool_audio.h, main/display/display_status.c, espet-backend/config.py, espet-backend/api/voice_router.py, .agent/SYSTEM_OVERVIEW.md).
+- 2026-10-08 — Fixed mic_feeder_task starvation during utterance capture and added "Hey Expert" wake word: fixed feeder task falsely parking during armed recording by replacing s_recording with s_capture_task_handle check; calibrated VAD threshold to RMS 420 based on actual room floor (210 RMS) and speech peak (750 RMS); added "expert", "hey expert", "hi expert" to config.py and Whisper prompt (files: main/tools/tool_audio.c, main/voice/voice_client.c, main/display/display_status.c, espet-backend/config.py, espet-backend/api/voice_router.py, espet-backend/.env, .agent/SYSTEM_OVERVIEW.md).
+- 2026-10-08 — Optimized voice response latency: reduced trailing silence cutoff threshold CMD_SILENCE_MS from 1200ms to 700ms in voice_client.c, cutting 500ms of post-speech waiting delay (files: main/voice/voice_client.c, .agent/SYSTEM_OVERVIEW.md).
+- 2026-10-08 — Implemented half-duplex turn-taking with paused mic during LLM reasoning and TTS playback: once a command is queued to the agent, voice client marks s_busy=true and suspends mic VAD/ring reads, preventing self-triggering from speaker audio, avoiding Wi-Fi packet contention during tool execution, and saving backend Whisper compute; voice_client_speak clears s_busy and flushes ring buffer upon playback completion (files: main/voice/voice_client.c, .agent/SYSTEM_OVERVIEW.md).
+- 2026-10-09 — Optimized voice listening latency and robustness: reduced wake utterance cap from 8.0s to 1.5s (UTTERANCE_MAX_MS=1500) and command cap from 10.0s to 4.5s (CMD_MAX_MS=4500); added adaptive dynamic silence threshold tracking (silence_cutoff = s_ambient_noise_rms + 80) in voice_client.c; implemented single-sample rail pop deglitcher in mic_feeder_task (tool_audio.c) to suppress electrical I2S full-scale spikes (files: main/voice/voice_client.c, main/tools/tool_audio.c, .agent/SYSTEM_OVERVIEW.md).
+- 2026-10-09 — Fixed audio cache persistence and spurious wake re-triggering: implemented `tool_audio_clear_cache()` draining both hardware I2S DMA FIFO and software ring buffer; added explicit cache clearing and 150ms/250ms acoustic settle cooldowns after playing 'Yes?' and after agent TTS replies; in `voice_run_command`, isolated pure wake word detections (e.g. repeated '米米') from real commands, discarding empty commands instead of falsely sending '米米' to the agent LLM loop (files: main/tools/tool_audio.h, main/tools/tool_audio.c, main/voice/voice_client.c, .agent/SYSTEM_OVERVIEW.md).
+- 2026-10-09 — Fixed premature command cutoff after 'Yes?' ack: removed aggressive 700ms silence timeout that immediately aborted listening; ensured the full 4.5s command window strictly begins after 'Yes?' finishes; added guaranteed 2.5s minimum speaking grace period before trailing silence (1200ms) can complete, and updated OLED to indicate active command listening (files: main/voice/voice_client.c, .agent/SYSTEM_OVERVIEW.md).
+- 2026-10-09 — Fixed empty Google MCP servers card on Home dashboard: replaced fragile DonutChart (whose Recharts ResponsiveContainer collapsed to 0 width inside display:grid placeItems:center) with a clear list of connected servers displaying names, status dots, and tool counts (Gmail, Calendar, Drive, Docs) with success badge tone (files: espet-backend/src/views/Home.tsx, espet-backend/static/vendor/app/chunks/Home-WQ7WBSGL.js, .agent/SYSTEM_OVERVIEW.md).
+- 2026-10-09 — Fixed OLED electrical interference causing continuous mic false triggers: SSD1306 internal charge pump (300-450 kHz) and shared 3.3V/GND breadboard rails induced large DC bias/ripple (~8500 raw RMS in quiet room), trapping VAD in a 24/7 capture-upload loop that made the mic seem insensitive to user speech; implemented a 1st-order DC-blocking IIR high-pass filter (fc ≈ 20Hz) in `mic_feeder_task` (`tool_audio.c`) to strip DC offsets/ground drift, and implemented `calc_ac_rms()` (zero-mean AC RMS) in `voice_client.c` for VAD listening, command trailing silence, and utterance capture so pure DC rail shifts can never trigger speech detection (files: main/tools/tool_audio.c, main/voice/voice_client.c, .agent/SYSTEM_OVERVIEW.md).
+- 2026-10-09 — Added Cloud tab to top navigation bar beside Agent and added shared GlassNav bar with bidirectional routing to /cloud: updated `PRIMARY` routes order (`routes.ts` & `chunk-UXN76GPX.js`), added routing interception in `index.js` to redirect clicks to `/cloud`, and added floating glass navbar with active Cloud pill and cross-view routes (Home, Agent, Chat, Camera, Assistant, System) in `cloud.html` (files: espet-backend/src/routes.ts, espet-backend/static/cloud.html, espet-backend/static/index.html, espet-backend/static/vendor/app/index.js, espet-backend/static/vendor/app/chunks/chunk-UXN76GPX.js, .agent/SYSTEM_OVERVIEW.md).
+
+
+- 2026-10-10 — Fixed endless self-wake loop (device re-woke with nobody speaking): root cause was TTS echo/noise > fixed VAD threshold → capture → Whisper (biased by wake words in `initial_prompt`) hallucinating "米米" → unconditional wake match → "Yes?" → loop. Backend: removed wake words from `initial_prompt` (now neutral/empty `voice_stt_prompt`), added pre-STT RMS gate (`voice_min_rms` 250), per-segment confidence gate (`voice_min_avg_logprob` −1.1 / `voice_max_no_speech_prob` 0.75, values calibrated against 19 real utterances vs 15 hallucination cases), and repeated-wake-word stripping in `check_wake_word` ("米米 米米" → wake-only, no command). Firmware: 700 ms post-playback echo guard (`ECHO_GUARD_MS`) replacing the 250 ms cooldown, 450 ms ack settle before the command window (`ACK_SETTLE_MS`), adaptive VAD threshold `max(420, 1.33×ambient)` capped at 14000 with a min-statistics floor tracker that runs on every frame (converges in a loud room where all frames exceed the old fixed threshold), trigger raised from 2 to 3 consecutive frames, and adaptive trailing-silence cutoff (files: espet-backend/api/voice_router.py, espet-backend/config.py, main/voice/voice_client.c, .agent/SYSTEM_OVERVIEW.md).
+- 2026-10-10 — Fixed VAD noise floor never converging + stale-backend-IP link death (field log after the previous voice fix): (1) the ambient-floor estimator lived in voice_task, which is blocked for 1.5 s + seconds of STT on every capture, so it crawled 420→1068 over two minutes while the room sat at ~9000 RMS and false-triggered forever; moved estimation into the always-running mic_feeder_task as a ~4 s sliding-window minimum of per-read RMS (stationary room noise vs transient speech ⇒ min locks onto the floor, converges on the first read, and cannot be dragged up mid-utterance) exposed as `s_mic_floor`, consumed by voice_client's `vad_trigger_threshold()`. (2) `cloud_link_start()` ran before mDNS discovery and built the WebSocket from the stale compiled-in IP; the WS client reconnects to a FIXED URI, so it retried the dead address forever (TLS-timeout storm starving Core 0 and stalling STT to 17-21 s). Added a cloud supervisor task that rebuilds the client whenever the discovered URL changes. (3) the boot-time `tool_registry_fetch_remote_tools()` hit the same stale IP and never retried, leaving 0 remote tools; added a bounded background retry task (re-fetch is idempotent). (files: main/tools/tool_audio.c, main/voice/voice_client.c, main/channels/cloud_link/cloud_link.c, main/mimi.c, .agent/SYSTEM_OVERVIEW.md).
+- 2026-10-11 — Fixed wake word recognition failures on "Hey Mimi": resolved Whisper punctuation mismatch in check_wake_word (commas/periods in "Hey, Mimi." previously caused 100% regex match failure); added fallback to vad_filter=False when Silero VAD discards short speech segments; added mapping for Japanese Whisper phonetic transcriptions ("耳"/"にみ" -> "mimi"); added anti-repetition limits (repetition_penalty=1.2, no_repeat_ngram_size=3, max_new_tokens=96) to prevent 20s token generation hangs on ambient noise; saved incoming captures to data/last_capture.wav with detailed RMS/length logging; increased firmware wake utterance capture cap from 1.5s to 2.5s (UTTERANCE_MAX_MS=2500) to prevent premature cutoffs; and fixed `mic_feeder_task` premature loop break on ring buffer full that zeroed `sumsq` and poisoned `s_mic_floor` to 0, trapping VAD in a permanent false-triggering loop on ambient OLED/breadboard electrical noise (files: espet-backend/api/voice_router.py, main/voice/voice_client.c, main/tools/tool_audio.c, .agent/SYSTEM_OVERVIEW.md).

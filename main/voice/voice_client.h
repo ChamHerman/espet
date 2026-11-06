@@ -45,11 +45,25 @@ void voice_client_stop(void);
 bool voice_client_speak(const char *text);
 
 /**
- * @brief Legacy entry: open the command window directly (no wake word).
- *
- * Kept for manual/CLI triggering; not wired to any button.
+ * @brief Structured STT result including wake word match status.
  */
-void voice_client_on_ptt_stop(void);
+typedef struct {
+    bool  wake_matched;  /* true if transcript began with a valid wake word */
+    char *text;          /* command text with wake word stripped (caller frees) */
+    char *raw_text;      /* full unmodified transcript (caller frees) */
+    char *wake_word;     /* matched wake word string (caller frees) */
+} voice_stt_result_t;
+
+/**
+ * @brief Full STT call returning wake word detection and command text.
+ */
+bool voice_client_transcribe_full(const int16_t *pcm, size_t samples, voice_stt_result_t *out_res);
+
+/**
+ * @brief Transcribe raw 16kHz mono PCM via backend STT (/api/voice/transcribe).
+ * Returns heap-allocated string (caller frees), or NULL on failure.
+ */
+char *voice_client_transcribe(const int16_t *pcm, size_t samples);
 
 #ifdef __cplusplus
 }

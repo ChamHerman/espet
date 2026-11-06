@@ -13,6 +13,7 @@
 #include "bus/message_bus.h"
 #include "wifi/wifi_manager.h"
 #include "channels/telegram/telegram_bot.h"
+#include "channels/cloud_link/cloud_link.h"
 #include "channels/feishu/feishu_bot.h"
 #include "llm/llm_proxy.h"
 #include "agent/agent_loop.h"
@@ -90,8 +91,7 @@ static void on_white_button_long_press(bool is_starting)
 }
 
 /* GPIO 41 camera button: short press = snapshot to Telegram,
- * hold >= 600 ms = video capture start/stop. (Previously PTT; voice is now
- * hands-free via the esp-sr wake word — see voice/voice_client.c.) */
+ * hold >= 600 ms = video capture start/stop. */
 
 static esp_err_t init_nvs(void)
 {
@@ -133,6 +133,23 @@ static esp_err_t init_spiffs(void)
 #define TG_SEND_RETRY_MS  5000
 
 /* Outbound dispatch task: reads from outbound queue and routes to channels */
+/* Remote MCP tool discovery: retries in the background until the backend is
+ * actually reachable. The boot-time fetch runs before mDNS has resolved, so it
+ * hits the stale compiled-in IP and (before this) never retried — the device
+ * ended up with zero remote tools. Re-fetch is idempotent (register_tool skips
+ * duplicates), so a successful later pass simply adds what was missing. */
+static void remote_tools_fetch_task(void *arg)
+{
+    for (int attempt = 1; attempt <= 10; attempt++) {
+        if (tool_registry_fetch_remote_tools() == ESP_OK) {
+            ESP_LOGI(TAG, "Remote tools ready (attempt %d)", attempt);
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10000));
+    }
+    vTaskDelete(NULL);
+}
+
 static void outbound_dispatch_task(void *arg)
 {
     ESP_LOGI(TAG, "Outbound dispatch started");
@@ -168,12 +185,44 @@ static void outbound_dispatch_task(void *arg)
                     ESP_LOGI(TAG, "Telegram send success for %s (%d bytes)", msg.chat_id, (int)strlen(msg.content));
                     /* Final agent replies are spoken too (user request):
                      * every text answer also comes out of the speaker. */
-                    /* VOICE DISABLED (field debug 2026-10-07) — see
-                     * voice_client_start() comment in app_main. */
-                    /* voice_client_speak(msg.content); */
+                    voice_client_speak(msg.content);
+                }
+            }
+#if MIMI_CLOUD_LINK_ENABLE
+        } else if (strcmp(msg.channel, MIMI_CHAN_CLOUD) == 0) {
+            /* Hybrid mode: replies to cloud-routed Telegram messages go back
+             * through the gateway. Same retry discipline as Telegram sends. */
+            if (msg.chat_id[0] == '\0') {
+                ESP_LOGW(TAG, "Skipping cloud send: chat_id is empty");
+            } else {
+                esp_err_t send_err = ESP_FAIL;
+                for (int attempt = 1; attempt <= TG_SEND_RETRIES; attempt++) {
+                    send_err = cloud_link_send_text(msg.chat_id, msg.content);
+                    if (send_err == ESP_OK) {
+                        break;
+                    }
+                    if (attempt < TG_SEND_RETRIES) {
+                        ESP_LOGW(TAG, "Cloud send failed (attempt %d/%d) — "
+                                      "retrying in %d s", attempt,
+                                 TG_SEND_RETRIES, TG_SEND_RETRY_MS / 1000);
+                        vTaskDelay(pdMS_TO_TICKS(TG_SEND_RETRY_MS));
+                    }
+                }
+                if (send_err != ESP_OK) {
+                    ESP_LOGE(TAG, "Cloud send failed for %s after %d attempts: %s",
+                             msg.chat_id, TG_SEND_RETRIES,
+                             esp_err_to_name(send_err));
+                } else {
+                    ESP_LOGI(TAG, "Cloud send success for %s (%d bytes)",
+                             msg.chat_id, (int)strlen(msg.content));
+                    /* Final agent replies are spoken too (user request) */
+                    voice_client_speak(msg.content);
                 }
             }
         } else if (strcmp(msg.channel, MIMI_CHAN_FEISHU) == 0) {
+#else
+        } else if (strcmp(msg.channel, MIMI_CHAN_FEISHU) == 0) {
+#endif
             esp_err_t send_err = feishu_send_message(msg.chat_id, msg.content);
             if (send_err != ESP_OK) {
                 ESP_LOGE(TAG, "Feishu send failed for %s: %s", msg.chat_id, esp_err_to_name(send_err));
@@ -187,15 +236,10 @@ static void outbound_dispatch_task(void *arg)
             }
         } else if (strcmp(msg.channel, MIMI_CHAN_SYSTEM) == 0) {
             ESP_LOGI(TAG, "System message [%s]: %.128s", msg.chat_id, msg.content);
-            /* Voice pipeline output [PIPELINE-3/4]: mirror the reply to the
-             * last Telegram chat AND speak it through the MAX98357A. */
+            /* Voice pipeline output: directly speak through MAX98357A speaker;
+             * completely detached from Telegram (no Telegram messages sent). */
             if (strcmp(msg.chat_id, "voice") == 0) {
-                telegram_send_to_last_chat(msg.content);
-                /* VOICE DISABLED (field debug 2026-10-07) — see
-                 * voice_client_start() comment in app_main. */
-                /* voice_client_speak(msg.content); */  /* final answers AND the
-                                                      "ESPeting..." status are
-                                                      spoken */
+                voice_client_speak(msg.content);
             }
         } else {
             ESP_LOGW(TAG, "Unknown channel: %s", msg.channel);
@@ -239,7 +283,7 @@ void app_main(void)
     ESP_ERROR_CHECK(llm_proxy_init());
     ESP_ERROR_CHECK(tool_registry_init());
     ESP_ERROR_CHECK(tool_camera_init());
-    ESP_ERROR_CHECK(button_handler_init(on_white_button_short_press, on_white_button_long_press, NULL));
+    ESP_ERROR_CHECK(button_handler_init(on_white_button_short_press, on_white_button_long_press));
     ESP_ERROR_CHECK(cron_service_init());
     ESP_ERROR_CHECK(heartbeat_init());
     ESP_ERROR_CHECK(config_sync_init());
@@ -287,27 +331,35 @@ void app_main(void)
 
         /* Start network-dependent services */
         ESP_ERROR_CHECK(agent_loop_start());
+#if MIMI_CLOUD_LINK_ENABLE
+        /* Hybrid mode: the backend owns Telegram polling; the device keeps
+         * one persistent WS to it. telegram_bot polling must NOT start
+         * (one poller per bot token, and replies route via channel "cloud"). */
+        ESP_ERROR_CHECK(cloud_link_start());
+#else
         ESP_ERROR_CHECK(telegram_bot_start());
+#endif
         ESP_ERROR_CHECK(feishu_bot_start());
         cron_service_start();
         heartbeat_start();
         ESP_ERROR_CHECK(ws_server_start());
         config_sync_start();
 
-        /* VOICE DISABLED (field debug 2026-10-07): "Hi ESP" wake-word listener
-         * and mic pipeline intentionally OFF. The esp-sr stack is a large
-         * internal-RAM consumer and TTS fetches hold a socket for up to 30 s;
-         * lwIP socket starvation was breaking all connections (LAN included).
-         * Re-enable once the socket fixes are proven stable. */
-        /* esp_err_t v_err = voice_client_start();
+        /* Hands-free wake word listener ("Hi ESP" -> Yes? -> command -> speaker) */
+        esp_err_t v_err = voice_client_start();
         if (v_err != ESP_OK) {
             ESP_LOGW(TAG, "voice wake listener not started: %s", esp_err_to_name(v_err));
-        } */
+        }
 
         /* mDNS resolve of backend URL — deliberately LAST so the internal-RAM
          * mDNS task doesn't starve boot-time task creation; falls back to the
          * compile-time IP until discovery succeeds. */
         backend_discovery_start();
+
+        /* The boot-time fetch above used the compiled-in IP and likely failed;
+         * retry in the background once mDNS has found the real address. */
+        xTaskCreate(remote_tools_fetch_task, "tools_fetch", 8192, NULL,
+                    tskIDLE_PRIORITY + 2, NULL);
 
         ESP_LOGI(TAG, "All services started!");
         display_status_idle();   /* shows "Hi ESP to wake" */

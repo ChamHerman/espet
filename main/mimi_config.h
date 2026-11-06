@@ -101,6 +101,14 @@
 #endif
 #define MIMI_BACKEND_URL             "http://" BACKEND_IP ":8000"
 #define MIMI_BACKEND_API_KEY         "espet_secret_device_key_2026"
+
+/* --- Hybrid mode (Plan C-Hybrid): cloud gateway owns Telegram polling --- */
+/* When 1: the device does NOT start telegram_bot polling; it keeps ONE
+ * persistent WebSocket to the backend (/ws/device) which relays messages.
+ * The backend must have CLOUD_GATEWAY_ENABLED=true + TELEGRAM_BOT_TOKEN set. */
+#ifndef MIMI_CLOUD_LINK_ENABLE
+#define MIMI_CLOUD_LINK_ENABLE 1
+#endif
 #define MIMI_LLM_API_VERSION         "2023-06-01"
 #define MIMI_LLM_STREAM_BUF_SIZE     (32 * 1024)
 #define MIMI_LLM_LOG_VERBOSE_PAYLOAD 0
@@ -142,9 +150,8 @@
 #define MIMI_GPIO_CONFIG_SECTION 1 /* enable GPIO tools */
 #define MIMI_GPIO_OLED_SCL 2       /* SSD1306 OLED SCL/SCK (was 21) */
 #define MIMI_GPIO_OLED_SDA 1       /* SSD1306 OLED SDA (was 47) */
-#define MIMI_GPIO_BTN_CAM 41       /* Camera Push Button (Input Pull-Up): short=snap, hold=video (was "green PTT") */
+#define MIMI_GPIO_BTN_CAM 41       /* Camera Push Button (Input Pull-Up): short=snap photo, hold=video */
 #define MIMI_GPIO_BTN_WHITE -1     /* (Unassigned) */
-#define MIMI_GPIO_BTN_PTT -1       /* PTT retired - voice uses on-device wake word (esp-sr WakeNet) */
 #define MIMI_GPIO_LED_WHITE 42     /* White LED Output (was 40) */
 #define MIMI_GPIO_I2S_BCLK 38      /* Shared Audio BCLK / SCK (Mic + Amp) (was 41) */
 #define MIMI_GPIO_I2S_WS 39        /* Shared Audio WS / LRC (Mic + Amp) (was 42) */

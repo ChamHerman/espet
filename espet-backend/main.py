@@ -23,7 +23,9 @@ from api.auth_router import router as auth_router
 from api.config_router import router as config_router
 from api.voice_router import router as voice_router
 from api.ui_router import router as ui_router
+from api.cloud_router import router as cloud_router
 from mcp.client import mcp_client_manager
+from config import settings
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -77,6 +79,7 @@ async def lifespan(app: FastAPI):
         mdns_info = ServiceInfo(
             "_espet._tcp.local.",
             "espet-backend._espet._tcp.local.",
+            server="espet-backend.local.",
             addresses=[socket.inet_aton(lan_ip)],
             port=settings.port,
             properties={"version": "1"},
@@ -89,10 +92,22 @@ async def lifespan(app: FastAPI):
         logger.warning(f"mDNS advertisement skipped ({type(e).__name__}: {e!r}) — "
                        f"ESP32 will use compiled-in fallback IP")
 
+    # Hybrid mode cloud gateway: poll Telegram for the device and route
+    # frames over the device's persistent WebSocket (api/cloud_router.py).
+    # Token/enabled come from the dashboard-editable gateway settings store
+    # (falls back to .env); restart_gateway() no-ops when disabled.
+    from api.cloud_router import restart_gateway
+    restart_gateway()
+
     yield  # App is running
 
     # Shutdown
     logger.info("Shutting down ESPET Backend Server...")
+    from services.telegram_gateway import get_gateway as _get_gw, set_gateway as _set_gw
+    _gw = _get_gw()
+    if _gw:
+        await _gw.stop()
+        _set_gw(None)
     if mdns_zc and mdns_info:
         try:
             await mdns_zc.async_unregister_service(mdns_info)
@@ -146,6 +161,15 @@ app.include_router(tools_router)
 app.include_router(auth_router)
 app.include_router(config_router)
 app.include_router(voice_router)
+app.include_router(cloud_router)
+
+# Alias /ws/device -> /api/cloud/ws/device for firmware compatibility
+from fastapi import Query, WebSocket
+from api.cloud_router import ws_device as _cloud_ws_device
+
+@app.websocket("/ws/device")
+async def ws_device_alias(websocket: WebSocket, key: str = Query("")):
+    await _cloud_ws_device(websocket, key)
 
 # Dashboard assets (css/js) — GET / itself is served by ui_router
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")

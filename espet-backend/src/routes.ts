@@ -31,6 +31,14 @@ export const PRIMARY: ViewMeta[] = [
       "Your agent, styled by its own settings — personality, memory and schedules shape the look.",
   },
   {
+    id: "cloud",
+    label: "Cloud",
+    icon: "server",
+    title: "Cloud Gateway",
+    subtitle:
+      "Hybrid Mode configuration: Telegram bot poller, server-side LLM relay, and chat bindings.",
+  },
+  {
     id: "chat",
     label: "Chat",
     icon: "message",

@@ -148,6 +148,22 @@ volatile uint32_t s_feeder_reads  = 0;   /* dma read calls with data */
 volatile uint32_t s_feeder_zeros  = 0;   /* all-zero reads (no mic data!) */
 volatile uint32_t s_ring_written  = 0;   /* samples pushed into ring */
 
+/* Ambient noise floor (RMS) for the wake VAD, estimated HERE because this
+ * task runs continuously. An estimator living in voice_task never converged:
+ * each false trigger blocks that task for 1.5 s capture + seconds of STT, so
+ * the field log showed the threshold crawling 420 -> 1068 over two minutes
+ * while the room sat at ~9000 RMS.
+ *
+ * Algorithm: sliding-window MINIMUM of per-read RMS (~4 s window). The room
+ * noise here is STATIONARY (fan/TV/electrical hum, ~9000 RMS steady) while
+ * speech is TRANSIENT, so a minimum locks onto the stationary floor and cannot
+ * be dragged up mid-utterance (the window still holds seconds of pre-speech
+ * noise). It converges on the first read at boot, so a loud room is handled
+ * immediately. Full-window flush (~4 s) is the cost of a sudden level change;
+ * the existing deglitch filter already suppresses single-sample rail pops. */
+#define MIC_FLOOR_WIN 256   /* reads ≈ 4 s of audio (256 frames/read @16 kHz) */
+volatile int32_t  s_mic_floor      = 0;
+
 static void mic_feeder_task(void *arg);
 static uint32_t      s_record_start_ms        = 0;
 static uint32_t      s_record_duration_ms     = 0;
@@ -588,7 +604,12 @@ static void capture_task(void *arg)
         size_t frames_read = bytes_read / (2 * sizeof(int32_t));
         for (size_t f = 0; f < frames_read && s_pcm_samples_captured < AUDIO_MAX_SAMPLES; f++) {
             int32_t raw_left = dma_buf[f * 2];
-            s_pcm_buf[s_pcm_samples_captured++] = (int16_t)(raw_left >> 16);
+            int32_t s = (raw_left >> 16);
+            /* +8 dB digital gain boost (2.5x) with clamp, matching mic_feeder_task */
+            s = (s * 5) / 2;
+            if (s > INT16_MAX) s = INT16_MAX;
+            else if (s < INT16_MIN) s = INT16_MIN;
+            s_pcm_buf[s_pcm_samples_captured++] = (int16_t)s;
         }
 
         /* Progress log every ~1 second */
@@ -628,44 +649,93 @@ static void capture_task(void *arg)
  * ===================================================================== */
 static void mic_feeder_task(void *arg)
 {
-    /* Descriptor-granular: the driver may return up to 4 DMA descriptors
-     * (~128 ms) per call. The old 256-frame clamp silently discarded 75%
-     * of the mic audio (field: ~4000 samples/s harvested vs 16000 made).
-     * 16 KB static internal buffer (DMA-capable). */
-    static int32_t dma_buf[4096];
+    ESP_LOGI(TAG, "mic_feeder_task started (chunk=%u bytes, timeout=%d ms)",
+             (unsigned)AUDIO_READ_CHUNK_BYTES, AUDIO_READ_TIMEOUT_MS);
+    static int32_t dma_buf[AUDIO_READ_CHUNK_FRAMES * 2];
     while (s_feeder_run) {
-        /* Park during a speaker session (TTS download + playback): I2S TX
-         * needs the bus/CPU and racing it corrupted the audio (field: noise
-         * burst instead of speech). RX DMA overruns during the pause —
-         * inaudible; consumers flush the ring afterwards. */
-        if (s_playing || s_speaker_busy) {
+        /* Park during a speaker session or standalone recording test: I2S TX
+         * needs the bus/CPU, or audio_record_test owns RX DMA. */
+        if (s_capture_task_handle || s_playing || s_speaker_busy) {
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
         size_t bytes_read = 0;
         esp_err_t err = i2s_channel_read(s_rx_handle, dma_buf, sizeof(dma_buf),
-                                         &bytes_read, pdMS_TO_TICKS(200));
-        if (err != ESP_OK || bytes_read == 0) {
+                                         &bytes_read, pdMS_TO_TICKS(AUDIO_READ_TIMEOUT_MS));
+        if (bytes_read == 0) {
+            static int64_t s_last_feeder_err = 0;
+            int64_t now_ms = esp_timer_get_time() / 1000;
+            if (now_ms - s_last_feeder_err >= 5000) {
+                s_last_feeder_err = now_ms;
+                ESP_LOGW(TAG, "[feeder] i2s_channel_read failed: %s (bytes_read=0)",
+                         esp_err_to_name(err));
+            }
             vTaskDelay(1);
             continue;
         }
         size_t frames = bytes_read / (2 * sizeof(int32_t));
         s_feeder_reads++;
         int32_t frame_energy = 0;
+        int64_t sumsq = 0;
+        static int16_t s_prev_sample = 0;
+        static int32_t s_dc_x_prev = 0;
+        static int32_t s_dc_y_prev = 0;
         for (size_t f = 0; f < frames; f++) {
-            int16_t s = (int16_t)(dma_buf[f * 2] >> 16);
-            frame_energy += (s < 0 ? -s : s);
-            size_t used = (s_rx_ring_w - s_rx_ring_r) & RX_RING_MASK;
-            if (used >= RX_RING_SAMPLES - 1) {
-                break;   /* ring full — backpressure: keep what's buffered,
-                          * drop the rest of THIS read (newest audio) */
+            int32_t raw = (int32_t)(dma_buf[f * 2] >> 16);
+            /* 2.5x digital gain (+8 dB) so speech easily reaches WakeNet threshold */
+            int32_t boosted = (raw * 5) / 2;
+            if (boosted > 32767) boosted = 32767;
+            else if (boosted < -32768) boosted = -32768;
+
+            /* 1st-order DC-blocking high-pass filter (fc ≈ 20Hz at 16kHz):
+             * y[n] = x[n] - x[n-1] + (254/256) * y[n-1]
+             * Removes hardware DC offset, ground-bounce & OLED charge-pump DC ripple */
+            int32_t y_hp = boosted - s_dc_x_prev + ((s_dc_y_prev * 254) >> 8);
+            s_dc_x_prev = boosted;
+            s_dc_y_prev = y_hp;
+            if (y_hp > 32767) y_hp = 32767;
+            else if (y_hp < -32768) y_hp = -32768;
+            int16_t s = (int16_t)y_hp;
+
+            /* Deglitch filter: suppress single-sample full-scale rail pops */
+            int32_t diff = (int32_t)s - (int32_t)s_prev_sample;
+            if ((s >= 32000 || s <= -32000) && (diff > 20000 || diff < -20000)) {
+                s = s_prev_sample;
+            } else {
+                s_prev_sample = s;
             }
-            s_rx_ring[s_rx_ring_w] = s;
-            s_rx_ring_w = (s_rx_ring_w + 1) & RX_RING_MASK;
-            s_ring_written++;
+
+            frame_energy += (s < 0 ? -s : s);
+            sumsq += (int64_t)s * (int64_t)s;
+            size_t used = (s_rx_ring_w - s_rx_ring_r) & RX_RING_MASK;
+            if (used < RX_RING_SAMPLES - 1) {
+                s_rx_ring[s_rx_ring_w] = s;
+                s_rx_ring_w = (s_rx_ring_w + 1) & RX_RING_MASK;
+                s_ring_written++;
+            }
         }
         if (frame_energy == 0) {
             s_feeder_zeros++;   /* whole read was exact zeros — mic not clocking! */
+        }
+
+        /* Ambient floor update (see s_mic_floor comment): sliding-window
+         * minimum of per-read RMS. Runs every ~16 ms of audio regardless of
+         * what voice_task is doing, so the wake VAD's threshold is always
+         * current — including while a capture or STT call blocks the listener. */
+        if (frames > 0) {
+            int32_t rms = (int32_t)sqrt((double)sumsq / (double)frames);
+            if (rms > 0) {
+                static int32_t win[MIC_FLOOR_WIN];
+                static int win_pos = 0, win_n = 0;
+                win[win_pos] = rms;
+                win_pos = (win_pos + 1) % MIC_FLOOR_WIN;
+                if (win_n < MIC_FLOOR_WIN) win_n++;
+                int32_t mn = win[0];
+                for (int i = 1; i < win_n; i++) {
+                    if (win[i] < mn) mn = win[i];
+                }
+                s_mic_floor = mn;
+            }
         }
         /* Pace: each read grabs ~32 ms of audio instantly (DMA is always
          * full). Without a yield this task spins at prio 7 and starves
@@ -727,16 +797,6 @@ void tool_audio_rx_stream_stop(void)
     /* task self-deletes; do not wait here */
 }
 
-void tool_audio_speaker_session_begin(void)
-{
-    s_speaker_busy = true;
-}
-
-void tool_audio_speaker_session_end(void)
-{
-    s_speaker_busy = false;
-}
-
 /* Pull up to max_out samples from the ring. Returns samples written. */
 size_t tool_audio_ring_read(int16_t *out, size_t max_out, uint32_t timeout_ms)
 {
@@ -765,6 +825,49 @@ size_t tool_audio_ring_available(void)
 void tool_audio_ring_flush(void)
 {
     s_rx_ring_r = s_rx_ring_w;   /* drop everything buffered */
+}
+
+/* Drain any queued RX data so a capture starts "now", not with
+ * audio buffered while the bus was idle or speaker was active. */
+void tool_audio_rx_flush(void)
+{
+    if (!s_rx_handle) {
+        return;
+    }
+    int32_t scratch[AUDIO_READ_CHUNK_FRAMES * 2];
+    size_t bytes = 0;
+    int loops = 0;
+    while (loops++ < 32 &&
+           i2s_channel_read(s_rx_handle, scratch, sizeof(scratch),
+                            &bytes, 0) == ESP_OK && bytes > 0) {
+        /* keep draining until dry */
+    }
+}
+
+/* Clear all audio caches (drains both I2S hardware DMA FIFO and software ring buffer) */
+void tool_audio_clear_cache(void)
+{
+    if (!s_i2s_initialized) {
+        return;
+    }
+    bool was_busy = s_speaker_busy;
+    s_speaker_busy = true;
+    vTaskDelay(pdMS_TO_TICKS(15));
+    tool_audio_rx_flush();
+    tool_audio_ring_flush();
+    s_speaker_busy = was_busy;
+}
+
+void tool_audio_speaker_session_begin(void)
+{
+    s_speaker_busy = true;
+}
+
+void tool_audio_speaker_session_end(void)
+{
+    tool_audio_rx_flush();
+    tool_audio_ring_flush();
+    s_speaker_busy = false;
 }
 
 /* =======================================================================
@@ -830,25 +933,16 @@ bool tool_audio_is_busy(void)
     return s_recording || s_playing;
 }
 
-/* Drain any queued RX data so a command capture starts "now", not with
- * audio buffered while the bus was idle. Call right before arming. */
-void tool_audio_rx_flush(void)
-{
-    if (!s_rx_handle) {
-        return;
-    }
-    int32_t scratch[AUDIO_READ_CHUNK_FRAMES * 2];
-    size_t bytes = 0;
-    while (i2s_channel_read(s_rx_handle, scratch, sizeof(scratch),
-                            &bytes, 0) == ESP_OK && bytes > 0) {
-        /* keep draining until dry */
-    }
-}
 
 /* Start capturing into s_pcm_buf WITHOUT a worker task: the caller's task
  * pumps tool_audio_rx_read() itself (the wake listener loop already exists,
  * no need for a second task). Returns false if busy. */
 bool tool_audio_capture_arm(size_t max_samples)
+{
+    return tool_audio_capture_arm_preroll(max_samples, 0);
+}
+
+bool tool_audio_capture_arm_preroll(size_t max_samples, size_t preroll_samples)
 {
     if (!s_i2s_initialized || s_recording || s_playing) {
         return false;
@@ -856,7 +950,16 @@ bool tool_audio_capture_arm(size_t max_samples)
     s_pcm_samples_captured = 0;
     s_capture_max = (max_samples > AUDIO_MAX_SAMPLES) ? AUDIO_MAX_SAMPLES : max_samples;
     s_record_start_ms = (uint32_t)(esp_timer_get_time() / 1000);
-    tool_audio_ring_flush();   /* stale buffered audio out; capture starts now */
+
+    if (preroll_samples == 0) {
+        tool_audio_ring_flush();   /* stale buffered audio out; capture starts now */
+    } else if (s_rx_ring) {
+        if (preroll_samples > RX_RING_SAMPLES / 2) preroll_samples = RX_RING_SAMPLES / 2;
+        s_rx_ring_r = (s_rx_ring_w >= preroll_samples)
+                      ? (s_rx_ring_w - preroll_samples)
+                      : (RX_RING_SAMPLES - (preroll_samples - s_rx_ring_w));
+        s_rx_ring_r &= RX_RING_MASK;
+    }
     s_recording = true;
     return true;
 }
@@ -1084,10 +1187,10 @@ static esp_err_t audio_play_tone_execute(const char *input_json, char *output, s
     return (err == ESP_OK) ? ESP_OK : ESP_FAIL;
 }
 
-/* audio_record_test — timed capture triggered by LLM / serial */
+/* audio_record_test — timed capture triggered by LLM / serial + STT test */
 static esp_err_t audio_record_test_execute(const char *input_json, char *output, size_t output_size)
 {
-    uint32_t duration_ms = 3000;
+    uint32_t duration_ms = 4000;
     if (input_json) {
         cJSON *j = cJSON_Parse(input_json);
         if (j) {
@@ -1099,7 +1202,8 @@ static esp_err_t audio_record_test_execute(const char *input_json, char *output,
         }
     }
 
-    ESP_LOGI(TAG, "[MIC-TEST] Triggered %lu ms timed recording", (unsigned long)duration_ms);
+    ESP_LOGI(TAG, "🎙️ [STT-TEST] Starting %lu ms recording — speak into mic now...", (unsigned long)duration_ms);
+    tool_audio_beep(880, 150, 0.4f);   /* short cue beep */
 
     size_t   n  = 0;
     uint32_t dur = 0;
@@ -1113,14 +1217,25 @@ static esp_err_t audio_record_test_execute(const char *input_json, char *output,
         return err;
     }
 
-    snprintf(output, output_size,
-             "{\"sample_count\":%u,\"duration_ms\":%u,\"sample_rate\":%d,"
-             "\"rms\":%.1f,\"min\":%d,\"max\":%d,\"verdict\":\"%s\"}",
-             (unsigned)n, (unsigned)dur, AUDIO_SAMPLE_RATE,
-             rms, (int)mn, (int)mx, mic_verdict(rms));
-
     dump_capture_stats();
-    /* TODO [PIPELINE-1]: POST s_pcm_buf to backend here */
+
+    ESP_LOGI(TAG, "🎙️ [STT-TEST] Sending audio to backend (/api/voice/transcribe)...");
+    char *transcript = voice_client_transcribe(s_pcm_buf, n);
+    if (transcript && strlen(transcript) > 0) {
+        ESP_LOGI(TAG, "=================================================");
+        ESP_LOGI(TAG, "🎉 [STT RESULT]: \"%s\"", transcript);
+        ESP_LOGI(TAG, "=================================================");
+        snprintf(output, output_size,
+                 "{\"sample_count\":%u,\"duration_ms\":%u,\"rms\":%.1f,\"verdict\":\"%s\",\"transcript\":\"%s\"}",
+                 (unsigned)n, (unsigned)dur, rms, mic_verdict(rms), transcript);
+        free(transcript);
+    } else {
+        ESP_LOGW(TAG, "⚠️ [STT RESULT]: (no speech recognized or empty)");
+        snprintf(output, output_size,
+                 "{\"sample_count\":%u,\"duration_ms\":%u,\"rms\":%.1f,\"verdict\":\"%s\",\"transcript\":\"\"}",
+                 (unsigned)n, (unsigned)dur, rms, mic_verdict(rms));
+        if (transcript) free(transcript);
+    }
     return ESP_OK;
 }
 

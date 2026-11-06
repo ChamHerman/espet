@@ -1,6 +1,7 @@
 #include "llm_proxy.h"
 #include "mimi_config.h"
 #include "proxy/http_proxy.h"
+#include "channels/cloud_link/cloud_link.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -358,8 +359,29 @@ static esp_err_t llm_http_via_proxy(const char *post_data, resp_buf_t *rb, int *
 
 /* ── Shared HTTP dispatch ─────────────────────────────────────── */
 
+static bool llm_via_cloud(void)
+{
+#if MIMI_CLOUD_LINK_ENABLE
+    /* Hybrid mode: the backend holds the API key — whenever the cloud link
+     * is up the request is tunneled through it (no local key needed). */
+    return cloud_link_is_connected();
+#else
+    return false;
+#endif
+}
+
 static esp_err_t llm_http_call(const char *post_data, resp_buf_t *rb, int *out_status)
 {
+    if (llm_via_cloud()) {
+        size_t got = 0;
+        esp_err_t err = cloud_link_llm_request(post_data, strlen(post_data),
+                                               rb->data, rb->cap, &got,
+                                               out_status, 120000);
+        if (err == ESP_OK) {
+            rb->len = got;
+        }
+        return err;
+    }
     if (http_proxy_is_enabled()) {
         return llm_http_via_proxy(post_data, rb, out_status);
     } else {
@@ -558,7 +580,7 @@ esp_err_t llm_chat_tools(const char *system_prompt,
 {
     memset(resp, 0, sizeof(*resp));
 
-    if (s_api_key[0] == '\0') return ESP_ERR_INVALID_STATE;
+    if (s_api_key[0] == '\0' && !llm_via_cloud()) return ESP_ERR_INVALID_STATE;
 
     /* Build request body (non-streaming) */
     cJSON *body = cJSON_CreateObject();

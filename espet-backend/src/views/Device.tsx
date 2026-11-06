@@ -58,10 +58,16 @@ export function DeviceView() {
 
   const channels = [
     {
-      name: "Telegram",
-      meta: "Bot token stored on the device (NVS — set via serial CLI). Cron jobs and the agent can deliver messages to any chat ID.",
-      badge: "On device",
+      name: "Hybrid Cloud Gateway & LLM Relay",
+      meta: "Backend polls Telegram and injects LLM API key; device connects via persistent WebSocket. Configure at /cloud.",
+      badge: "Cloud Mode (/cloud)",
       tone: "success" as const,
+    },
+    {
+      name: "Telegram (Direct)",
+      meta: "Bot token stored on the device (NVS — set via serial CLI). Cron jobs and the agent can deliver messages to any chat ID.",
+      badge: "Direct Mode",
+      tone: "default" as const,
     },
     {
       name: "Feishu / Lark",
@@ -243,6 +249,20 @@ export function DeviceView() {
             <div className={styles.cardTitle}>
               <Icon name="send" /> Messaging channels
             </div>
+            <a
+              href="/cloud"
+              style={{
+                fontSize: 12,
+                color: "#93c5fd",
+                textDecoration: "none",
+                padding: "3px 10px",
+                borderRadius: 999,
+                border: "1px solid rgba(147,197,253,0.3)",
+                background: "rgba(147,197,253,0.08)",
+              }}
+            >
+              Configure Cloud Gateway ↗
+            </a>
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: 9 }}>
             {channels.map((c) => (

@@ -10,6 +10,7 @@
 #define MIMI_CHAN_WEBSOCKET  "websocket"
 #define MIMI_CHAN_CLI        "cli"
 #define MIMI_CHAN_SYSTEM     "system"
+#define MIMI_CHAN_CLOUD      "cloud"
 
 /* Message types on the bus */
 typedef struct {

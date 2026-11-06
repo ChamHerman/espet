@@ -40,16 +40,46 @@ class Settings(BaseSettings):
 
     # --- Voice pipeline (STT/TTS) ---
     # STT: faster-whisper model size: tiny, base, small, medium...
-    voice_stt_model: str = "base"
+    voice_stt_model: str = "small"
     # None = auto-detect language; "en"/"zh" forces a language
     voice_language: str | None = None
     # TTS: edge-tts voice (neural, free). zh-CN = Mandarin, zh-HK = Cantonese:
     #   zh-CN-XiaoxiaoNeural (female) / zh-CN-YunxiNeural (male)
     #   zh-HK-HiuMaanNeural / en-US-AriaNeural ...
     voice_tts_voice: str = "zh-CN-XiaoxiaoNeural"
+    # Comma-separated wake words checked against transcripts (case-insensitive)
+    voice_wake_words: str = "expert,hey expert,hi expert,espet,hey espet,mimi,hey mimi,hi mimi,ok mimi,hi esp,米米,咪咪,小米"
+    # Whisper initial_prompt. Leave EMPTY unless you know what you are doing:
+    # putting the wake words here biases the decoder and was verified to turn
+    # room noise / speaker echo into exactly the wake word (endless self-wake).
+    voice_stt_prompt: str = ""
+    # Reject wake matches below this confidence. faster-whisper reports
+    # avg_logprob per segment; genuine wake utterances measure > -1.0 on this
+    # pipeline while noise/echo hallucinations sit lower.
+    voice_min_avg_logprob: float = -1.1
+    # Reject wake matches when Whisper itself says "probably not speech".
+    # Noise hallucinations measured 0.79~0.91; real speech stays < 0.6.
+    voice_max_no_speech_prob: float = 0.75
+    # Skip STT entirely when the capture is near-silent (RMS below this).
+    voice_min_rms: float = 250
 
     # --- Database ---
     db_path: str = "db/tokens.db"
+
+    # --- Hybrid mode cloud gateway (Telegram & LLM relay for the device) ---
+    # When enabled, the backend polls Telegram for the device (single poller)
+    # and routes messages over the device's persistent WebSocket /ws/device.
+    # The device sets MIMI_CLOUD_LINK_ENABLE=1 and stops polling on its own.
+    cloud_gateway_enabled: bool = False
+    telegram_bot_token: str = ""
+    telegram_poll_interval_s: float = 0.0
+    # Overridable for tests (mock Telegram server)
+    telegram_api_base: str = "https://api.telegram.org"
+
+    # Server-side LLM relay (hybrid mode: device holds no API keys)
+    llm_api_key: str = ""
+    llm_base_url: str = "https://api.openai.com/v1"
+    llm_model: str = ""
 
     model_config = {
         "env_file": ".env",
