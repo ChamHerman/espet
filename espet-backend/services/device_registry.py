@@ -78,6 +78,16 @@ class DeviceRegistry:
         with self._lock:
             return list(self.connections.keys())
 
+    def get_connection(self, device_id: str | None = None):
+        """Returns (device_id, websocket) for the specified device or the first connected device."""
+        with self._lock:
+            if device_id and device_id in self.connections:
+                return device_id, self.connections[device_id]
+            if self.connections:
+                did = next(iter(self.connections))
+                return did, self.connections[did]
+            return None, None
+
     # ------------------------------------------------------------- bindings
 
     def bind(self, chat_id: str | int, device_id: str) -> None:

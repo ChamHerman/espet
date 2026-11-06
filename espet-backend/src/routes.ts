@@ -1,4 +1,4 @@
-/* Route table — hash router. Home / Agent / Chat are primary pages; Assistant
+/* Route table — hash router. Home / Cloud / Chat / Camera are primary pages; Assistant
    and System are single scroll pages whose sections (the old standalone views)
    are reached via the right-side bubble rail or deep links like
    #assistant/memory (bare #memory still works as an alias). */
@@ -21,14 +21,6 @@ export const PRIMARY: ViewMeta[] = [
     title: "Overview",
     subtitle:
       "Live status of the backend, Google services, and the device configuration.",
-  },
-  {
-    id: "agent",
-    label: "Agent",
-    icon: "bot",
-    title: "Agent",
-    subtitle:
-      "Your agent, styled by its own settings — personality, memory and schedules shape the look.",
   },
   {
     id: "cloud",

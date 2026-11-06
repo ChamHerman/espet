@@ -599,14 +599,12 @@ static void capture_task(void *arg)
         /* Reset consecutive timeout counter on successful read */
         timeout_count = 0;
 
-        /* Convert stereo 32-bit frames → mono int16_t
-         * buf layout: [L0][R0][L1][R1]...  L = INMP441 data */
-        size_t frames_read = bytes_read / (2 * sizeof(int32_t));
-        for (size_t f = 0; f < frames_read && s_pcm_samples_captured < AUDIO_MAX_SAMPLES; f++) {
-            int32_t raw_left = dma_buf[f * 2];
+        /* Convert 32-bit DMA data → mono int16_t.
+         * When slot_mask = I2S_STD_SLOT_LEFT, DMA buffer holds single 32-bit words per sample. */
+        size_t samples_read = bytes_read / sizeof(int32_t);
+        for (size_t f = 0; f < samples_read && s_pcm_samples_captured < AUDIO_MAX_SAMPLES; f++) {
+            int32_t raw_left = dma_buf[f];
             int32_t s = (raw_left >> 16);
-            /* +8 dB digital gain boost (2.5x) with clamp, matching mic_feeder_task */
-            s = (s * 5) / 2;
             if (s > INT16_MAX) s = INT16_MAX;
             else if (s < INT16_MIN) s = INT16_MIN;
             s_pcm_buf[s_pcm_samples_captured++] = (int16_t)s;
@@ -677,13 +675,21 @@ static void mic_feeder_task(void *arg)
         s_feeder_reads++;
         int32_t frame_energy = 0;
         int64_t sumsq = 0;
+        int64_t sumsq_l = 0;
+        int64_t sumsq_r = 0;
         static int16_t s_prev_sample = 0;
         static int32_t s_dc_x_prev = 0;
         static int32_t s_dc_y_prev = 0;
+        static int s_active_slot = 0; /* 0 = Left (L/R=GND), 1 = Right (L/R=3.3V/float) */
+
         for (size_t f = 0; f < frames; f++) {
-            int32_t raw = (int32_t)(dma_buf[f * 2] >> 16);
-            /* 2.5x digital gain (+8 dB) so speech easily reaches WakeNet threshold */
-            int32_t boosted = (raw * 5) / 2;
+            int32_t raw_l = (int32_t)(dma_buf[f * 2] >> 16);
+            int32_t raw_r = (int32_t)(dma_buf[f * 2 + 1] >> 16);
+            sumsq_l += (int64_t)raw_l * (int64_t)raw_l;
+            sumsq_r += (int64_t)raw_r * (int64_t)raw_r;
+
+            int32_t raw = (s_active_slot == 1) ? raw_r : raw_l;
+            int32_t boosted = raw;
             if (boosted > 32767) boosted = 32767;
             else if (boosted < -32768) boosted = -32768;
 
@@ -692,9 +698,9 @@ static void mic_feeder_task(void *arg)
              * Removes hardware DC offset, ground-bounce & OLED charge-pump DC ripple */
             int32_t y_hp = boosted - s_dc_x_prev + ((s_dc_y_prev * 254) >> 8);
             s_dc_x_prev = boosted;
-            s_dc_y_prev = y_hp;
             if (y_hp > 32767) y_hp = 32767;
             else if (y_hp < -32768) y_hp = -32768;
+            s_dc_y_prev = y_hp;
             int16_t s = (int16_t)y_hp;
 
             /* Deglitch filter: suppress single-sample full-scale rail pops */
@@ -712,6 +718,27 @@ static void mic_feeder_task(void *arg)
                 s_rx_ring[s_rx_ring_w] = s;
                 s_rx_ring_w = (s_rx_ring_w + 1) & RX_RING_MASK;
                 s_ring_written++;
+            }
+        }
+
+        /* Check if INMP441 L/R pin is swapped (e.g. L/R pulled to VDD or floating) */
+        if (frames > 0) {
+            int32_t rms_l = (int32_t)sqrt((double)sumsq_l / (double)frames);
+            int32_t rms_r = (int32_t)sqrt((double)sumsq_r / (double)frames);
+            static int64_t s_last_lr_check = 0;
+            int64_t now_ms = esp_timer_get_time() / 1000;
+            if (now_ms - s_last_lr_check >= 5000) {
+                s_last_lr_check = now_ms;
+                if (s_active_slot == 0 && rms_l > 25000 && rms_r > 300 && rms_r < 20000) {
+                    ESP_LOGW(TAG, "MIC AUTO-SWITCH: Left channel railed (rms=%d) but Right channel healthy (rms=%d). "
+                                  "INMP441 L/R pin is floating or on 3.3V -> auto-switched to Right channel",
+                             (int)rms_l, (int)rms_r);
+                    s_active_slot = 1;
+                } else if (s_active_slot == 1 && rms_r > 25000 && rms_l > 300 && rms_l < 20000) {
+                    ESP_LOGW(TAG, "MIC AUTO-SWITCH: Right channel railed (rms=%d) -> auto-switched to Left channel",
+                             (int)rms_r);
+                    s_active_slot = 0;
+                }
             }
         }
         if (frame_energy == 0) {
@@ -1036,6 +1063,54 @@ const int16_t *tool_audio_get_last_capture(size_t *out_samples, uint32_t *out_du
     if (out_samples)     *out_samples     = s_pcm_samples_captured;
     if (out_duration_ms) *out_duration_ms = s_record_duration_ms;
     return (s_pcm_samples_captured > 0) ? s_pcm_buf : NULL;
+}
+
+esp_err_t tool_audio_manual_record_start(void)
+{
+    if (!s_i2s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_recording || s_playing) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    tool_audio_clear_cache();
+    s_recording = true;
+    BaseType_t ret = xTaskCreatePinnedToCore(
+        capture_task, "audio_cap_t", 4096, NULL,
+        7, &s_capture_task_handle, 1);
+    if (ret != pdPASS) {
+        s_recording = false;
+        return ESP_FAIL;
+    }
+    tool_audio_beep(880, 100, 0.3f);
+    return ESP_OK;
+}
+
+esp_err_t tool_audio_manual_record_stop(size_t *out_samples, uint32_t *out_dur_ms, double *out_rms)
+{
+    if (!s_recording) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_recording = false;
+
+    uint32_t wait_ms = 0;
+    while (s_capture_task_handle != NULL && wait_ms < 1500) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        wait_ms += 10;
+    }
+
+    size_t n = s_pcm_samples_captured;
+    int64_t ssq = 0;
+    for (size_t i = 0; i < n; i++) {
+        int16_t s = s_pcm_buf[i];
+        ssq += (int64_t)s * s;
+    }
+
+    if (out_samples) *out_samples = n;
+    if (out_dur_ms)  *out_dur_ms  = s_record_duration_ms;
+    if (out_rms)     *out_rms     = (n > 0) ? sqrt((double)ssq / (double)n) : 0.0;
+    return ESP_OK;
 }
 
 /* =======================================================================

@@ -178,6 +178,16 @@ void tool_audio_speaker_session_end(void);
  */
 const int16_t *tool_audio_get_last_capture(size_t *out_samples, uint32_t *out_duration_ms);
 
+/**
+ * @brief Start manual recording into the internal PCM buffer on demand.
+ */
+esp_err_t tool_audio_manual_record_start(void);
+
+/**
+ * @brief Stop manual recording and compute stats.
+ */
+esp_err_t tool_audio_manual_record_stop(size_t *out_samples, uint32_t *out_dur_ms, double *out_rms);
+
 /* -----------------------------------------------------------------------
  * WAV playback — voice pipeline output [PIPELINE-4]
  * --------------------------------------------------------------------- */

@@ -25,6 +25,8 @@
 #include "freertos/task.h"
 #include "mimi_config.h"
 #include "sync/backend_discovery.h"
+#include "tools/tool_audio.h"
+#include "voice/voice_client.h"
 
 #include "bus/message_bus.h"
 
@@ -138,6 +140,44 @@ static void handle_frame(char *json_str)
                 xSemaphoreGive(s_llm_sema);
             }
         }
+    } else if (strcmp(type_str, "record_start") == 0) {
+        esp_err_t err = tool_audio_manual_record_start();
+        char resp[128];
+        snprintf(resp, sizeof(resp),
+                 "{\"type\":\"record_status\",\"status\":\"%s\",\"ok\":%s}",
+                 (err == ESP_OK) ? "recording" : "error",
+                 (err == ESP_OK) ? "true" : "false");
+        send_json(resp);
+    } else if (strcmp(type_str, "record_stop") == 0) {
+        size_t samples = 0;
+        uint32_t dur = 0;
+        double rms = 0.0;
+        esp_err_t err = tool_audio_manual_record_stop(&samples, &dur, &rms);
+        if (err != ESP_OK || samples == 0) {
+            char resp[128];
+            snprintf(resp, sizeof(resp),
+                     "{\"type\":\"record_result\",\"ok\":false,\"error\":\"no_audio\"}");
+            send_json(resp);
+        } else {
+            const int16_t *pcm = tool_audio_get_last_capture(&samples, &dur);
+            char *transcript = (pcm && samples > 0) ? voice_client_transcribe(pcm, samples) : NULL;
+            char resp[512];
+            snprintf(resp, sizeof(resp),
+                     "{\"type\":\"record_result\",\"ok\":true,\"samples\":%u,\"duration_ms\":%u,\"rms\":%.1f,\"transcript\":\"%s\"}",
+                     (unsigned)samples, (unsigned)dur, rms,
+                     transcript ? transcript : "");
+            send_json(resp);
+            if (transcript) free(transcript);
+        }
+    } else if (strcmp(type_str, "voice_listen") == 0) {
+        const cJSON *en = cJSON_GetObjectItem(root, "enabled");
+        bool enable = cJSON_IsBool(en) ? cJSON_IsTrue(en) : false;
+        voice_client_set_listen(enable);
+        char resp[128];
+        snprintf(resp, sizeof(resp),
+                 "{\"type\":\"voice_listen_status\",\"enabled\":%s,\"ok\":true}",
+                 enable ? "true" : "false");
+        send_json(resp);
     } else if (strcmp(type_str, "hello_ack") == 0) {
         ESP_LOGI(TAG, "cloud gateway accepted this device");
     } else if (strcmp(type_str, "pong") == 0) {

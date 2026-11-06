@@ -25,7 +25,7 @@ cryptography>=43.0.0
 
 # Voice pipeline (STT/TTS) — see api/voice_router.py
 faster-whisper>=1.0.0
-edge-tts>=6.1.0
+edge-tts>=7.3.1
 numpy>=1.26.0
 
 # Utilities

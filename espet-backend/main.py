@@ -76,13 +76,14 @@ async def lifespan(app: FastAPI):
 
         lan_ip = settings.host if settings.host not in ("0.0.0.0", "") else _detect_lan_ip()
         mdns_zc = Zeroconf()
+        host_tag = socket.gethostname().split('.')[0].lower() or "host"
         mdns_info = ServiceInfo(
             "_espet._tcp.local.",
-            "espet-backend._espet._tcp.local.",
-            server="espet-backend.local.",
+            f"espet-backend-{host_tag}._espet._tcp.local.",
+            server=f"espet-{host_tag}.local.",
             addresses=[socket.inet_aton(lan_ip)],
             port=settings.port,
-            properties={"version": "1"},
+            properties={"version": "1", "host": lan_ip},
         )
         # async API is mandatory here: the sync one raises EventLoopBlocked
         # when called from inside uvicorn's running event loop

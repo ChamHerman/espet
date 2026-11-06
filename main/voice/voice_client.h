@@ -36,6 +36,12 @@ esp_err_t voice_client_start(void);
 void voice_client_stop(void);
 
 /**
+ * @brief Enable or disable autonomous VAD wake-word listening at runtime.
+ */
+void voice_client_set_listen(bool enable);
+bool voice_client_is_listen_enabled(void);
+
+/**
  * @brief Speak a reply: fetch TTS audio from the backend and play it.
  *
  * Called by the outbound dispatcher for system:"voice" replies. Blocking

@@ -16,6 +16,7 @@
 #define LOOKUP_TIMEOUT_MS    3000
 #define RETRY_DELAY_MS       5000
 #define MAX_ATTEMPTS         6
+#define MAX_MDNS_RESULTS     8
 
 static const char *TAG = "discovery";
 
@@ -43,47 +44,79 @@ static bool resolve_once(char *out, size_t out_sz)
 {
     mdns_result_t *results = NULL;
     esp_err_t err = mdns_query_ptr(BACKEND_MDNS_SERVICE, BACKEND_MDNS_PROTO,
-                                   LOOKUP_TIMEOUT_MS, 1, &results);
+                                   LOOKUP_TIMEOUT_MS, MAX_MDNS_RESULTS, &results);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "mDNS query failed: %s", esp_err_to_name(err));
         return false;
     }
 
     int count = 0;
-    bool found = false;
-    for (mdns_result_t *r = results; r && !found; r = r->next, count++) {
+    char first_url[96] = {0};
+    bool matched_preferred = false;
+
+    for (mdns_result_t *r = results; r && !matched_preferred; r = r->next, count++) {
         ESP_LOGI(TAG, "mDNS result: %s port=%u", r->instance_name ? r->instance_name : "?",
                  (unsigned)r->port);
 
-        for (mdns_ip_addr_t *a = r->addr; a && !found; a = a->next) {
+        char candidate_url[96] = {0};
+        char candidate_ip[16] = {0};
+
+        for (mdns_ip_addr_t *a = r->addr; a; a = a->next) {
             if (a->addr.type != ESP_IPADDR_TYPE_V4) continue;
-            char ip[16];
-            esp_ip4addr_ntoa(&a->addr.u_addr.ip4, ip, sizeof(ip));
-            snprintf(out, out_sz, "http://%s:%u", ip, (unsigned)r->port);
-            found = true;
+            esp_ip4addr_ntoa(&a->addr.u_addr.ip4, candidate_ip, sizeof(candidate_ip));
+            snprintf(candidate_url, sizeof(candidate_url), "http://%s:%u",
+                     candidate_ip, (unsigned)r->port);
+            break;
         }
 
         /* If no IP in PTR record, resolve hostname or instance name via mdns_query_a */
-        const char *candidates[2] = { r->hostname, r->instance_name };
-        for (int c = 0; c < 2 && !found; c++) {
-            const char *h = candidates[c];
-            if (!h || !h[0]) continue;
-            char clean_host[64];
-            strlcpy(clean_host, h, sizeof(clean_host));
-            char *dot = strstr(clean_host, ".local");
-            if (dot) *dot = '\0';
-            esp_ip4_addr_t addr;
-            if (mdns_query_a(clean_host, LOOKUP_TIMEOUT_MS, &addr) == ESP_OK) {
-                char ip[16];
-                esp_ip4addr_ntoa(&addr, ip, sizeof(ip));
-                snprintf(out, out_sz, "http://%s:%u", ip, (unsigned)r->port);
-                found = true;
+        if (candidate_url[0] == '\0') {
+            const char *candidates[2] = { r->hostname, r->instance_name };
+            for (int c = 0; c < 2; c++) {
+                const char *h = candidates[c];
+                if (!h || !h[0]) continue;
+                char clean_host[64];
+                strlcpy(clean_host, h, sizeof(clean_host));
+                char *dot = strstr(clean_host, ".local");
+                if (dot) *dot = '\0';
+                esp_ip4_addr_t addr;
+                if (mdns_query_a(clean_host, LOOKUP_TIMEOUT_MS, &addr) == ESP_OK) {
+                    esp_ip4addr_ntoa(&addr, candidate_ip, sizeof(candidate_ip));
+                    snprintf(candidate_url, sizeof(candidate_url), "http://%s:%u",
+                             candidate_ip, (unsigned)r->port);
+                    break;
+                }
+            }
+        }
+
+        if (candidate_url[0] != '\0') {
+#ifdef BACKEND_IP
+            if (strcmp(candidate_ip, BACKEND_IP) == 0) {
+                strlcpy(out, candidate_url, out_sz);
+                ESP_LOGI(TAG, "mDNS selected preferred compiled-in BACKEND_IP (%s): %s",
+                         BACKEND_IP, out);
+                matched_preferred = true;
+                break;
+            }
+#endif
+            if (first_url[0] == '\0') {
+                strlcpy(first_url, candidate_url, sizeof(first_url));
             }
         }
     }
     mdns_query_results_free(results);
-    if (!found) ESP_LOGW(TAG, "mDNS query ok but %d result(s), none usable", count);
-    return found;
+
+    if (matched_preferred) {
+        return true;
+    }
+    if (first_url[0] != '\0') {
+        strlcpy(out, first_url, out_sz);
+        ESP_LOGI(TAG, "mDNS selected first discovered backend: %s", out);
+        return true;
+    }
+
+    ESP_LOGW(TAG, "mDNS query ok but %d result(s), none usable", count);
+    return false;
 }
 
 static void discovery_task(void *arg)

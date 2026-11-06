@@ -1,0 +1,846 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>ESPET Hardware Mic &amp; Speech-to-Text Tester</title>
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#050505">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="icon" type="image/jpeg" href="/static/brand/espet_logo.jpg">
+  <style>
+    :root {
+      --bg: #050505;
+      --card-bg: rgba(255, 255, 255, 0.055);
+      --card-border: rgba(255, 255, 255, 0.10);
+      --card-inner: rgba(255, 255, 255, 0.035);
+      --text: #f5f5f5;
+      --text-muted: #a3a3a3;
+      --text-dim: #737373;
+      --accent: #93c5fd;
+      --accent-dim: rgba(147, 197, 253, 0.15);
+      --mint: #8fd9ae;
+      --mint-bg: rgba(143, 217, 174, 0.10);
+      --mint-border: rgba(143, 217, 174, 0.28);
+      --red: #eda7a7;
+      --red-bg: rgba(237, 167, 167, 0.10);
+      --red-border: rgba(237, 167, 167, 0.28);
+      --yellow: #e6cf94;
+      --yellow-bg: rgba(230, 207, 148, 0.10);
+      --yellow-border: rgba(230, 207, 148, 0.28);
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Outfit', system-ui, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 20px 20px 90px;
+      line-height: 1.5;
+    }
+    .container { width: 100%; max-width: 820px; display: flex; flex-direction: column; gap: 24px; position: relative; z-index: 1; }
+    
+    header {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding-bottom: 14px;
+      border-bottom: 1px solid var(--card-border);
+    }
+    header h1 { font-size: 1.4rem; font-weight: 700; letter-spacing: -0.2px; display: flex; align-items: center; gap: 10px; }
+    header p { font-size: 0.92rem; color: var(--text-muted); }
+
+    /* Floating GlassNav matching the main Control Center */
+    .espet-nav-spacer {
+      height: 70px;
+      margin-bottom: 24px;
+      flex: none;
+    }
+    .espet-navbar {
+      position: fixed;
+      top: 14px;
+      left: 16px;
+      right: 16px;
+      margin-inline: auto;
+      width: fit-content;
+      max-width: calc(100vw - 32px);
+      z-index: 100;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      height: 70px;
+      padding: 0 20px;
+      border-radius: 20px;
+      background: rgba(255, 255, 255, 0.06);
+      backdrop-filter: blur(20px) saturate(1.1);
+      -webkit-backdrop-filter: blur(20px) saturate(1.1);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      box-shadow: 0 10px 40px rgba(0, 0, 0, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.1);
+    }
+    .espet-brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      text-decoration: none;
+      color: inherit;
+      flex: none;
+    }
+    .espet-logo {
+      border-radius: 12px;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      object-fit: cover;
+      transition: transform 0.2s cubic-bezier(0.34, 1.56, 0.64, 1);
+    }
+    .espet-brand:hover .espet-logo {
+      transform: scale(1.08) rotate(-3deg);
+    }
+    .espet-brand-text {
+      display: flex;
+      flex-direction: column;
+    }
+    .espet-brand-name {
+      font-weight: 700;
+      font-size: 1rem;
+      letter-spacing: 0.2px;
+      color: #f5f5f5;
+    }
+    .espet-brand-sub {
+      font-size: 11px;
+      color: #737373;
+      margin-top: -3px;
+    }
+    .espet-nav-links {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      flex: none;
+    }
+    .espet-nav-link {
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 14px;
+      border-radius: 12px;
+      font-size: 0.9rem;
+      font-weight: 500;
+      color: #a3a3a3;
+      text-decoration: none;
+      user-select: none;
+      white-space: nowrap;
+      transition: color 0.15s ease, transform 0.15s ease;
+    }
+    .espet-nav-link:hover { color: #e5e5e5; }
+    .espet-nav-link.active { color: #ffffff; }
+    .espet-active-pill {
+      position: absolute;
+      inset: 0;
+      z-index: 0;
+      border-radius: 12px;
+      background: linear-gradient(120deg, rgba(255, 255, 255, 0.14), rgba(255, 255, 255, 0.09));
+      border: 1px solid rgba(255, 255, 255, 0.3);
+      box-shadow: 0 2px 14px rgba(255, 255, 255, 0.1);
+    }
+    .espet-nav-link span, .espet-nav-link svg {
+      position: relative;
+      z-index: 1;
+    }
+    @media (max-width: 819px) {
+      .espet-navbar { height: auto; padding: 8px 12px; flex-wrap: wrap; justify-content: center; }
+      .espet-nav-links { overflow-x: auto; max-width: 100%; padding-bottom: 2px; }
+      .espet-nav-spacer { height: 90px; }
+    }
+
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 18px;
+      padding: 24px;
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+    }
+    .card-title {
+      font-size: 16px; font-weight: 600; margin-bottom: 4px;
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    .card-title-left { display: flex; align-items: center; gap: 10px; }
+    .card-subtitle {
+      font-size: 13px; color: var(--text-muted); margin-bottom: 18px;
+    }
+
+    .status-row {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px;
+      margin-bottom: 18px;
+    }
+    .status-box {
+      background: var(--card-inner);
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      padding: 14px 16px;
+    }
+    .status-box .label { font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: .6px; }
+    .status-box .val { font-size: 14px; font-weight: 500; margin-top: 5px; display: flex; align-items: center; gap: 8px; }
+    
+    .badge {
+      display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 500;
+    }
+    .badge-mint { color: var(--mint); background: var(--mint-bg); border: 1px solid var(--mint-border); }
+    .badge-red { color: var(--red); background: var(--red-bg); border: 1px solid var(--red-border); }
+    .badge-yellow { color: var(--yellow); background: var(--yellow-bg); border: 1px solid var(--yellow-border); }
+    .badge-neutral { color: var(--text-muted); background: var(--card-inner); border: 1px solid var(--card-border); }
+    .dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+    .dot-mint { background: var(--mint); box-shadow: 0 0 8px var(--mint); }
+    .dot-red { background: var(--red); }
+    .dot-yellow { background: var(--yellow); }
+
+    .toggle-row {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 14px 18px; background: var(--card-inner); border: 1px solid var(--card-border);
+      border-radius: 14px; margin-bottom: 12px;
+    }
+    .toggle-text { display: flex; flex-direction: column; gap: 2px; }
+    .toggle-title { font-size: 14px; font-weight: 600; color: var(--text); }
+    .toggle-desc { font-size: 12px; color: var(--text-muted); }
+    
+    .switch {
+      position: relative; display: inline-block; width: 46px; height: 26px; flex-shrink: 0;
+    }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider {
+      position: absolute; cursor: pointer; inset: 0; background: #1c1c1c;
+      border-radius: 26px; transition: .25s ease; border: 1px solid var(--card-border);
+    }
+    .slider:before {
+      position: absolute; content: ""; height: 18px; width: 18px; left: 3px; bottom: 3px;
+      background: #e5e5e5; border-radius: 50%; transition: .25s cubic-bezier(0.34, 1.56, 0.64, 1);
+    }
+    input:checked + .slider {
+      background: linear-gradient(135deg, rgba(96,165,250,0.65), rgba(147,197,253,0.45));
+      border-color: rgba(147,197,253,0.5);
+    }
+    input:checked + .slider:before {
+      transform: translateX(20px);
+      background: #ffffff;
+    }
+
+    /* Record Interactive Area */
+    .record-stage {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 36px 20px;
+      background: var(--card-inner);
+      border: 1px solid var(--card-border);
+      border-radius: 16px;
+      text-align: center;
+      gap: 16px;
+      position: relative;
+      overflow: hidden;
+    }
+    .pulse-ring {
+      width: 88px;
+      height: 88px;
+      border-radius: 50%;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+    }
+    .recording .pulse-ring {
+      background: rgba(237, 167, 167, 0.15);
+      border-color: rgba(237, 167, 167, 0.4);
+      animation: pulse-grow 1.6s infinite ease-out;
+    }
+    @keyframes pulse-grow {
+      0% { box-shadow: 0 0 0 0 rgba(237, 167, 167, 0.4); }
+      70% { box-shadow: 0 0 0 18px rgba(237, 167, 167, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(237, 167, 167, 0); }
+    }
+    
+    .timer-display {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 26px;
+      font-weight: 600;
+      color: #f5f5f5;
+      letter-spacing: 1px;
+    }
+    .stage-status {
+      font-size: 13px;
+      color: var(--text-muted);
+      max-width: 360px;
+    }
+
+    /* Action buttons following DESIGN.MD */
+    .btn-action {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      padding: 12px 28px;
+      border-radius: 14px;
+      font-family: inherit;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s cubic-bezier(0.34, 1.56, 0.64, 1);
+      user-select: none;
+    }
+    .btn-action.idle {
+      background: linear-gradient(135deg, rgba(96,165,250,0.22), rgba(147,197,253,0.14));
+      border: 1px solid rgba(147,197,253,0.35);
+      color: #dbeafe;
+      box-shadow: 0 4px 18px rgba(96,165,250,0.15);
+    }
+    .btn-action.idle:hover {
+      background: linear-gradient(135deg, rgba(96,165,250,0.32), rgba(147,197,253,0.24));
+      border-color: rgba(147,197,253,0.55);
+      transform: translateY(-1px);
+    }
+    .btn-action.recording {
+      background: linear-gradient(135deg, rgba(237,167,167,0.3), rgba(237,167,167,0.18));
+      border: 1px solid rgba(237,167,167,0.5);
+      color: #ffe4e4;
+      box-shadow: 0 4px 18px rgba(237,167,167,0.2);
+    }
+    .btn-action.recording:hover {
+      background: linear-gradient(135deg, rgba(237,167,167,0.4), rgba(237,167,167,0.28));
+      transform: translateY(-1px);
+    }
+    .btn-action:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+      transform: none !important;
+    }
+
+    /* Result Well */
+    .result-well {
+      background: var(--card-inner);
+      border: 1px solid var(--card-border);
+      border-radius: 14px;
+      padding: 18px 20px;
+      min-height: 80px;
+      font-size: 17px;
+      color: #ffffff;
+      line-height: 1.6;
+      word-break: break-word;
+      white-space: pre-wrap;
+    }
+    .result-well.empty {
+      color: var(--text-dim);
+      font-style: italic;
+      font-size: 14px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .metrics-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+      gap: 10px;
+      margin-top: 14px;
+    }
+    .metric-pill {
+      background: rgba(255, 255, 255, 0.025);
+      border: 1px solid var(--card-border);
+      border-radius: 10px;
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .metric-pill .lbl { font-size: 11px; color: var(--text-dim); text-transform: uppercase; }
+    .metric-pill .val { font-family: 'JetBrains Mono', monospace; font-size: 14px; font-weight: 500; color: #e5e5e5; }
+
+    /* Audio Player */
+    .audio-panel {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      margin-top: 14px;
+      padding: 14px 18px;
+      background: var(--card-inner);
+      border: 1px solid var(--card-border);
+      border-radius: 14px;
+    }
+    audio {
+      width: 100%;
+      height: 38px;
+      outline: none;
+      filter: invert(0.9) hue-rotate(180deg);
+      border-radius: 8px;
+    }
+    .audio-meta {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 12px;
+      color: var(--text-dim);
+    }
+    .audio-meta a {
+      color: var(--accent);
+      text-decoration: none;
+    }
+    .audio-meta a:hover {
+      text-decoration: underline;
+    }
+
+    .mono { font-family: 'JetBrains Mono', monospace; }
+
+    /* Toast */
+    .toast {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      background: rgba(16, 16, 16, 0.95);
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      padding: 12px 18px;
+      font-size: 13px;
+      box-shadow: 0 10px 40px rgba(0,0,0,0.7);
+      backdrop-filter: blur(12px);
+      z-index: 1000;
+      opacity: 0;
+      transform: translateY(12px);
+      transition: all 0.25s cubic-bezier(0.34, 1.56, 0.64, 1);
+      pointer-events: none;
+    }
+    .toast.show {
+      opacity: 1;
+      transform: translateY(0);
+      pointer-events: auto;
+    }
+    .toast.mint { border-color: var(--mint-border); color: var(--mint); }
+    .toast.red { border-color: var(--red-border); color: var(--red); }
+    .toast.yellow { border-color: var(--yellow-border); color: var(--yellow); }
+
+    .spinner {
+      border: 2px solid rgba(255, 255, 255, 0.15);
+      border-top-color: #ffffff;
+      border-radius: 50%;
+      width: 18px;
+      height: 18px;
+      animation: spin 0.8s linear infinite;
+      display: inline-block;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Floating Glass Navigation -->
+  <header class="espet-navbar">
+    <a href="/" class="espet-brand">
+      <img src="/static/brand/espet_logo.jpg" alt="ESPET" width="46" height="46" class="espet-logo">
+      <div class="espet-brand-text">
+        <div class="espet-brand-name">ESPET</div>
+        <div class="espet-brand-sub">Embodied AI</div>
+      </div>
+    </a>
+    <nav class="espet-nav-links" aria-label="Primary">
+      <a href="/#overview" class="espet-nav-link">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="7" height="9" x="3" y="3" rx="1"></rect><rect width="7" height="5" x="14" y="3" rx="1"></rect><rect width="7" height="9" x="14" y="12" rx="1"></rect><rect width="7" height="5" x="3" y="16" rx="1"></rect></svg>
+        <span>Home</span>
+      </a>
+      <a href="/cloud" class="espet-nav-link">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="8" x="2" y="2" rx="2"></rect><rect width="20" height="8" x="2" y="14" rx="2"></rect><path d="M6 6h.01M6 18h.01"></path></svg>
+        <span>Cloud Gateway</span>
+      </a>
+      <a href="/stt" class="espet-nav-link active">
+        <span class="espet-active-pill"></span>
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" x2="12" y1="19" y2="22"></line></svg>
+        <span>Mic &amp; STT</span>
+      </a>
+      <a href="/#chat" class="espet-nav-link">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z"></path></svg>
+        <span>Chat</span>
+      </a>
+    </nav>
+  </header>
+
+  <div class="espet-nav-spacer"></div>
+
+  <main class="container">
+
+    <header>
+      <h1>
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" x2="12" y1="19" y2="22"></line></svg>
+        Hardware Microphone &amp; Speech-to-Text Tester
+      </h1>
+      <p>Test the physical INMP441 microphone on ESP32-S3, trigger recordings remotely, transcribe speech with Whisper (restricted to English &amp; Chinese), and manage the VAD wake word listener.</p>
+    </header>
+
+    <!-- SECTION 1: HARDWARE & VAD CONTROLS -->
+    <section class="card">
+      <div class="card-title">
+        <div class="card-title-left">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><path d="m10 15 5-3-5-3v6Z"></path></svg>
+          Device Status &amp; Real-Time VAD Listener
+        </div>
+        <span id="badge-device" class="badge badge-neutral"><span class="dot dot-yellow"></span> Checking device...</span>
+      </div>
+      <div class="card-subtitle">Control whether the ESP32 actively listens for wake words or remains silent for manual testing.</div>
+
+      <div class="toggle-row">
+        <div class="toggle-text">
+          <div class="toggle-title">Real-time Wake Word Listener (Autonomous VAD)</div>
+          <div class="toggle-desc">When disabled, the ESP32 stops sampling room noise, eliminating false wake captures ("Thanks for watching!"). Keep disabled for clean manual button testing.</div>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="switch-vad">
+          <span class="slider"></span>
+        </label>
+      </div>
+
+      <div class="status-row" style="margin-bottom: 0;">
+        <div class="status-box">
+          <div class="label">VAD Background State</div>
+          <div class="val" id="vad-state-val"><span class="badge badge-neutral">Disabled (Quiet)</span></div>
+        </div>
+        <div class="status-box">
+          <div class="label">Allowed STT Languages</div>
+          <div class="val"><span class="badge badge-mint">English &amp; Chinese (en, zh)</span></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- SECTION 2: MANUAL RECORDING CONTROL -->
+    <section class="card">
+      <div class="card-title">
+        <div class="card-title-left">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" x2="12" y1="19" y2="22"></line></svg>
+          Interactive Voice Capture
+        </div>
+        <span id="record-state-chip" class="badge badge-neutral">Ready</span>
+      </div>
+      <div class="card-subtitle">Click "Start Recording" to trigger the ESP32's physical microphone. Speak directly into the INMP441, then click "Stop &amp; Transcribe".</div>
+
+      <div class="record-stage" id="record-stage">
+        <div class="pulse-ring" id="pulse-ring">
+          <svg id="stage-mic-icon" width="38" height="38" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color: var(--text-muted);"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" x2="12" y1="19" y2="22"></line></svg>
+        </div>
+        <div class="timer-display" id="timer-display">00:00</div>
+        <div class="stage-status" id="stage-status">ESP32 physical microphone is idle. Click below to begin.</div>
+
+        <button id="btn-record-action" class="btn-action idle">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" x2="12" y1="19" y2="22"></line></svg>
+          <span id="btn-record-text">Start Recording (Mic Hardware)</span>
+        </button>
+      </div>
+    </section>
+
+    <!-- SECTION 3: RECOGNITION RESULT -->
+    <section class="card">
+      <div class="card-title">
+        <div class="card-title-left">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
+          Speech Recognition Transcript
+        </div>
+        <button id="btn-copy" style="padding: 4px 10px; font-size: 11px;" title="Copy transcript">Copy Text</button>
+      </div>
+      <div class="card-subtitle">Model inference result processed by Whisper with language restriction.</div>
+
+      <div class="result-well empty" id="result-text">
+        Press "Start Recording" above and speak into the INMP441 microphone...
+      </div>
+
+      <div class="metrics-grid">
+        <div class="metric-pill">
+          <div class="lbl">Duration</div>
+          <div class="val" id="metric-duration">-- s</div>
+        </div>
+        <div class="metric-pill">
+          <div class="lbl">PCM Samples</div>
+          <div class="val" id="metric-samples">--</div>
+        </div>
+        <div class="metric-pill">
+          <div class="lbl">Signal RMS</div>
+          <div class="val" id="metric-rms">--</div>
+        </div>
+        <div class="metric-pill">
+          <div class="lbl">Status</div>
+          <div class="val" id="metric-status">Ready</div>
+        </div>
+      </div>
+
+      <!-- AUDIO PLAYBACK OF EXACT HARDWARE CAPTURE -->
+      <div class="audio-panel">
+        <div class="audio-meta">
+          <span>Captured Audio Playback (ESP32 INMP441 raw WAV)</span>
+          <a id="link-download-wav" href="/api/voice/last-capture-audio" download="last_capture.wav">Download WAV</a>
+        </div>
+        <audio id="audio-playback" controls preload="none">
+          <source src="/api/voice/last-capture-audio" type="audio/wav">
+          Your browser does not support audio playback.
+        </audio>
+      </div>
+    </section>
+
+  </main>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    const API_KEY = localStorage.getItem("espet_api_key") || "espet_secret_device_key_2026";
+    const headers = {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${API_KEY}`
+    };
+
+    let isRecording = false;
+    let timerInterval = null;
+    let recordStartTime = 0;
+    let currentDeviceId = null;
+
+    const badgeDevice = document.getElementById("badge-device");
+    const switchVad = document.getElementById("switch-vad");
+    const vadStateVal = document.getElementById("vad-state-val");
+    const btnRecordAction = document.getElementById("btn-record-action");
+    const btnRecordText = document.getElementById("btn-record-text");
+    const recordStage = document.getElementById("record-stage");
+    const timerDisplay = document.getElementById("timer-display");
+    const stageStatus = document.getElementById("stage-status");
+    const recordStateChip = document.getElementById("record-state-chip");
+    const resultText = document.getElementById("result-text");
+    const metricDuration = document.getElementById("metric-duration");
+    const metricSamples = document.getElementById("metric-samples");
+    const metricRms = document.getElementById("metric-rms");
+    const metricStatus = document.getElementById("metric-status");
+    const audioPlayback = document.getElementById("audio-playback");
+    const linkDownloadWav = document.getElementById("link-download-wav");
+    const btnCopy = document.getElementById("btn-copy");
+
+    function showToast(msg, kind = "mint") {
+      const t = document.getElementById("toast");
+      t.textContent = msg;
+      t.className = `toast show ${kind}`;
+      setTimeout(() => { t.className = "toast"; }, 3500);
+    }
+
+    async function fetchJSON(url, opts = {}) {
+      const res = await fetch(url, { ...opts, headers: { ...headers, ...(opts.headers || {}) } });
+      if (!res.ok) {
+        let err = res.statusText;
+        try { const b = await res.json(); err = b.detail || b.error || err; } catch {}
+        throw new Error(err);
+      }
+      return await res.json();
+    }
+
+    // --- Check Device Status ---
+    async function checkDeviceStatus() {
+      try {
+        const data = await fetchJSON("/api/cloud/devices");
+        const list = data.connected || [];
+        if (list.length > 0) {
+          currentDeviceId = list[0];
+          badgeDevice.className = "badge badge-mint";
+          badgeDevice.innerHTML = `<span class="dot dot-mint"></span> ${currentDeviceId} (Online)`;
+          btnRecordAction.disabled = false;
+        } else {
+          currentDeviceId = null;
+          badgeDevice.className = "badge badge-red";
+          badgeDevice.innerHTML = `<span class="dot dot-red"></span> No Device Online`;
+          btnRecordAction.disabled = true;
+          stageStatus.textContent = "Please connect or power on your ESP32 device.";
+        }
+      } catch (e) {
+        badgeDevice.className = "badge badge-red";
+        badgeDevice.innerHTML = `<span class="dot dot-red"></span> Backend Disconnected`;
+        btnRecordAction.disabled = true;
+      }
+    }
+
+    // --- Check & Toggle VAD Wake Listener ---
+    async function refreshVadStatus() {
+      try {
+        const data = await fetchJSON("/api/cloud/voice-listen");
+        const enabled = Boolean(data.enabled);
+        switchVad.checked = enabled;
+        updateVadLabel(enabled);
+      } catch (e) {
+        console.warn("Could not fetch VAD status", e);
+      }
+    }
+
+    function updateVadLabel(enabled) {
+      if (enabled) {
+        vadStateVal.innerHTML = `<span class="badge badge-yellow"><span class="dot dot-yellow"></span> Active (Listening for wake word)</span>`;
+      } else {
+        vadStateVal.innerHTML = `<span class="badge badge-mint"><span class="dot dot-mint"></span> Disabled (Quiet / bench mode)</span>`;
+      }
+    }
+
+    switchVad.addEventListener("change", async () => {
+      const wanted = switchVad.checked;
+      try {
+        switchVad.disabled = true;
+        const resp = await fetchJSON("/api/cloud/voice-listen", {
+          method: "POST",
+          body: JSON.stringify({ enabled: wanted, device_id: currentDeviceId })
+        });
+        if (resp.ok) {
+          updateVadLabel(resp.enabled);
+          showToast(resp.enabled ? "Real-time VAD wake listener ENABLED" : "Real-time VAD wake listener DISABLED (Quiet)", "mint");
+        } else {
+          throw new Error(resp.error || "Failed to switch VAD");
+        }
+      } catch (e) {
+        showToast(e.message, "red");
+        switchVad.checked = !wanted;
+      } finally {
+        switchVad.disabled = false;
+      }
+    });
+
+    // --- Record Timer Logic ---
+    function startTimer() {
+      recordStartTime = Date.now();
+      timerDisplay.textContent = "00:00";
+      clearInterval(timerInterval);
+      timerInterval = setInterval(() => {
+        const elapsed = Math.floor((Date.now() - recordStartTime) / 1000);
+        const mins = String(Math.floor(elapsed / 60)).padStart(2, '0');
+        const secs = String(elapsed % 60).padStart(2, '0');
+        timerDisplay.textContent = `${mins}:${secs}`;
+        if (elapsed >= 30) {
+          stopRecordingAction(); // Auto-stop at 30 seconds
+        }
+      }, 200);
+    }
+
+    function stopTimer() {
+      clearInterval(timerInterval);
+      timerInterval = null;
+    }
+
+    // --- Start / Stop Recording Actions ---
+    async function startRecordingAction() {
+      if (!currentDeviceId) {
+        showToast("No ESP32 device online", "red");
+        return;
+      }
+      try {
+        btnRecordAction.disabled = true;
+        btnRecordText.textContent = "Starting mic...";
+        const resp = await fetchJSON("/api/cloud/record/start", {
+          method: "POST",
+          body: JSON.stringify({ device_id: currentDeviceId })
+        });
+
+        if (!resp.ok) {
+          throw new Error(resp.error || "Hardware mic busy or not responding");
+        }
+
+        isRecording = true;
+        recordStage.classList.add("recording");
+        btnRecordAction.className = "btn-action recording";
+        btnRecordText.textContent = "Stop & Transcribe";
+        recordStateChip.className = "badge badge-red";
+        recordStateChip.innerHTML = `<span class="dot dot-red"></span> Recording...`;
+        stageStatus.textContent = "Recording in progress from ESP32 INMP441... Speak clearly.";
+        metricStatus.textContent = "Recording";
+        startTimer();
+        showToast("ESP32 microphone recording started", "mint");
+      } catch (e) {
+        showToast("Failed to start recording: " + e.message, "red");
+        stageStatus.textContent = "Error: " + e.message;
+      } finally {
+        btnRecordAction.disabled = false;
+      }
+    }
+
+    async function stopRecordingAction() {
+      stopTimer();
+      isRecording = false;
+      recordStage.classList.remove("recording");
+      btnRecordAction.disabled = true;
+      btnRecordText.innerHTML = `<span class="spinner"></span> Transcribing...`;
+      stageStatus.textContent = "Sending audio to server and transcribing with Whisper...";
+      recordStateChip.className = "badge badge-yellow";
+      recordStateChip.innerHTML = `<span class="dot dot-yellow"></span> Transcribing...`;
+      metricStatus.textContent = "Processing";
+
+      try {
+        const resp = await fetchJSON("/api/cloud/record/stop", {
+          method: "POST",
+          body: JSON.stringify({ device_id: currentDeviceId })
+        });
+
+        if (!resp.ok) {
+          throw new Error(resp.error || "Recording failed");
+        }
+
+        const transcript = (resp.transcript || "").trim();
+        if (transcript) {
+          resultText.classList.remove("empty");
+          resultText.textContent = transcript;
+        } else {
+          resultText.classList.add("empty");
+          resultText.textContent = "(No speech recognized or confidence too low)";
+        }
+
+        const durSec = ((resp.duration_ms || 0) / 1000).toFixed(2);
+        metricDuration.textContent = `${durSec} s`;
+        metricSamples.textContent = (resp.samples || 0).toLocaleString();
+        metricRms.textContent = Math.round(resp.rms || 0).toLocaleString();
+        metricStatus.textContent = "Completed";
+
+        // Reload audio element with fresh timestamp
+        const cacheBuster = Date.now();
+        const audioUrl = `/api/voice/last-capture-audio?t=${cacheBuster}`;
+        audioPlayback.src = audioUrl;
+        audioPlayback.load();
+        linkDownloadWav.href = audioUrl;
+
+        showToast("Transcription complete!", "mint");
+        stageStatus.textContent = "Capture complete. You can listen to the audio below or record again.";
+      } catch (e) {
+        showToast("Transcription error: " + e.message, "red");
+        stageStatus.textContent = "Error: " + e.message;
+        metricStatus.textContent = "Error";
+      } finally {
+        btnRecordAction.disabled = false;
+        btnRecordAction.className = "btn-action idle";
+        btnRecordText.textContent = "Start Recording (Mic Hardware)";
+        recordStateChip.className = "badge badge-neutral";
+        recordStateChip.textContent = "Ready";
+      }
+    }
+
+    btnRecordAction.addEventListener("click", () => {
+      if (!isRecording) {
+        startRecordingAction();
+      } else {
+        stopRecordingAction();
+      }
+    });
+
+    btnCopy.addEventListener("click", () => {
+      const text = resultText.textContent.trim();
+      if (!text || resultText.classList.contains("empty")) {
+        showToast("Nothing to copy", "yellow");
+        return;
+      }
+      navigator.clipboard.writeText(text);
+      showToast("Copied transcript to clipboard", "mint");
+    });
+
+    // Poll status periodically
+    checkDeviceStatus();
+    refreshVadStatus();
+    setInterval(checkDeviceStatus, 4000);
+  </script>
+</body>
+</html>
+

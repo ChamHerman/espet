@@ -178,10 +178,13 @@ http = httpx.Client(base_url=f"http://127.0.0.1:{gw_port}",
 
 
 def _reset_state():
-    """Fresh registry + mock state per test. Bindings persist to a tmp file."""
+    """Fresh registry + mock state per test. Bindings and settings persist to tmp files."""
     registry.connections.clear()
     registry.chat_to_device.clear()
     registry.persist_path = Path(tmp_dir) / "cloud_bindings.json"
+    gateway_settings.persist_path = Path(tmp_dir) / "gateway_config.json"
+    (Path(tmp_dir) / "gateway_config.json").write_text("{}")
+    gateway_settings._load()
     mock_records["sendMessage"].clear()
     mock_records["sendPhoto"].clear()
     with mock_lock:

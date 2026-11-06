@@ -31,6 +31,12 @@ router = APIRouter(prefix="/api/cloud", tags=["cloud"])
 
 registry = DeviceRegistry()
 
+# Asynchronous response tracking for manual recording and voice listen toggle
+_pending_record_start: dict[str, asyncio.Future] = {}
+_pending_record_stop: dict[str, asyncio.Future] = {}
+_pending_voice_listen: dict[str, asyncio.Future] = {}
+_voice_listen_state: dict[str, bool] = {}
+
 
 def _build_gateway() -> TelegramGateway | None:
     """(Re)create the Telegram poller from the current gateway settings.
@@ -159,6 +165,22 @@ async def ws_device(websocket: WebSocket, key: str = Query("")):
             elif ftype == "ping":
                 await websocket.send_text(json.dumps({"type": "pong"}))
 
+            elif ftype == "record_status":
+                fut = _pending_record_start.pop(device_id, None)
+                if fut and not fut.done():
+                    fut.set_result(frame)
+
+            elif ftype == "record_result":
+                fut = _pending_record_stop.pop(device_id, None)
+                if fut and not fut.done():
+                    fut.set_result(frame)
+
+            elif ftype == "voice_listen_status":
+                _voice_listen_state[device_id] = frame.get("enabled", False)
+                fut = _pending_voice_listen.pop(device_id, None)
+                if fut and not fut.done():
+                    fut.set_result(frame)
+
             else:
                 await websocket.send_text(json.dumps(
                     {"type": "error", "detail": f"unknown frame type {ftype!r}"}))
@@ -166,6 +188,10 @@ async def ws_device(websocket: WebSocket, key: str = Query("")):
     except WebSocketDisconnect:
         logger.info("Device %s disconnected", device_id)
     finally:
+        for pmap in (_pending_record_start, _pending_record_stop, _pending_voice_listen):
+            fut = pmap.pop(device_id, None)
+            if fut and not fut.done():
+                fut.set_exception(RuntimeError("Device disconnected"))
         registry.remove_connection(device_id, websocket)
         logger.info("Device %s removed — %d device(s) online",
                     device_id, len(registry.connected_devices()))
@@ -373,3 +399,110 @@ async def put_gateway_config(payload: dict,
     if before != after or get_gateway() is None:
         poller = restart_gateway()
     return {"ok": True, "config": snap, "poller": poller}
+
+
+# ---------------------------------------------------------------------------
+# Manual Audio Recording & Real-time VAD Wake Listener Controls
+# ---------------------------------------------------------------------------
+
+@router.post("/record/start")
+async def start_recording(payload: dict | None = None, device_id: str | None = Query(None)):
+    req_did = (payload or {}).get("device_id") or device_id
+    did, ws = registry.get_connection(req_did)
+    if not did or not ws:
+        return {"ok": False, "error": "No ESP32 device online"}
+
+    prev_fut = _pending_record_start.pop(did, None)
+    if prev_fut and not prev_fut.done():
+        prev_fut.cancel()
+
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()
+    _pending_record_start[did] = fut
+
+    try:
+        await ws.send_text(json.dumps({"type": "record_start"}))
+        res = await asyncio.wait_for(fut, timeout=5.0)
+        return {
+            "ok": res.get("ok", False),
+            "status": res.get("status", "unknown"),
+            "device_id": did,
+        }
+    except asyncio.TimeoutError:
+        _pending_record_start.pop(did, None)
+        return {"ok": False, "error": "Timeout waiting for device to start recording"}
+    except Exception as e:
+        _pending_record_start.pop(did, None)
+        return {"ok": False, "error": str(e)}
+
+
+@router.post("/record/stop")
+async def stop_recording(payload: dict | None = None, device_id: str | None = Query(None)):
+    req_did = (payload or {}).get("device_id") or device_id
+    did, ws = registry.get_connection(req_did)
+    if not did or not ws:
+        return {"ok": False, "error": "No ESP32 device online"}
+
+    prev_fut = _pending_record_stop.pop(did, None)
+    if prev_fut and not prev_fut.done():
+        prev_fut.cancel()
+
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()
+    _pending_record_stop[did] = fut
+
+    try:
+        await ws.send_text(json.dumps({"type": "record_stop"}))
+        res = await asyncio.wait_for(fut, timeout=20.0)
+        return {
+            "ok": res.get("ok", False),
+            "device_id": did,
+            "samples": res.get("samples", 0),
+            "duration_ms": res.get("duration_ms", 0),
+            "rms": res.get("rms", 0.0),
+            "transcript": res.get("transcript", ""),
+            "error": res.get("error"),
+        }
+    except asyncio.TimeoutError:
+        _pending_record_stop.pop(did, None)
+        return {"ok": False, "error": "Timeout waiting for device transcription result"}
+    except Exception as e:
+        _pending_record_stop.pop(did, None)
+        return {"ok": False, "error": str(e)}
+
+
+@router.post("/voice-listen")
+async def set_voice_listen(payload: dict | None = None, device_id: str | None = Query(None)):
+    req_did = (payload or {}).get("device_id") or device_id
+    did, ws = registry.get_connection(req_did)
+    if not did or not ws:
+        return {"ok": False, "error": "No ESP32 device online"}
+
+    enable = bool((payload or {}).get("enabled", False))
+
+    prev_fut = _pending_voice_listen.pop(did, None)
+    if prev_fut and not prev_fut.done():
+        prev_fut.cancel()
+
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()
+    _pending_voice_listen[did] = fut
+
+    try:
+        await ws.send_text(json.dumps({"type": "voice_listen", "enabled": enable}))
+        res = await asyncio.wait_for(fut, timeout=5.0)
+        _voice_listen_state[did] = res.get("enabled", enable)
+        return {"ok": True, "device_id": did, "enabled": res.get("enabled", enable)}
+    except asyncio.TimeoutError:
+        _pending_voice_listen.pop(did, None)
+        return {"ok": False, "error": "Timeout waiting for voice listen switch"}
+    except Exception as e:
+        _pending_voice_listen.pop(did, None)
+        return {"ok": False, "error": str(e)}
+
+
+@router.get("/voice-listen")
+async def get_voice_listen(device_id: str | None = Query(None)):
+    did, ws = registry.get_connection(device_id)
+    enabled = _voice_listen_state.get(did, True) if did else True
+    return {"ok": True, "device_id": did, "enabled": enabled, "online": ws is not None}

@@ -101,6 +101,7 @@ static TaskHandle_t         s_voice_task     = NULL;
 static StackType_t         *s_voice_stack    = NULL;  /* PSRAM-allocated */
 static StaticTask_t        *s_voice_tcb      = NULL;  /* internal RAM */
 static volatile bool        s_running        = false;
+static volatile bool        s_listen_enabled = true;  /* autonomous VAD listener toggle (always on by default) */
 static volatile bool        s_busy           = false;  /* pipeline in flight */
 static int64_t              s_busy_start_ms  = 0;      /* watchdog timer for agent thinking */
 static volatile int64_t     s_mic_guard_until_ms = 0;  /* post-playback echo guard deadline */
@@ -139,7 +140,10 @@ static inline int32_t vad_trigger_threshold(void)
     int32_t floor = s_mic_floor;
     int32_t thr = floor + floor / 3;                           /* 1.33x floor */
     if (thr < VAD_SPEECH_RMS_START) thr = VAD_SPEECH_RMS_START;
-    if (thr > VAD_RMS_THRESHOLD_MAX) thr = VAD_RMS_THRESHOLD_MAX;
+    if (floor < VAD_RMS_THRESHOLD_MAX && thr > VAD_RMS_THRESHOLD_MAX) {
+        thr = VAD_RMS_THRESHOLD_MAX;
+    }
+    if (thr <= floor) thr = floor + 300;
     return thr;
 }
 
@@ -640,11 +644,17 @@ static void voice_task(void *arg)
     int64_t  dbg_last_report_ms = esp_timer_get_time() / 1000;
     bool     was_paused = false;
 
-    ESP_LOGI(TAG, "software wake listener running — say \"Hey Expert\" or \"Mimi\" "
+    ESP_LOGI(TAG, "software wake listener running — say \"Hey Mimi\" or \"Mimi\" "
                   "(adaptive VAD: feeder floor, base thr=%d, x1.33)",
              VAD_SPEECH_RMS_START);
 
     while (s_running) {
+        /* When autonomous VAD listening is disabled, sleep quietly without sampling or logging */
+        if (!s_listen_enabled) {
+            vTaskDelay(pdMS_TO_TICKS(150));
+            continue;
+        }
+
         /* ---- 5-second debug report ---- */
         int64_t now = esp_timer_get_time() / 1000;
         if (now - dbg_last_report_ms >= 5000) {
@@ -706,6 +716,20 @@ static void voice_task(void *arg)
         dbg_frames++;
         dbg_rms_sum += rms;
         if (rms > dbg_rms_peak) dbg_rms_peak = rms;
+
+        /* If ambient floor or signal is persistently railed (> 25000 RMS), do not trigger VAD.
+         * Report wiring error periodically and pause to avoid permanent capture loops. */
+        if (s_mic_floor > 25000 && rms > 25000) {
+            consec_speech = 0;
+            static int64_t s_last_railed_log = 0;
+            if (now - s_last_railed_log >= 5000) {
+                s_last_railed_log = now;
+                ESP_LOGW(TAG, "[VAD] mic signal railed (rms=%d, floor=%d) — check INMP441 GND/VDD/SD wiring",
+                         (int)rms, (int)s_mic_floor);
+            }
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
 
         if (rms >= vad_thr) {
             consec_speech++;
@@ -953,4 +977,18 @@ void voice_client_stop(void)
 {
     s_running = false;
     tool_audio_rx_stream_stop();
+}
+
+void voice_client_set_listen(bool enable)
+{
+    s_listen_enabled = enable;
+    ESP_LOGI(TAG, "VAD real-time wake listener %s", enable ? "ENABLED" : "DISABLED");
+    if (!enable) {
+        tool_audio_clear_cache();
+    }
+}
+
+bool voice_client_is_listen_enabled(void)
+{
+    return s_listen_enabled;
 }

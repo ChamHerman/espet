@@ -98,6 +98,70 @@ def wav_bytes_to_pcm16(wav: bytes) -> np.ndarray:
     return samples
 
 
+def _biquad_notch(signal: np.ndarray, f0: float, bw: float = 8.0, fs: float = float(ESP_SAMPLE_RATE)) -> np.ndarray:
+    """Narrow IIR biquad notch filter: completely eliminates f0 with zero comb artifacts."""
+    w0 = 2.0 * np.pi * f0 / fs
+    r = 1.0 - (np.pi * bw / fs)
+    b0 = 1.0
+    b1 = -2.0 * np.cos(w0)
+    b2 = 1.0
+    a1 = -2.0 * r * np.cos(w0)
+    a2 = r * r
+    gain_dc = (1.0 + b1 + 1.0) / (1.0 + a1 + a2)
+    b0 /= gain_dc
+    b1 /= gain_dc
+    b2 /= gain_dc
+
+    y = np.empty_like(signal)
+    x1, x2 = 0.0, 0.0
+    y1, y2 = 0.0, 0.0
+    for i in range(len(signal)):
+        x0 = signal[i]
+        out = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
+        x2, x1 = x1, x0
+        y2, y1 = y1, out
+        y[i] = out
+    return y
+
+
+def denoise_and_boost_audio(pcm16: np.ndarray, sample_rate: int = ESP_SAMPLE_RATE) -> np.ndarray:
+    """
+    Gentle, artifact-free audio conditioning:
+    1. Removes DC bias (zero-mean).
+    2. Applies studio 80 Hz low-cut filter to remove sub-audible rumble without affecting voice pitch.
+    3. Narrow 3-band biquad notch filter at 169.2 Hz, 338.3 Hz, and 507.5 Hz to extinguish
+       the breadboard OLED charge-pump hum without affecting voice formants or pitch.
+    4. Safe, gentle voice scaling so speech is clearly audible without robotic coloration.
+    """
+    if len(pcm16) < sample_rate // 10:
+        return pcm16
+
+    data = pcm16.astype(np.float64)
+    # 1. Strip DC offset cleanly
+    data = data - np.mean(data)
+
+    # 2. Gentle 1st-order high-pass filter (fc ≈ 80 Hz) — completely linear and artifact-free
+    # R = e^(-2*pi*fc/fs) ≈ 0.969
+    R = 0.969
+    y = np.empty_like(data)
+    y[0] = data[0]
+    for i in range(1, len(data)):
+        y[i] = data[i] - data[i - 1] + R * y[i - 1]
+
+    # 3. Narrow biquad notch filters at 169.2 Hz, 338.3 Hz, 507.5 Hz (OLED charge pump ripple)
+    y = _biquad_notch(y, 169.2, bw=8.0, fs=float(sample_rate))
+    y = _biquad_notch(y, 338.3, bw=8.0, fs=float(sample_rate))
+    y = _biquad_notch(y, 507.5, bw=8.0, fs=float(sample_rate))
+
+    # 4. Safe, gentle voice scaling (target ~20,000 counts, max 3.5x boost)
+    peak = np.max(np.abs(y))
+    if peak > 200.0:
+        gain = min(20000.0 / peak, 3.5)
+        y = y * gain
+
+    return np.clip(y, -32768, 32767).astype(np.int16)
+
+
 def resample_to_16k(pcm16: np.ndarray, orig_rate: int) -> np.ndarray:
     """Simple linear-interpolation resampler down/up to 16 kHz."""
     if orig_rate == ESP_SAMPLE_RATE or len(pcm16) == 0:
@@ -106,6 +170,49 @@ def resample_to_16k(pcm16: np.ndarray, orig_rate: int) -> np.ndarray:
     x_in = np.arange(len(pcm16), dtype=np.float64)
     x_out = np.arange(n_out, dtype=np.float64) * orig_rate / ESP_SAMPLE_RATE
     return np.interp(x_out, x_in, pcm16.astype(np.float64)).astype(np.int16)
+
+
+def detect_pitch_f0(data: np.ndarray, fs: int = ESP_SAMPLE_RATE) -> float:
+    """Measure median fundamental pitch F0 across voiced segments using autocorrelation."""
+    if len(data) < fs // 4:
+        return 0.0
+    win = int(fs * 0.04)
+    hop = int(fs * 0.01)
+    pitches = []
+    for i in range(0, len(data) - win, hop):
+        seg = data[i:i + win].astype(np.float64)
+        seg = seg - np.mean(seg)
+        rms = np.sqrt(np.mean(seg**2))
+        if rms < 1500:
+            continue
+        corr = np.correlate(seg, seg, mode="full")[win - 1:]
+        min_lag = int(fs / 500)
+        max_lag = int(fs / 70)
+        peak_lag = min_lag + int(np.argmax(corr[min_lag:max_lag]))
+        f0 = fs / peak_lag
+        if corr[peak_lag] > 0.45 * corr[0]:
+            pitches.append(f0)
+    return float(np.median(pitches)) if len(pitches) >= 3 else 0.0
+
+
+def check_and_fix_pitch(pcm16: np.ndarray, sample_rate: int = ESP_SAMPLE_RATE) -> tuple[np.ndarray, bool]:
+    """
+    Detect if the audio has double-speed/octave-up chipmunk pitch due to
+    hardware DMA mono slot-mask decimation (effective 8 kHz played as 16 kHz).
+    If pitch is abnormal (> 270 Hz median for voiced speech), upsamples 8k -> 16k
+    to restore normal human voice pitch and natural playback speed.
+    """
+    f0 = detect_pitch_f0(pcm16, sample_rate)
+    if f0 > 270.0:
+        logger.info(
+            "Speech pitch is %.1f Hz (chipmunk/double speed detected) — restoring normal pitch (resampling 8k -> 16k)",
+            f0
+        )
+        corrected = resample_to_16k(pcm16, 8000)
+        new_f0 = detect_pitch_f0(corrected, sample_rate)
+        logger.info("Normal voice pitch restored: %.1f Hz", new_f0)
+        return corrected, True
+    return pcm16, False
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +246,10 @@ def _transcribe_pcm(pcm16: np.ndarray, language: str | None) -> tuple[str, float
     """
     if len(pcm16) < ESP_SAMPLE_RATE // 5:  # < 0.2 s of audio
         return "", 0.0, 1.0
+
+    # Clean electrical buzz (OLED charge pump 169 Hz harmonics) and normalize human voice
+    pcm16 = denoise_and_boost_audio(pcm16)
+
     model = _get_stt_model()
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
         wav_bytes = pcm_to_wav_bytes(pcm16)
@@ -151,10 +262,15 @@ def _transcribe_pcm(pcm16: np.ndarray, language: str | None) -> tuple[str, float
         debug_file.write_bytes(wav_bytes)
     except Exception:
         pass
+    allowed_langs = [
+        l.strip().lower() for l in (settings.voice_allowed_languages or "").split(",") if l.strip()
+    ]
+    target_lang = language if language else (allowed_langs[0] if len(allowed_langs) == 1 else None)
+
     try:
         segments, info = model.transcribe(
             tmp_path,
-            language=language or None,
+            language=target_lang,
             beam_size=3,
             best_of=3,
             repetition_penalty=1.2,
@@ -165,6 +281,36 @@ def _transcribe_pcm(pcm16: np.ndarray, language: str | None) -> tuple[str, float
             initial_prompt=settings.voice_stt_prompt or None,
             condition_on_previous_text=False,
         )
+
+        # Restrict detected language to allowed set (default: English and Chinese only)
+        if not target_lang and allowed_langs and info.language not in allowed_langs:
+            probs = dict(info.all_language_probs or [])
+            best_allowed = max(allowed_langs, key=lambda l: probs.get(l, 0.0))
+            best_prob = probs.get(best_allowed, 0.0)
+            logger.warning(
+                "Whisper detected '%s' (not in allowed %s, prob=%.2f) — restricting to '%s' (prob=%.3f)",
+                info.language, allowed_langs, info.language_probability, best_allowed, best_prob
+            )
+            if best_prob < 0.03:
+                logger.info("Language confidence for %s too low (best=%.3f) — discarding noise",
+                            allowed_langs, best_prob)
+                return "", 0.0, 1.0
+
+            target_lang = best_allowed
+            segments, info = model.transcribe(
+                tmp_path,
+                language=target_lang,
+                beam_size=3,
+                best_of=3,
+                repetition_penalty=1.2,
+                no_repeat_ngram_size=3,
+                max_new_tokens=96,
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=500),
+                initial_prompt=settings.voice_stt_prompt or None,
+                condition_on_previous_text=False,
+            )
+
         segs = list(segments)
         text = " ".join(seg.text.strip() for seg in segs).strip()
 
@@ -173,7 +319,7 @@ def _transcribe_pcm(pcm16: np.ndarray, language: str | None) -> tuple[str, float
             logger.info("vad_filter=True returned empty segments; retrying with vad_filter=False...")
             segments, info = model.transcribe(
                 tmp_path,
-                language=language or None,
+                language=target_lang or (info.language if (not allowed_langs or info.language in allowed_langs) else "en"),
                 beam_size=3,
                 best_of=3,
                 repetition_penalty=1.2,
@@ -185,6 +331,14 @@ def _transcribe_pcm(pcm16: np.ndarray, language: str | None) -> tuple[str, float
             )
             segs = list(segments)
             text = " ".join(seg.text.strip() for seg in segs).strip()
+
+        # Strip any foreign scripts outside English (ASCII) and Chinese (\u4e00-\u9fff)
+        if allowed_langs and set(allowed_langs) <= {"en", "zh"}:
+            clean_text = _re.sub(r"[^\x00-\x7F\u4e00-\u9fff\u3000-\u303f]+", " ", text).strip()
+            clean_text = _re.sub(r"\s+", " ", clean_text).strip()
+            if clean_text != text:
+                logger.info("Filtered non-en/zh characters: '%s' -> '%s'", text, clean_text)
+            text = clean_text
 
         if segs:
             avg_logprob = float(segs[0].avg_logprob)
@@ -316,6 +470,10 @@ async def transcribe(request: Request):
         else:
             raw = np.frombuffer(body[: len(body) // 2 * 2], dtype="<i2").copy()
             pcm = resample_to_16k(raw, rate) if rate != ESP_SAMPLE_RATE else raw
+
+        # Check and restore natural voice pitch if audio was decimated by DMA slot mask (8k -> 16k)
+        pcm, _ = check_and_fix_pitch(pcm, ESP_SAMPLE_RATE)
+
         rms = float(np.sqrt(np.mean(pcm.astype(np.float64) ** 2))) if len(pcm) else 0.0
         logger.info("STT request: %d bytes (%.2fs @ %dHz), RMS=%.1f (threshold=%.1f)",
                     len(pcm) * 2, len(pcm) / ESP_SAMPLE_RATE, rate, rms, settings.voice_min_rms)
@@ -382,3 +540,16 @@ async def tts(req: TTSRequest):
         raise HTTPException(500, f"tts failed: {e}")
 
     return Response(content=wav, media_type="audio/wav")
+
+
+@router.get("/last-capture-audio")
+async def get_last_capture_audio():
+    """Serves the most recent audio WAV captured from the physical microphone."""
+    wav_path = Path("data/last_capture.wav")
+    if not wav_path.exists():
+        raise HTTPException(404, "No audio captured yet")
+    return Response(
+        content=wav_path.read_bytes(),
+        media_type="audio/wav",
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )

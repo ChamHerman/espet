@@ -34,3 +34,13 @@ async def dashboard():
 )
 async def cloud_dashboard():
     return FileResponse(_STATIC_DIR / "cloud.html")
+
+
+@router.get(
+    "/stt",
+    response_class=FileResponse,
+    summary="Hardware Microphone & STT Tester",
+    description="Dedicated testing page for ESP32 INMP441 microphone capture, real-time Whisper transcription, and VAD controls.",
+)
+async def stt_dashboard():
+    return FileResponse(_STATIC_DIR / "stt.html")
