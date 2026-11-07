@@ -644,7 +644,7 @@ static void voice_task(void *arg)
     int64_t  dbg_last_report_ms = esp_timer_get_time() / 1000;
     bool     was_paused = false;
 
-    ESP_LOGI(TAG, "software wake listener running — say \"Hey Mimi\" or \"Mimi\" "
+    ESP_LOGI(TAG, "software wake listener running — say \"Hey ESPET\" or \"ESPET\" (sounds like \"Expert\") "
                   "(adaptive VAD: feeder floor, base thr=%d, x1.33)",
              VAD_SPEECH_RMS_START);
 

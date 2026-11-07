@@ -235,7 +235,7 @@ export function DeviceView() {
         <div className={styles.sectionNote} style={{ marginTop: 12 }}>
           <Icon name="info" size={16} />
           <span>
-            Don’t know the IP? Run <b>mimi&gt; wifi_status</b> on the serial
+            Don’t know the IP? Run <b>espet&gt; wifi_status</b> on the serial
             console (UART, 115200 baud). The gateway also answers on{" "}
             <span className="espet-mono">espet.local</span> when your network
             resolves mDNS.

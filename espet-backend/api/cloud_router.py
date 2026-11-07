@@ -258,6 +258,8 @@ async def _llm_relay(websocket, request_id, body_str: str) -> None:
                 headers={"Authorization": f"Bearer {cfg['api_key']}", "Accept": "application/json"})
         logger.info("LLM relay: %s -> HTTP %d (%d bytes)",
                     url, resp.status_code, len(resp.text))
+        if resp.status_code != 200 or len(resp.text) < 400:
+            logger.info("LLM relay payload preview: %.300s", resp.text)
         await _reply(resp.status_code == 200, resp.status_code, resp.text)
     except Exception as e:
         logger.warning("LLM relay to %s failed: %r", url, e)

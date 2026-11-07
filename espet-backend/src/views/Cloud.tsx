@@ -516,7 +516,7 @@ export function CloudView() {
           <Input
             value={newDeviceId}
             onChange={(r) => setNewDeviceId(r.target.value)}
-            placeholder="Device ID (e.g. mimi-espet)"
+            placeholder="Device ID (e.g. espet-device)"
             className="espet-mono"
           />
           <Button onClick={onAddBind} icon={<Icon name="plus" size={14} />}>

@@ -68,4 +68,15 @@ esp_err_t wifi_manager_stop(void);
 /**
  * Enable or disable STA auto-reconnect on disconnect events.
  */
+
+/**
+ * Check if device was requested to reboot directly into BLE provisioning mode.
+ * Clears the flag on read.
+ */
+bool wifi_manager_is_ble_prov_requested(void);
+
+/**
+ * Trigger immediate reboot into BLE provisioning mode.
+ */
+void wifi_manager_trigger_ble_prov(void);
 void wifi_manager_set_reconnect_enabled(bool enabled);

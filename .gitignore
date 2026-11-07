@@ -34,6 +34,8 @@ main/mimi_secrets.h
 .cache
 *.pyc
 *.bin
+*.log
+.pytest_cache/
 
 # Documentation (generated)
 BUILD_TEST_GUIDE.md

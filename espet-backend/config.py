@@ -56,7 +56,7 @@ class Settings(BaseSettings):
     #   zh-HK-HiuMaanNeural / en-US-AriaNeural ...
     voice_tts_voice: str = "zh-CN-XiaoxiaoNeural"
     # Comma-separated wake words checked against transcripts (case-insensitive)
-    voice_wake_words: str = "mimi,hey mimi,hi mimi,ok mimi,expert,hey expert,hi expert,espet,hey espet,hi esp,米米,咪咪,小米"
+    voice_wake_words: str = "espet,hey espet,hi espet,ok espet,expert,hey expert,hi expert,mimi,hey mimi,hi mimi,ok mimi,米米,咪咪,小米"
     # Whisper initial_prompt. Leave EMPTY unless you know what you are doing:
     # putting the wake words here biases the decoder and was verified to turn
     # room noise / speaker echo into exactly the wake word (endless self-wake).

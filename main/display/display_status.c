@@ -243,5 +243,5 @@ void display_status_set(const char *line1, const char *line2)
 
 void display_status_idle(void)
 {
-    display_status_set("Say Hey Mimi", "");
+    display_status_set("Say Hey ESPET", "");
 }

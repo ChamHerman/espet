@@ -144,7 +144,7 @@ function Shell() {
       <footer className={styles.footer}>
         <span className={styles.footBrand}>ESPET Control Center</span>
         <span className={styles.footSep}>·</span>
-        <span className={styles.footCredit}>powered by MimiClaw</span>
+        <span className={styles.footCredit}>powered by ESPET</span>
       </footer>
       <StatusDock />
     </div>

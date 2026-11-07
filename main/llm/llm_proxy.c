@@ -586,13 +586,14 @@ esp_err_t llm_chat_tools(const char *system_prompt,
     cJSON *body = cJSON_CreateObject();
     cJSON_AddStringToObject(body, "model", s_model);
     cJSON_AddBoolToObject(body, "stream", false);
-    if (provider_is_openai()) {
+    bool use_openai = provider_is_openai() || llm_via_cloud();
+    if (use_openai) {
         cJSON_AddNumberToObject(body, "max_completion_tokens", MIMI_LLM_MAX_TOKENS);
     } else {
         cJSON_AddNumberToObject(body, "max_tokens", MIMI_LLM_MAX_TOKENS);
     }
 
-    if (provider_is_openai()) {
+    if (use_openai) {
         cJSON *openai_msgs = convert_messages_openai(system_prompt, messages);
         cJSON_AddItemToObject(body, "messages", openai_msgs);
 
@@ -662,8 +663,8 @@ esp_err_t llm_chat_tools(const char *system_prompt,
         return ESP_FAIL;
     }
 
-    if (provider_is_openai()) {
-        cJSON *choices = cJSON_GetObjectItem(root, "choices");
+    cJSON *choices = cJSON_GetObjectItem(root, "choices");
+    if ((choices && cJSON_IsArray(choices)) || provider_is_openai() || llm_via_cloud()) {
         cJSON *choice0 = choices && cJSON_IsArray(choices) ? cJSON_GetArrayItem(choices, 0) : NULL;
         if (choice0) {
             cJSON *finish = cJSON_GetObjectItem(choice0, "finish_reason");
@@ -681,8 +682,29 @@ esp_err_t llm_chat_tools(const char *system_prompt,
                         memcpy(resp->text, content->valuestring, tlen);
                         resp->text_len = tlen;
                     }
+                } else if (content && cJSON_IsArray(content)) {
+                    size_t total = 0;
+                    cJSON *blk;
+                    cJSON_ArrayForEach(blk, content) {
+                        cJSON *bt = cJSON_GetObjectItem(blk, "text");
+                        if (bt && cJSON_IsString(bt)) total += strlen(bt->valuestring);
+                    }
+                    if (total > 0) {
+                        resp->text = calloc(1, total + 1);
+                        if (resp->text) {
+                            size_t off = 0;
+                            cJSON_ArrayForEach(blk, content) {
+                                cJSON *bt = cJSON_GetObjectItem(blk, "text");
+                                if (bt && cJSON_IsString(bt)) {
+                                    size_t blen = strlen(bt->valuestring);
+                                    memcpy(resp->text + off, bt->valuestring, blen);
+                                    off += blen;
+                                }
+                            }
+                            resp->text_len = off;
+                        }
+                    }
                 }
-
                 cJSON *tool_calls = cJSON_GetObjectItem(message, "tool_calls");
                 if (tool_calls && cJSON_IsArray(tool_calls)) {
                     cJSON *tc;
