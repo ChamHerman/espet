@@ -58,6 +58,18 @@ static int cmd_wifi_status(int argc, char **argv)
     return 0;
 }
 
+/* --- wifi_prov command --- */
+static int cmd_wifi_prov(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    printf("Erasing Wi-Fi credentials and rebooting into BLE provisioning...\n");
+    wifi_manager_clear_credentials();
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+    return 0;
+}
+
 /* --- set_tg_token command --- */
 static struct {
     struct arg_str *token;
@@ -828,6 +840,14 @@ esp_err_t serial_cli_init(void)
         .func = &cmd_wifi_scan,
     };
     esp_console_cmd_register(&wifi_scan_cmd);
+
+    /* wifi_prov */
+    esp_console_cmd_t wifi_prov_cmd = {
+        .command = "wifi_prov",
+        .help = "Erase WiFi credentials and reboot into BLE provisioning",
+        .func = &cmd_wifi_prov,
+    };
+    esp_console_cmd_register(&wifi_prov_cmd);
 
     /* set_tg_token */
     tg_token_args.token = arg_str1(NULL, NULL, "<token>", "Telegram bot token");

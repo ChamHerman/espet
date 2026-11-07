@@ -29,7 +29,7 @@
 #include "sync/backend_discovery.h"
 #include "display/display_status.h"
 #include "skills/skill_loader.h"
-#include "onboard/wifi_onboard.h"
+#include "onboard/wifi_onboard_ble.h"
 #include "tools/button_handler.h"
 #include "tools/tool_audio.h"
 #include "voice/voice_client.h"
@@ -312,13 +312,9 @@ void app_main(void)
     }
 
     if (!wifi_ok) {
-        ESP_LOGW(TAG, "Entering WiFi onboarding mode...");
-        wifi_onboard_start(WIFI_ONBOARD_MODE_CAPTIVE);  /* blocks, restarts on success */
+        ESP_LOGW(TAG, "Entering WiFi BLE onboarding mode...");
+        wifi_onboard_ble_start();  /* blocks, restarts on success */
         return;  /* unreachable */
-    }
-
-    if (wifi_onboard_start(WIFI_ONBOARD_MODE_ADMIN) != ESP_OK) {
-        ESP_LOGW(TAG, "Local admin portal unavailable; continuing without config hotspot");
     }
 
     {

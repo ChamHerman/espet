@@ -190,7 +190,7 @@ nvs_flash → SPIFFS → message_bus → memory_store → skill_loader → sessi
 → tool_registry → camera → button_handler → cron_service → heartbeat
 → config_sync → agent_loop → serial_cli
 │
-wifi start ──fail──▶ captive portal onboarding (blocks, reboots on success)
+wifi start ──fail──▶ BLE Wi-Fi onboarding (PROV_ESPET_XXXX, Web Bluetooth/app, reboots on success)
 │ok
 outbound dispatch task → agent_loop_start → backend_discovery_start (last)
 → telegram/feishu start → cron_start → heartbeat_start → ws_server → config_sync_start
@@ -290,10 +290,11 @@ outbound dispatch task → agent_loop_start → backend_discovery_start (last)
 
 ### 3.6 Connectivity & onboarding
 
-`wifi/wifi_manager.c` (credential store + retry/backoff) and
-`onboard/wifi_onboard.c` (captive portal: `/scan`, `/config`, `/save` —
-first-boot setup from a phone). `ota/` for firmware updates.
-
+`wifi/wifi_manager.c` (credential store + retry/backoff), `onboard/wifi_onboard_ble.c`
+(BLE Wi-Fi provisioning via Apache NimBLE and Protocomm with Security 0 plain text;
+allows personal hotspot onboarding without app via Web Bluetooth, releases BT RAM
+on completion), and `onboard/wifi_onboard.c` (legacy captive portal fallback).
+`ota/` for firmware updates.
 ---
 
 ## 4. Backend (`espet-backend/`)
@@ -1295,3 +1296,4 @@ Append-only session log. Newest first. One line per change:
 - 2026-11-06 — Fixed sound pitch change and robotic comb distortion: removed sample-by-sample Left/Right channel swapping in firmware `capture_task` (`tool_audio.c`) that was violently chopping waveforms and doubling pitch; replaced backend multi-harmonic comb filter in `voice_router.py` with linear 80 Hz studio low-cut filter and gentle 3x voice normalization, mathematically preserving authentic human voice pitch (files: main/tools/tool_audio.c, espet-backend/api/voice_router.py, .agent/SYSTEM_OVERVIEW.md).
 - 2026-11-06 — Added narrow 3-band IIR biquad notch filter (169.2 Hz, 338.3 Hz, 507.5 Hz) in `voice_router.py`: achieved 85% reduction in breadboard OLED charge-pump hum without affecting voice vowels or formants; provided hardware bottom-port acoustic aperture guidance (files: espet-backend/api/voice_router.py, .agent/SYSTEM_OVERVIEW.md).
 - 2026-11-06 — Restored natural human voice pitch and playback speed: diagnosed 2x speed / chipmunk pitch bug caused by ESP32 I2S DMA mono slot-mask decimation (`capture_task` assumed stereo interleaved buffer `[L, R]` and indexed `dma_buf[f * 2]`, dropping 50% of speech samples and halving effective sample rate to 8 kHz); implemented `detect_pitch_f0` and `check_and_fix_pitch` in `espet-backend/api/voice_router.py` to automatically detect octave-shifted pitch (> 270 Hz) and upsample 8k -> 16k, restoring exact natural human pitch (~179.8 Hz) and 1x speed; updated firmware `capture_task` in `main/tools/tool_audio.c` to read all consecutive 32-bit DMA words for genuine 16 kHz capture; updated `data/last_capture.wav` (files: espet-backend/api/voice_router.py, main/tools/tool_audio.c, .agent/SYSTEM_OVERVIEW.md).
+- 2026-11-07 — Implemented BLE Wi-Fi provisioning (Apache NimBLE) with Web Bluetooth support (no app needed): resolved phone personal hotspot teardown issue during SoftAP onboarding by implementing `main/onboard/wifi_onboard_ble.c` using `wifi_prov_mgr` and `wifi_prov_scheme_ble`; device advertises `PROV_ESPET_XXXX`, scans 2.4 GHz channels, receives credentials over BLE with Security 0, verifies connection and IP, saves to NVS (`MIMI_NVS_WIFI`), and deinitializes BLE stack releasing controller RAM back to heap; added `wifi_prov` CLI command in `main/cli/serial_cli.c`; integrated standalone Web Bluetooth onboarding page in `docs/ble_prov.html` and `espet-backend/static/ble_prov.html` for single-tap pairing from phone/desktop Chrome without installing any mobile app; updated boot sequence in `main/mimi.c` and Kconfig in `sdkconfig.defaults.esp32s3` (files: main/onboard/wifi_onboard_ble.h, main/onboard/wifi_onboard_ble.c, main/mimi.c, main/cli/serial_cli.c, main/CMakeLists.txt, sdkconfig.defaults.esp32s3, docs/ble_prov.html, espet-backend/static/ble_prov.html, .agent/SYSTEM_OVERVIEW.md).

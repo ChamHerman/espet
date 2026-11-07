@@ -185,6 +185,19 @@ esp_err_t wifi_manager_set_credentials(const char *ssid, const char *password)
     return ESP_OK;
 }
 
+esp_err_t wifi_manager_clear_credentials(void)
+{
+    nvs_handle_t nvs;
+    if (nvs_open(MIMI_NVS_WIFI, NVS_READWRITE, &nvs) == ESP_OK) {
+        nvs_erase_key(nvs, MIMI_NVS_KEY_SSID);
+        nvs_erase_key(nvs, MIMI_NVS_KEY_PASS);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+        ESP_LOGI(TAG, "WiFi credentials cleared from NVS");
+    }
+    return ESP_OK;
+}
+
 EventGroupHandle_t wifi_manager_get_event_group(void)
 {
     return s_wifi_event_group;

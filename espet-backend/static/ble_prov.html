@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ESPET - Web Bluetooth Wi-Fi Provisioning</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card: #1e293b;
+      --border: #334155;
+      --text: #f8fafc;
+      --text-muted: #94a3b8;
+      --accent: #3b82f6;
+      --accent-hover: #2563eb;
+      --success: #10b981;
+      --error: #ef4444;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+      padding: 16px;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      max-width: 480px;
+      width: 100%;
+      padding: 24px;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+    }
+    h1 {
+      font-size: 1.5rem;
+      margin-bottom: 8px;
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    p.desc {
+      font-size: 0.875rem;
+      color: var(--text-muted);
+      margin-bottom: 20px;
+      line-height: 1.4;
+    }
+    .badge {
+      display: inline-block;
+      padding: 4px 8px;
+      border-radius: 6px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      background: rgba(59, 130, 246, 0.2);
+      color: var(--accent);
+      margin-bottom: 16px;
+    }
+    .step {
+      margin-bottom: 16px;
+      padding: 12px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: rgba(15, 23, 42, 0.6);
+    }
+    .step-title {
+      font-size: 0.875rem;
+      font-weight: 600;
+      margin-bottom: 8px;
+      color: var(--text);
+    }
+    input, select {
+      width: 100%;
+      padding: 10px 12px;
+      background: #0f172a;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      font-size: 0.9rem;
+      margin-bottom: 10px;
+    }
+    input:focus, select:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+    button {
+      width: 100%;
+      padding: 12px;
+      border: none;
+      border-radius: 6px;
+      font-weight: 600;
+      font-size: 0.95rem;
+      cursor: pointer;
+      background: var(--accent);
+      color: white;
+      transition: background 0.2s;
+    }
+    button:hover:not(:disabled) {
+      background: var(--accent-hover);
+    }
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    .btn-secondary {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text);
+      margin-top: 8px;
+    }
+    .btn-secondary:hover:not(:disabled) {
+      background: rgba(255,255,255,0.05);
+    }
+    #log {
+      margin-top: 16px;
+      background: #0b1120;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 10px;
+      font-family: monospace;
+      font-size: 0.75rem;
+      height: 120px;
+      overflow-y: auto;
+      color: var(--text-muted);
+    }
+    .log-line { margin-bottom: 4px; }
+    .log-info { color: #60a5fa; }
+    .log-success { color: #34d399; }
+    .log-error { color: #f87171; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="badge">No Mobile App Required</div>
+    <h1>ESPET BLE Provisioning</h1>
+    <p class="desc">
+      Configure your phone's Personal Hotspot or home Wi-Fi over Bluetooth Low Energy.
+      Your hotspot stays active throughout the entire setup.
+    </p>
+
+    <!-- Step 1: Discover device -->
+    <div class="step" id="step-connect">
+      <div class="step-title">1. Connect ESPET Device</div>
+      <button id="btn-search">Search & Pair ESPET (BLE)</button>
+    </div>
+
+    <!-- Step 2: Configure Wi-Fi -->
+    <div class="step" id="step-wifi" style="opacity: 0.5; pointer-events: none;">
+      <div class="step-title">2. Select & Enter Hotspot Details</div>
+      <input type="text" id="ssid" placeholder="Hotspot SSID (e.g. My Phone Hotspot)">
+      <input type="password" id="password" placeholder="Hotspot Password">
+      <button id="btn-provision">Connect Hotspot</button>
+      <button class="btn-secondary" id="btn-scan">Scan 2.4 GHz Networks</button>
+      <div id="scan-results" style="margin-top: 8px;"></div>
+    </div>
+
+    <!-- Live Event Log -->
+    <div class="step-title" style="margin-top: 12px;">Activity Log</div>
+    <div id="log"></div>
+  </div>
+
+  <script type="module">
+    import {
+      ESPProvisionManager,
+      ESPWifiStaState,
+      FALLBACK_SERVICE_UUID
+    } from 'https://unpkg.com/esp-idf-provisioning-web@0.0.7/dist/index.es.js';
+
+    let provDevice = null;
+
+    function log(msg, type = 'info') {
+      const el = document.getElementById('log');
+      const line = document.createElement('div');
+      line.className = `log-line log-${type}`;
+      const time = new Date().toLocaleTimeString();
+      line.textContent = `[${time}] ${msg}`;
+      el.appendChild(line);
+      el.scrollTop = el.scrollHeight;
+    }
+
+    if (!ESPProvisionManager.isBluetoothSupported()) {
+      log('Web Bluetooth is not supported in this browser. Use Chrome/Edge on Android/PC/Mac or Bluefy on iOS.', 'error');
+      document.getElementById('btn-search').disabled = true;
+    } else {
+      log('Web Bluetooth ready. Tap "Search & Pair ESPET" to begin.', 'success');
+    }
+
+    document.getElementById('btn-search').addEventListener('click', async () => {
+      log('Scanning for PROV_ESPET devices over BLE...', 'info');
+      try {
+        provDevice = await ESPProvisionManager.searchBLEDevice({
+          filters: [
+            { namePrefix: 'PROV_ESPET_' },
+            { namePrefix: 'PROV_' },
+            { services: [FALLBACK_SERVICE_UUID] }
+          ],
+          optionalServices: [FALLBACK_SERVICE_UUID]
+        });
+
+        if (!provDevice) {
+          log('No device selected.', 'error');
+          return;
+        }
+
+        const devName = provDevice.getDevice().name || 'PROV_ESPET';
+        log(`Connecting to ${devName}...`, 'info');
+        await provDevice.connect();
+        log(`Connected to ${devName}!`, 'success');
+
+        document.getElementById('step-wifi').style.opacity = '1';
+        document.getElementById('step-wifi').style.pointerEvents = 'auto';
+        document.getElementById('btn-search').textContent = `Connected: ${devName}`;
+        document.getElementById('btn-search').disabled = true;
+      } catch (err) {
+        log(`Pairing error: ${err.message}`, 'error');
+      }
+    });
+
+    document.getElementById('btn-scan').addEventListener('click', async () => {
+      if (!provDevice) return;
+      log('Requesting ESPET to scan 2.4 GHz Wi-Fi channels...', 'info');
+      try {
+        const networks = await provDevice.scanWifiList();
+        const resultsEl = document.getElementById('scan-results');
+        resultsEl.innerHTML = '';
+        if (networks && networks.length > 0) {
+          log(`Discovered ${networks.length} networks`, 'success');
+          const select = document.createElement('select');
+          select.innerHTML = '<option value="">-- Tap to select detected network --</option>' +
+            networks.map(n => `<option value="${n.ssid}">${n.ssid} (${n.rssi} dBm)</option>`).join('');
+          select.addEventListener('change', (e) => {
+            if (e.target.value) {
+              document.getElementById('ssid').value = e.target.value;
+            }
+          });
+          resultsEl.appendChild(select);
+        } else {
+          log('No networks found via scan. You can enter SSID manually.', 'info');
+        }
+      } catch (err) {
+        log(`Scan failed: ${err.message}`, 'error');
+      }
+    });
+
+    document.getElementById('btn-provision').addEventListener('click', async () => {
+      if (!provDevice) return;
+      const ssid = document.getElementById('ssid').value.trim();
+      const password = document.getElementById('password').value;
+
+      if (!ssid) {
+        log('Please enter Hotspot SSID', 'error');
+        return;
+      }
+
+      log(`Sending credentials for "${ssid}" to ESPET...`, 'info');
+      document.getElementById('btn-provision').disabled = true;
+
+      try {
+        await provDevice.provision(ssid, password);
+        log('Credentials delivered. ESPET testing connection...', 'info');
+
+        let status;
+        let pollCount = 0;
+        do {
+          await new Promise(r => setTimeout(r, 2000));
+          status = await provDevice.fetchWifiStatus();
+          pollCount++;
+          log(`Connection state: ${status.staState}`, 'info');
+        } while (status.staState === ESPWifiStaState.connecting && pollCount < 15);
+
+        if (status.staState === ESPWifiStaState.connected) {
+          log('WiFi connected successfully! ESPET saving credentials to NVS and rebooting...', 'success');
+          document.getElementById('btn-provision').textContent = 'Provisioned & Connected!';
+        } else if (status.staState === ESPWifiStaState.failed) {
+          log(`Failed to connect: ${status.failedReason || 'Auth/timeout error'}`, 'error');
+          document.getElementById('btn-provision').disabled = false;
+        } else {
+          log('Provisioning request accepted. Device restarting.', 'success');
+        }
+      } catch (err) {
+        log(`Provisioning error: ${err.message}`, 'error');
+        document.getElementById('btn-provision').disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
