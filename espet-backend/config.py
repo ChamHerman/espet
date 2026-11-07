@@ -40,7 +40,13 @@ class Settings(BaseSettings):
 
     # --- Voice pipeline (STT/TTS) ---
     # STT: faster-whisper model size: tiny, base, small, medium...
-    voice_stt_model: str = "small"
+    voice_stt_model: str = "base"
+    # STT device: "auto", "cuda", or "cpu"
+    voice_stt_device: str = "auto"
+    # STT compute type: "auto", "float16", "int8", "int8_float16"
+    voice_stt_compute_type: str = "auto"
+    # STT beam size: 1 for fast greedy decoding, >1 for beam search
+    voice_stt_beam_size: int = 1
     # None = auto-detect within allowed languages; "en"/"zh" forces a single language
     voice_language: str | None = None
     # Restrict Whisper auto-detection to these languages (comma-separated, e.g. "en,zh")
