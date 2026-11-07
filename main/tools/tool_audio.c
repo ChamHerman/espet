@@ -130,7 +130,6 @@ static volatile bool s_playing                = false;
  * the playback phase still corrupted TX (field: noise burst instead of
  * speech, "ESPeting..."). */
 static volatile bool s_speaker_busy           = false;
-static TaskHandle_t  s_capture_task_handle    = NULL;
 static int16_t      *s_pcm_buf                = NULL; /* PSRAM — mono 16-bit */
 static size_t        s_pcm_samples_captured   = 0;
 static size_t        s_capture_max            = 0; /* armed capture limit */
@@ -174,7 +173,6 @@ static uint32_t      s_record_duration_ms     = 0;
 static esp_err_t audio_play_tone_execute(const char *in, char *out, size_t out_sz);
 static esp_err_t audio_record_test_execute(const char *in, char *out, size_t out_sz);
 static esp_err_t audio_spktest_execute(const char *in, char *out, size_t out_sz);
-static void      capture_task(void *arg);
 static void      dump_capture_stats(void);
 static void      log_gpio_states(void);
 static esp_err_t play_tone(uint32_t freq_hz, uint32_t duration_ms, float vol);
@@ -520,122 +518,7 @@ static esp_err_t play_tone(uint32_t freq_hz, uint32_t duration_ms, float vol)
     return err;
 }
 
-/* =======================================================================
- * PTT Capture Task
- *
- * Called by xTaskCreate in timed_capture (audio_record_test).
- * Runs on Core 1, priority 7 (above agent loop at 6).
- *
- * RX (and TX) channels are already enabled from tool_audio_init — this
- * task only pumps i2s_channel_read into the PSRAM buffer.
- *
- * Read layout from i2s_channel_read (32-bit data, stereo):
- *   buf[f*2] = LEFT  ← INMP441 audio (24-bit in 32-bit word)
- *   buf[f*2+1] = RIGHT ← 0 (L/R=GND)
- *   int16 = raw >> 16
- * ===================================================================== */
-static void capture_task(void *arg)
-{
-    /* Allocate read chunk on internal RAM (DMA accessible) */
-    int32_t *dma_buf = (int32_t *)malloc(AUDIO_READ_CHUNK_BYTES);
-    if (!dma_buf) {
-        ESP_LOGE(TAG, "capture_task: chunk buffer malloc FAILED (%u bytes)",
-                 (unsigned)AUDIO_READ_CHUNK_BYTES);
-        s_recording = false;
-        s_capture_task_handle = NULL;
-        vTaskDelete(NULL);
-        return;
-    }
-
-    ESP_LOGI(TAG, "capture_task: starting — chunk=%u bytes, timeout=%d ms",
-             (unsigned)AUDIO_READ_CHUNK_BYTES, AUDIO_READ_TIMEOUT_MS);
-    log_gpio_states();
-
-    s_pcm_samples_captured = 0;
-    s_record_start_ms = (uint32_t)(esp_timer_get_time() / 1000);
-    uint32_t read_count    = 0;
-    uint32_t error_count   = 0;
-    uint32_t timeout_count = 0;
-
-    ESP_LOGI(TAG, "[MIC] Recording started — max %d s, buf %u KB",
-             AUDIO_MAX_RECORD_MS / 1000,
-             (unsigned)(AUDIO_MAX_SAMPLES * sizeof(int16_t) / 1024));
-
-    while (s_recording && s_pcm_samples_captured < AUDIO_MAX_SAMPLES) {
-        size_t bytes_read = 0;
-        esp_err_t err = i2s_channel_read(s_rx_handle, dma_buf,
-                                         AUDIO_READ_CHUNK_BYTES, &bytes_read,
-                                         AUDIO_READ_TIMEOUT_MS);
-
-        read_count++;
-
-        if (err == ESP_ERR_TIMEOUT) {
-            timeout_count++;
-            ESP_LOGW(TAG, "  [read #%u] TIMEOUT — DMA empty.", (unsigned)read_count);
-            ESP_LOGW(TAG, "  Possible causes:");
-            ESP_LOGW(TAG, "    (a) BCLK/WS not reaching INMP441 — check wiring GPIO %d,%d",
-                     MIMI_GPIO_I2S_BCLK, MIMI_GPIO_I2S_WS);
-            ESP_LOGW(TAG, "    (b) INMP441 SD not connected to GPIO %d", MIMI_GPIO_I2S_DIN);
-            ESP_LOGW(TAG, "    (c) INMP441 VCC not at 3.3V (check power)");
-            ESP_LOGW(TAG, "    (d) INMP441 L/R pin not tied to GND (check wiring)");
-            if (timeout_count >= 3) {
-                ESP_LOGE(TAG, "  !! %u consecutive timeouts — I2S clock almost certainly not "
-                              "reaching INMP441. Stopping capture.", (unsigned)timeout_count);
-                log_gpio_states();
-                break;
-            }
-            continue;
-        } else if (err != ESP_OK) {
-            error_count++;
-            ESP_LOGW(TAG, "  [read #%u] ERROR: %s (bytes_read=%u)",
-                     (unsigned)read_count, esp_err_to_name(err), (unsigned)bytes_read);
-            if (error_count > 10) {
-                ESP_LOGE(TAG, "  !! Too many errors — aborting capture.");
-                break;
-            }
-            continue;
-        }
-
-        /* Reset consecutive timeout counter on successful read */
-        timeout_count = 0;
-
-        /* Convert 32-bit DMA data → mono int16_t.
-         * When slot_mask = I2S_STD_SLOT_LEFT, DMA buffer holds single 32-bit words per sample. */
-        size_t samples_read = bytes_read / sizeof(int32_t);
-        for (size_t f = 0; f < samples_read && s_pcm_samples_captured < AUDIO_MAX_SAMPLES; f++) {
-            int32_t raw_left = dma_buf[f];
-            int32_t s = (raw_left >> 16);
-            if (s > INT16_MAX) s = INT16_MAX;
-            else if (s < INT16_MIN) s = INT16_MIN;
-            s_pcm_buf[s_pcm_samples_captured++] = (int16_t)s;
-        }
-
-        /* Progress log every ~1 second */
-        if ((read_count % (AUDIO_SAMPLE_RATE / AUDIO_READ_CHUNK_FRAMES)) == 0) {
-            ESP_LOGI(TAG, "  [record] %u ms | %u samples | read#%u ok",
-                     (unsigned)(s_pcm_samples_captured * 1000 / AUDIO_SAMPLE_RATE),
-                     (unsigned)s_pcm_samples_captured,
-                     (unsigned)read_count);
-
-            /* Log first 4 raw int32 values from this chunk for sanity */
-            ESP_LOGI(TAG, "  [raw] L0=0x%08X L1=0x%08X L2=0x%08X L3=0x%08X",
-                     (unsigned)dma_buf[0], (unsigned)dma_buf[2],
-                     (unsigned)dma_buf[4], (unsigned)dma_buf[6]);
-        }
-    }
-
-    s_record_duration_ms = (uint32_t)(esp_timer_get_time() / 1000) - s_record_start_ms;
-
-    free(dma_buf);
-
-    ESP_LOGI(TAG, "[MIC] Recording stopped — %u samples | %u ms | %u reads | %u errors",
-             (unsigned)s_pcm_samples_captured, (unsigned)s_record_duration_ms,
-             (unsigned)read_count, (unsigned)error_count);
-
-    s_capture_task_handle = NULL;
-    vTaskDelete(NULL);
-}
-
+/* Capture is handled directly by mic_feeder_task (single I2S DMA reader) */
 /* =======================================================================
  * Mic feeder task — drains the I2S DMA into the RX ring buffer.
  *
@@ -653,7 +536,7 @@ static void mic_feeder_task(void *arg)
     while (s_feeder_run) {
         /* Park during a speaker session or standalone recording test: I2S TX
          * needs the bus/CPU, or audio_record_test owns RX DMA. */
-        if (s_capture_task_handle || s_playing || s_speaker_busy) {
+        if (s_playing || s_speaker_busy) {
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
@@ -718,6 +601,9 @@ static void mic_feeder_task(void *arg)
                 s_rx_ring[s_rx_ring_w] = s;
                 s_rx_ring_w = (s_rx_ring_w + 1) & RX_RING_MASK;
                 s_ring_written++;
+            }
+            if (s_recording && s_pcm_buf && s_pcm_samples_captured < s_capture_max) {
+                s_pcm_buf[s_pcm_samples_captured++] = s;
             }
         }
 
@@ -861,14 +747,8 @@ void tool_audio_rx_flush(void)
     if (!s_rx_handle) {
         return;
     }
-    int32_t scratch[AUDIO_READ_CHUNK_FRAMES * 2];
-    size_t bytes = 0;
-    int loops = 0;
-    while (loops++ < 32 &&
-           i2s_channel_read(s_rx_handle, scratch, sizeof(scratch),
-                            &bytes, 0) == ESP_OK && bytes > 0) {
-        /* keep draining until dry */
-    }
+    /* Single DMA owner is mic_feeder_task — flush ring buffer without touching DMA */
+    tool_audio_ring_flush();
 }
 
 /* Clear all audio caches (drains both I2S hardware DMA FIFO and software ring buffer) */
@@ -913,25 +793,16 @@ static esp_err_t timed_capture(uint32_t duration_ms, size_t *out_n, uint32_t *ou
         return ESP_ERR_INVALID_STATE;
     }
 
+    tool_audio_clear_cache();
+    s_pcm_samples_captured = 0;
+    s_capture_max = (duration_ms * (AUDIO_SAMPLE_RATE / 1000));
+    if (s_capture_max > AUDIO_MAX_SAMPLES) s_capture_max = AUDIO_MAX_SAMPLES;
+    s_record_start_ms = (uint32_t)(esp_timer_get_time() / 1000);
     s_recording = true;
-    BaseType_t ret = xTaskCreatePinnedToCore(
-        capture_task, "audio_cap_t", 4096, NULL,
-        7,   /* prio 7: above agent loop (6) so DMA reads are never starved */
-        &s_capture_task_handle,
-        1);  /* Core 1: keep audio off WiFi core */
-    if (ret != pdPASS) {
-        s_recording = false;
-        return ESP_FAIL;
-    }
 
     vTaskDelay(pdMS_TO_TICKS(duration_ms));
     s_recording = false;
-
-    uint32_t wait_ms = 0;
-    while (s_capture_task_handle != NULL && wait_ms < 1500) {
-        vTaskDelay(pdMS_TO_TICKS(10));
-        wait_ms += 10;
-    }
+    s_record_duration_ms = (uint32_t)(esp_timer_get_time() / 1000) - s_record_start_ms;
 
     size_t n = s_pcm_samples_captured;
     int16_t mn = INT16_MAX, mx = INT16_MIN;
@@ -982,10 +853,15 @@ bool tool_audio_capture_arm_preroll(size_t max_samples, size_t preroll_samples)
         tool_audio_ring_flush();   /* stale buffered audio out; capture starts now */
     } else if (s_rx_ring) {
         if (preroll_samples > RX_RING_SAMPLES / 2) preroll_samples = RX_RING_SAMPLES / 2;
-        s_rx_ring_r = (s_rx_ring_w >= preroll_samples)
+        size_t r = (s_rx_ring_w >= preroll_samples)
                       ? (s_rx_ring_w - preroll_samples)
                       : (RX_RING_SAMPLES - (preroll_samples - s_rx_ring_w));
-        s_rx_ring_r &= RX_RING_MASK;
+        r &= RX_RING_MASK;
+        while (r != s_rx_ring_w && s_pcm_samples_captured < s_capture_max) {
+            s_pcm_buf[s_pcm_samples_captured++] = s_rx_ring[r];
+            r = (r + 1) & RX_RING_MASK;
+        }
+        s_rx_ring_r = s_rx_ring_w;
     }
     s_recording = true;
     return true;
@@ -1026,10 +902,8 @@ bool tool_audio_rx_read(int16_t *out, size_t max_out, size_t *out_written,
             (*out_written)++;
         }
         if (s_recording) {
-            if (s_pcm_buf && s_pcm_samples_captured < s_capture_max) {
-                s_pcm_buf[s_pcm_samples_captured++] = s;
-            } else if (out_full) {
-                *out_full = true;
+            if (s_pcm_samples_captured >= s_capture_max) {
+                if (out_full) *out_full = true;
                 break;
             }
         } else if (captured_total) {
@@ -1075,15 +949,11 @@ esp_err_t tool_audio_manual_record_start(void)
     }
 
     tool_audio_clear_cache();
+    s_pcm_samples_captured = 0;
+    s_capture_max = AUDIO_MAX_SAMPLES;
+    s_record_start_ms = (uint32_t)(esp_timer_get_time() / 1000);
     s_recording = true;
-    BaseType_t ret = xTaskCreatePinnedToCore(
-        capture_task, "audio_cap_t", 4096, NULL,
-        7, &s_capture_task_handle, 1);
-    if (ret != pdPASS) {
-        s_recording = false;
-        return ESP_FAIL;
-    }
-    tool_audio_beep(880, 100, 0.3f);
+    ESP_LOGI(TAG, "Manual recording started");
     return ESP_OK;
 }
 
@@ -1093,12 +963,7 @@ esp_err_t tool_audio_manual_record_stop(size_t *out_samples, uint32_t *out_dur_m
         return ESP_ERR_INVALID_STATE;
     }
     s_recording = false;
-
-    uint32_t wait_ms = 0;
-    while (s_capture_task_handle != NULL && wait_ms < 1500) {
-        vTaskDelay(pdMS_TO_TICKS(10));
-        wait_ms += 10;
-    }
+    s_record_duration_ms = (uint32_t)(esp_timer_get_time() / 1000) - s_record_start_ms;
 
     size_t n = s_pcm_samples_captured;
     int64_t ssq = 0;

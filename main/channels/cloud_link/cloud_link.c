@@ -81,6 +81,28 @@ static void send_hello(void)
     ESP_LOGI(TAG, "hello sent as %s", s_device_id);
 }
 
+typedef struct {
+    size_t samples;
+    uint32_t dur;
+    double rms;
+} transcribe_req_t;
+
+static void transcribe_task_fn(void *arg)
+{
+    transcribe_req_t *req = (transcribe_req_t *)arg;
+    const int16_t *pcm = tool_audio_get_last_capture(&req->samples, &req->dur);
+    char *transcript = (pcm && req->samples > 0) ? voice_client_transcribe(pcm, req->samples) : NULL;
+    char resp[512];
+    snprintf(resp, sizeof(resp),
+             "{\"type\":\"record_result\",\"ok\":true,\"samples\":%u,\"duration_ms\":%u,\"rms\":%.1f,\"transcript\":\"%s\"}",
+             (unsigned)req->samples, (unsigned)req->dur, req->rms,
+             transcript ? transcript : "");
+    send_json(resp);
+    if (transcript) free(transcript);
+    free(req);
+    vTaskDelete(NULL);
+}
+
 /* -------------------------------------------------- inbound frame handling */
 
 static void handle_frame(char *json_str)
@@ -159,15 +181,19 @@ static void handle_frame(char *json_str)
                      "{\"type\":\"record_result\",\"ok\":false,\"error\":\"no_audio\"}");
             send_json(resp);
         } else {
-            const int16_t *pcm = tool_audio_get_last_capture(&samples, &dur);
-            char *transcript = (pcm && samples > 0) ? voice_client_transcribe(pcm, samples) : NULL;
-            char resp[512];
-            snprintf(resp, sizeof(resp),
-                     "{\"type\":\"record_result\",\"ok\":true,\"samples\":%u,\"duration_ms\":%u,\"rms\":%.1f,\"transcript\":\"%s\"}",
-                     (unsigned)samples, (unsigned)dur, rms,
-                     transcript ? transcript : "");
-            send_json(resp);
-            if (transcript) free(transcript);
+            transcribe_req_t *req = malloc(sizeof(transcribe_req_t));
+            if (req) {
+                req->samples = samples;
+                req->dur = dur;
+                req->rms = rms;
+                if (xTaskCreate(transcribe_task_fn, "stt_trans", 8192, req, 5, NULL) != pdPASS) {
+                    free(req);
+                    char resp[128];
+                    snprintf(resp, sizeof(resp),
+                             "{\"type\":\"record_result\",\"ok\":false,\"error\":\"task_fail\"}");
+                    send_json(resp);
+                }
+            }
         }
     } else if (strcmp(type_str, "voice_listen") == 0) {
         const cJSON *en = cJSON_GetObjectItem(root, "enabled");
@@ -292,6 +318,7 @@ static esp_err_t cloud_open(void)
         .reconnect_timeout_ms = 5000,
         .network_timeout_ms = 10000,
         .buffer_size = 4096,
+        .task_stack = 8192,
         .disable_auto_reconnect = false,
         .enable_close_reconnect = true,
         .crt_bundle_attach = esp_crt_bundle_attach,
