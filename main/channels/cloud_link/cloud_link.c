@@ -33,7 +33,7 @@
 
 static const char *TAG = "cloud";
 
-#define CLOUD_FRAME_MAX 1024
+#define CLOUD_FRAME_MAX (36 * 1024)
 
 static esp_websocket_client_handle_t s_client;
 static volatile bool s_running;
@@ -239,11 +239,11 @@ static void handle_text_chunk(esp_websocket_event_data_t *data)
     if (data->payload_offset == 0) {
         if (data->payload_len > CLOUD_FRAME_MAX) {
             ESP_LOGW(TAG, "frame too large (%d) — dropped", data->payload_len);
-            s_rx_total = data->payload_len;   /* swallow remaining slices */
+            s_rx_total = (data->data_len < data->payload_len) ? (size_t)data->payload_len : 0;
             return;
         }
         if (!s_rx_buf) {
-            s_rx_buf = heap_caps_malloc(CLOUD_FRAME_MAX + 1, MALLOC_CAP_SPIRAM);
+            s_rx_buf = heap_caps_calloc(1, CLOUD_FRAME_MAX + 1, MALLOC_CAP_SPIRAM);
             if (!s_rx_buf) {
                 return;
             }
@@ -263,8 +263,10 @@ static void handle_text_chunk(esp_websocket_event_data_t *data)
     }
 
     if ((size_t)(data->payload_offset + data->data_len) >= s_rx_total) {
-        s_rx_buf[s_rx_len] = '\0';
-        handle_frame(s_rx_buf);
+        if (s_rx_total <= CLOUD_FRAME_MAX && s_rx_buf) {
+            s_rx_buf[s_rx_len] = '\0';
+            handle_frame(s_rx_buf);
+        }
         s_rx_len = 0;
         s_rx_total = 0;
     }
