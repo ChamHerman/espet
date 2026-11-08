@@ -9,6 +9,8 @@ import type {
   Health,
   Job,
   McpTool,
+  MemoryItem,
+  MemoryQueryResponse,
   Skill,
 } from "./types";
 
@@ -77,6 +79,26 @@ export const client = {
     api<{ skills: Skill[] }>(`/api/ui/skills/${id}`, { method: "DELETE" }),
 
   reconnectMcp: () => api("/api/mcp/reconnect", json("POST", {})),
+
+  // Long-Term Memory (SQLite-Vec RAG)
+  listMemories: (p?: { category?: string; search?: string; limit?: number; offset?: number; device_id?: string }) => {
+    const q = new URLSearchParams();
+    if (p?.category && p.category !== "all") q.set("category", p.category);
+    if (p?.search) q.set("search", p.search);
+    if (p?.limit) q.set("limit", String(p.limit));
+    if (p?.offset) q.set("offset", String(p.offset));
+    if (p?.device_id) q.set("device_id", p.device_id);
+    const qs = q.toString();
+    return api<{ items: MemoryItem[]; total: number }>(`/api/memory/list${qs ? `?${qs}` : ""}`);
+  },
+  createMemoryItem: (p: { content: string; category?: string; device_id?: string }) =>
+    api<{ ok: boolean; id: number; item: MemoryItem }>("/api/memory/item", json("POST", p)),
+  updateMemoryItem: (id: number, p: { content: string; category?: string }) =>
+    api<{ ok: boolean; id: number; item: MemoryItem }>(`/api/memory/item/${id}`, json("PUT", p)),
+  deleteMemoryItem: (id: number) =>
+    api<{ ok: boolean; deleted: boolean; id: number }>(`/api/memory/item/${id}`, { method: "DELETE" }),
+  queryMemory: (query: string, top_k = 3, threshold = 0.28, device_id = "espet_s3_01") =>
+    api<MemoryQueryResponse>("/api/memory/query", json("POST", { query, top_k, threshold, device_id })),
 };
 
 /* Device WebSocket gateway address for the direct-chat view (localStorage;

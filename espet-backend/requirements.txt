@@ -17,9 +17,10 @@ google-auth-oauthlib>=1.2.0
 google-auth-httplib2>=0.2.0
 google-api-python-client>=2.150.0
 
-# Database
+# Database & Vector Memory
 aiosqlite>=0.20.0
-
+sqlite-vec>=0.1.9
+fastembed>=0.9.1
 # Security
 cryptography>=43.0.0
 

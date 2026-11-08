@@ -24,6 +24,7 @@ from config import settings
 from services.device_registry import DeviceRegistry
 from services.gateway_settings import gateway_settings
 from services.telegram_gateway import TelegramGateway, get_gateway, set_gateway
+from services.rag_service import rag_service
 
 logger = logging.getLogger("espet-backend.cloud")
 
@@ -160,7 +161,7 @@ async def ws_device(websocket: WebSocket, key: str = Query("")):
                          "ok": False, "status": 0,
                          "body": json.dumps({"error": "empty llm body"})}))
                     continue
-                asyncio.create_task(_llm_relay(websocket, request_id, body_str))
+                asyncio.create_task(_llm_relay(websocket, request_id, body_str, device_id=device_id))
 
             elif ftype == "ping":
                 await websocket.send_text(json.dumps({"type": "pong"}))
@@ -221,7 +222,7 @@ async def _photo_logged(gateway, chat_id: str, image: bytes, caption: str) -> No
 # provider, returning the raw provider response to the device.
 # ---------------------------------------------------------------------------
 
-async def _llm_relay(websocket, request_id, body_str: str) -> None:
+async def _llm_relay(websocket, request_id, body_str: str, device_id: str = "espet_s3_01") -> None:
     cfg = gateway_settings.llm_config()
 
     async def _reply(ok: bool, status: int, body_text: str) -> None:
@@ -249,6 +250,51 @@ async def _llm_relay(websocket, request_id, body_str: str) -> None:
         body.setdefault("stream", False)
         if cfg["model"]:
             body["model"] = cfg["model"]   # server-side model override
+
+        # --- RAG Injection ---
+        messages = body.get("messages")
+        if isinstance(messages, list) and messages:
+            user_query = ""
+            for msg in reversed(messages):
+                if isinstance(msg, dict) and msg.get("role") == "user":
+                    c = msg.get("content")
+                    if isinstance(c, str):
+                        user_query = c.strip()
+                    elif isinstance(c, list):
+                        parts = [p.get("text", "") for p in c if isinstance(p, dict) and p.get("type") == "text"]
+                        user_query = " ".join(parts).strip()
+                    if user_query:
+                        break
+
+            if user_query:
+                try:
+                    rag_res = await asyncio.to_thread(
+                        rag_service.search,
+                        query=user_query,
+                        device_id=device_id,
+                        top_k=settings.rag_top_k,
+                        threshold=settings.rag_threshold,
+                    )
+                    if rag_res.get("results"):
+                        lines = ["## Retrieved Long-Term Memory (via SQLite-Vec RAG):"]
+                        for item in rag_res["results"]:
+                            lines.append(f"- [{item['source_type']}]: {item['content']}")
+                        injected_block = "\n".join(lines)
+
+                        if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
+                            orig_content = messages[0].get("content") or ""
+                            messages[0]["content"] = f"{orig_content}\n\n{injected_block}".strip()
+                        else:
+                            messages.insert(0, {"role": "system", "content": injected_block})
+
+                        logger.info(
+                            "rag: Injected %d memory chunk(s) for device %s (%.2f ms)",
+                            len(rag_res["results"]),
+                            device_id,
+                            rag_res.get("latency_ms", 0.0),
+                        )
+                except Exception as ex:
+                    logger.warning("rag: search/injection failed: %r", ex)
     used_model = body.get("model") if isinstance(body, dict) else None
 
     url = cfg["base_url"].rstrip("/") + "/chat/completions"
@@ -262,10 +308,36 @@ async def _llm_relay(websocket, request_id, body_str: str) -> None:
         if resp.status_code != 200 or len(resp.text) < 400:
             logger.info("LLM relay payload preview: %.300s", resp.text)
         await _reply(resp.status_code == 200, resp.status_code, resp.text)
+        if resp.status_code == 200:
+            asyncio.create_task(_capture_episodic_action(device_id, resp.text))
     except Exception as e:
         logger.warning("LLM relay to %s failed: %r", url, e)
         await _reply(False, 0, json.dumps({"error": f"{type(e).__name__}: {e}"}))
 
+
+async def _capture_episodic_action(device_id: str, resp_text: str) -> None:
+    try:
+        data = json.loads(resp_text)
+        choices = data.get("choices", [])
+        if not choices:
+            return
+        msg = choices[0].get("message", {})
+        tool_calls = msg.get("tool_calls", [])
+        for tc in tool_calls:
+            fn = tc.get("function", {})
+            name = fn.get("name", "")
+            args = fn.get("arguments", "")
+            if name and name not in ("memory_save", "memory_search"):
+                summary = f"Action: executed tool {name} with args {args[:120]}"
+                await asyncio.to_thread(
+                    rag_service.add_memory,
+                    device_id=device_id,
+                    content=summary,
+                    source_type="action",
+                    source_ref="relay_tool",
+                )
+    except Exception as e:
+        logger.debug("Episodic action capture skipped: %r", e)
 
 # ---------------------------------------------------------------------------
 # REST — bindings & connected devices (device-key guarded)

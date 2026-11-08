@@ -278,4 +278,111 @@ async def execute_list_events(arguments: dict) -> dict:
 CUSTOM_TOOLS["create_event"]["executor"] = execute_create_event
 CUSTOM_TOOLS["list_events"]["executor"] = execute_list_events
 
+from services.rag_service import rag_service
+
+async def execute_memory_save(arguments: dict) -> dict:
+    content = (
+        arguments.get("content")
+        or arguments.get("text")
+        or arguments.get("memory")
+        or arguments.get("fact")
+        or ""
+    )
+    content = str(content).strip()
+    if not content:
+        return {"error": "Parameter 'content' is required to save memory."}
+
+    category = str(arguments.get("category") or "fact").strip().lower()
+    if category not in ("fact", "preference", "event", "action", "note"):
+        category = "fact"
+
+    device_id = str(arguments.get("device_id") or "espet_s3_01").strip()
+    try:
+        chunk_id = rag_service.add_memory(
+            device_id=device_id,
+            content=content,
+            source_type=category,
+            source_ref="agent_tool",
+        )
+        return {"result": f"Successfully saved to long-term memory (ID: {chunk_id}): {content}"}
+    except Exception as e:
+        return {"error": f"Failed to save memory: {e}"}
+
+async def execute_memory_search(arguments: dict) -> dict:
+    query = (
+        arguments.get("query")
+        or arguments.get("search")
+        or arguments.get("text")
+        or ""
+    )
+    query = str(query).strip()
+    if not query:
+        return {"error": "Parameter 'query' is required to search memory."}
+
+    top_k = arguments.get("top_k", 3)
+    try:
+        top_k = int(top_k)
+    except (ValueError, TypeError):
+        top_k = 3
+
+    device_id = str(arguments.get("device_id") or "espet_s3_01").strip()
+    try:
+        res = rag_service.search(query=query, device_id=device_id, top_k=top_k)
+        matches = res.get("results", [])
+        if not matches:
+            return {"result": f"No relevant long-term memories found for query '{query}'."}
+        lines = [f"Found {len(matches)} relevant memory item(s):"]
+        for m in matches:
+            sim_pct = int(m.get("similarity", 0.0) * 100)
+            lines.append(f"- [{m.get('source_type', 'fact')}] {m.get('content')} (relevance: {sim_pct}%)")
+        return {"result": "\n".join(lines), "count": len(matches)}
+    except Exception as e:
+        return {"error": f"Failed to search memory: {e}"}
+
+CUSTOM_TOOLS["memory_save"] = {
+    "description": (
+        "Save a critical fact, user preference, routine, or event into ESPET's "
+        "long-term vector memory database so it persists across conversations and reboots."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "content": {
+                "type": "string",
+                "description": "The exact fact, habit, routine, or event to remember"
+            },
+            "category": {
+                "type": "string",
+                "enum": ["fact", "preference", "event", "action"],
+                "description": "Category of the memory (default: fact)"
+            }
+        },
+        "required": ["content"]
+    },
+    "server": "custom-backend",
+    "executor": execute_memory_save
+}
+
+CUSTOM_TOOLS["memory_search"] = {
+    "description": (
+        "Search ESPET's long-term vector database for past memories, user habits, "
+        "commitments, or previously learned knowledge."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "The topic, person, or keyword to search in long-term memory"
+            },
+            "top_k": {
+                "type": "integer",
+                "description": "Maximum number of memory items to return (default: 3)"
+            }
+        },
+        "required": ["query"]
+    },
+    "server": "custom-backend",
+    "executor": execute_memory_search
+}
 

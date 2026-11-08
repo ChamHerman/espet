@@ -73,7 +73,9 @@ class Settings(BaseSettings):
 
     # --- Database ---
     db_path: str = "db/tokens.db"
-
+    sqlite_db_path: str = "db/espet.db"
+    rag_top_k: int = 3
+    rag_threshold: float = 0.28
     # --- Hybrid mode cloud gateway (Telegram & LLM relay for the device) ---
     # When enabled, the backend polls Telegram for the device (single poller)
     # and routes messages over the device's persistent WebSocket /ws/device.
