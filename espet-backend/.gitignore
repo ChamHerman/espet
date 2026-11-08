@@ -18,13 +18,16 @@ __pycache__/
 dist/
 build/
 
+*.log
+.pytest_cache/
 # Virtual environment
 venv/
 .venv/
 env/
 
-# Node (front-end vendor deps; built output is committed to static/vendor)
+# Node (front-end vendor deps and built output)
 node_modules/
+static/vendor/app/
 
 # IDE
 .vscode/

@@ -35,7 +35,7 @@ idf.py fullclean && idf.py build
 ### Option 2: Runtime Configuration (CLI)
 
 ```
-mimi> set_feishu_creds cli_xxxxxxxxxxxxxx xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+espet> set_feishu_creds cli_xxxxxxxxxxxxxx xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
 ## Feishu App Setup

@@ -25,8 +25,11 @@ cryptography>=43.0.0
 
 # Voice pipeline (STT/TTS) — see api/voice_router.py
 faster-whisper>=1.0.0
+av>=11,<19
 edge-tts>=7.3.1
 numpy>=1.26.0
+# Optional: Windows/Linux NVIDIA GPU acceleration (sub-200ms latency)
+# pip install nvidia-cublas-cu12 nvidia-cudnn-cu12
 
 # Utilities
 python-dotenv>=1.0.0

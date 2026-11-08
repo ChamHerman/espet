@@ -1,6 +1,6 @@
 #pragma once
 
-/* MimiClaw Global Configuration */
+/* ESPET Global Configuration */
 
 /* Build-time secrets (highest priority, override NVS) */
 #if __has_include("mimi_secrets.h")
@@ -23,7 +23,7 @@
 #define MIMI_SECRET_MODEL ""
 #endif
 #ifndef MIMI_SECRET_MODEL_PROVIDER
-#define MIMI_SECRET_MODEL_PROVIDER "anthropic"
+#define MIMI_SECRET_MODEL_PROVIDER "openai"
 #endif
 #ifndef MIMI_SECRET_PROXY_HOST
 #define MIMI_SECRET_PROXY_HOST ""
@@ -48,9 +48,9 @@
 #endif
 
 /* WiFi */
-#define MIMI_WIFI_MAX_RETRY 10
+#define MIMI_WIFI_MAX_RETRY 5
 #define MIMI_WIFI_RETRY_BASE_MS 1000
-#define MIMI_WIFI_RETRY_MAX_MS 30000
+#define MIMI_WIFI_RETRY_MAX_MS 15000
 
 /* Telegram Bot */
 #define MIMI_TG_POLL_TIMEOUT_S 5
@@ -193,8 +193,12 @@
 #define MIMI_NVS_KEY_PROXY_TYPE "proxy_type"
 
 /* WiFi Onboarding (Captive Portal) */
-#define MIMI_ONBOARD_AP_PREFIX "MimiClaw-"
+#define MIMI_ONBOARD_AP_PREFIX "ESPET-"
 #define MIMI_ONBOARD_AP_PASS "" /* open network */
 #define MIMI_ONBOARD_HTTP_PORT 80
 #define MIMI_ONBOARD_DNS_STACK (4 * 1024)
 #define MIMI_ONBOARD_MAX_SCAN 20
+
+/* WiFi Onboarding (BLE Provisioning) */
+#define MIMI_BLE_PROV_PREFIX "PROV_ESPET_"
+#define MIMI_BLE_PROV_RESTART_DELAY_MS 2000

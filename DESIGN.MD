@@ -9,7 +9,8 @@ Implementation lives in: `src/global.css` (canvas, orbs, buttons, utilities),
 `src/theme.tsx` (antd tokens + `ESPET_COLORS`), `src/ui.tsx` (glass primitives,
 badges, layout), `src/components/` (GlassNav, SectionRail, StatusChips,
 MarkdownField/SourceField), `static/index.html` (boot splash, favicon, fonts),
-`static/cloud.html` (Cloud Gateway), `static/stt.html` (Mic & STT Tester).
+`static/cloud.html` (Cloud Gateway), `static/stt.html` (Mic & STT Tester),
+`docs/ble_prov.html` (BLE Wi-Fi Provisioning, mirrored to `static/ble_prov.html`).
 Built by `npm run build:app` → `static/vendor/app/` (cache-bust `?v=<hash>`
 stamped automatically by the build — never bump it by hand).
 

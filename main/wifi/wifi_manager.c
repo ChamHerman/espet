@@ -9,6 +9,8 @@
 #include "esp_netif.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "esp_attr.h"
+#include "esp_system.h"
 
 static const char *TAG = "wifi";
 
@@ -17,6 +19,8 @@ static int s_retry_count = 0;
 static char s_ip_str[16] = "0.0.0.0";
 static bool s_connected = false;
 static bool s_reconnect_enabled = true;
+static RTC_DATA_ATTR bool s_ble_prov_requested = false;
+static bool s_runtime_connected = false;
 
 static const char *wifi_reason_to_str(wifi_err_reason_t reason)
 {
@@ -59,14 +63,20 @@ static void event_handler(void *arg, esp_event_base_t event_base,
             s_retry_count++;
         } else {
             ESP_LOGE(TAG, "Failed to connect after %d retries", MIMI_WIFI_MAX_RETRY);
-            display_status_set("WiFi FAILED", "check router");
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+            if (s_runtime_connected) {
+                ESP_LOGW(TAG, "Wi-Fi connection lost at runtime. Triggering BLE onboarding fallback...");
+                wifi_manager_trigger_ble_prov();
+            } else {
+                display_status_set("WiFi FAILED", "check router");
+            }
         }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         snprintf(s_ip_str, sizeof(s_ip_str), IPSTR, IP2STR(&event->ip_info.ip));
         ESP_LOGI(TAG, "Connected! IP: %s", s_ip_str);
         s_retry_count = 0;
+        s_runtime_connected = true;
         s_connected = true;
         esp_wifi_set_ps(WIFI_PS_NONE);
 
@@ -185,6 +195,19 @@ esp_err_t wifi_manager_set_credentials(const char *ssid, const char *password)
     return ESP_OK;
 }
 
+esp_err_t wifi_manager_clear_credentials(void)
+{
+    nvs_handle_t nvs;
+    if (nvs_open(MIMI_NVS_WIFI, NVS_READWRITE, &nvs) == ESP_OK) {
+        nvs_erase_key(nvs, MIMI_NVS_KEY_SSID);
+        nvs_erase_key(nvs, MIMI_NVS_KEY_PASS);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+        ESP_LOGI(TAG, "WiFi credentials cleared from NVS");
+    }
+    return ESP_OK;
+}
+
 EventGroupHandle_t wifi_manager_get_event_group(void)
 {
     return s_wifi_event_group;
@@ -289,4 +312,20 @@ void wifi_manager_set_reconnect_enabled(bool enabled)
     if (!enabled) {
         s_retry_count = 0;
     }
+}
+
+void wifi_manager_trigger_ble_prov(void)
+{
+    s_ble_prov_requested = true;
+    display_status_set("WiFi Setup (BLE)", "Starting BLE...");
+    ESP_LOGW(TAG, "Rebooting into BLE onboarding mode...");
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+}
+
+bool wifi_manager_is_ble_prov_requested(void)
+{
+    bool req = s_ble_prov_requested;
+    s_ble_prov_requested = false;
+    return req;
 }

@@ -40,7 +40,13 @@ class Settings(BaseSettings):
 
     # --- Voice pipeline (STT/TTS) ---
     # STT: faster-whisper model size: tiny, base, small, medium...
-    voice_stt_model: str = "small"
+    voice_stt_model: str = "base"
+    # STT device: "auto", "cuda", or "cpu"
+    voice_stt_device: str = "auto"
+    # STT compute type: "auto", "float16", "int8", "int8_float16"
+    voice_stt_compute_type: str = "auto"
+    # STT beam size: 1 for fast greedy decoding, >1 for beam search
+    voice_stt_beam_size: int = 1
     # None = auto-detect within allowed languages; "en"/"zh" forces a single language
     voice_language: str | None = None
     # Restrict Whisper auto-detection to these languages (comma-separated, e.g. "en,zh")
@@ -50,7 +56,7 @@ class Settings(BaseSettings):
     #   zh-HK-HiuMaanNeural / en-US-AriaNeural ...
     voice_tts_voice: str = "zh-CN-XiaoxiaoNeural"
     # Comma-separated wake words checked against transcripts (case-insensitive)
-    voice_wake_words: str = "mimi,hey mimi,hi mimi,ok mimi,expert,hey expert,hi expert,espet,hey espet,hi esp,米米,咪咪,小米"
+    voice_wake_words: str = "espet,hey espet,hi espet,ok espet,expert,hey expert,hi expert,mimi,hey mimi,hi mimi,ok mimi,米米,咪咪,小米"
     # Whisper initial_prompt. Leave EMPTY unless you know what you are doing:
     # putting the wake words here biases the decoder and was verified to turn
     # room noise / speaker echo into exactly the wake word (endless self-wake).

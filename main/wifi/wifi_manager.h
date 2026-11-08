@@ -41,6 +41,11 @@ const char *wifi_manager_get_ip(void);
 esp_err_t wifi_manager_set_credentials(const char *ssid, const char *password);
 
 /**
+ * Clear saved WiFi credentials from NVS.
+ */
+esp_err_t wifi_manager_clear_credentials(void);
+
+/**
  * Get the event group for WiFi state (WIFI_CONNECTED_BIT / WIFI_FAIL_BIT).
  */
 EventGroupHandle_t wifi_manager_get_event_group(void);
@@ -63,4 +68,15 @@ esp_err_t wifi_manager_stop(void);
 /**
  * Enable or disable STA auto-reconnect on disconnect events.
  */
+
+/**
+ * Check if device was requested to reboot directly into BLE provisioning mode.
+ * Clears the flag on read.
+ */
+bool wifi_manager_is_ble_prov_requested(void);
+
+/**
+ * Trigger immediate reboot into BLE provisioning mode.
+ */
+void wifi_manager_trigger_ble_prov(void);
 void wifi_manager_set_reconnect_enabled(bool enabled);

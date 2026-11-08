@@ -29,7 +29,7 @@
 #include "sync/backend_discovery.h"
 #include "display/display_status.h"
 #include "skills/skill_loader.h"
-#include "onboard/wifi_onboard.h"
+#include "onboard/wifi_onboard_ble.h"
 #include "tools/button_handler.h"
 #include "tools/tool_audio.h"
 #include "voice/voice_client.h"
@@ -149,6 +149,15 @@ static void remote_tools_fetch_task(void *arg)
     }
     vTaskDelete(NULL);
 }
+/* ponytail: skip status and error fallback strings so TTS only speaks true assistant answers */
+static bool should_speak_reply(const char *content)
+{
+    if (!content || content[0] == '\0') return false;
+    if (strncmp(content, "ESPeting", 8) == 0) return false;
+    if (strstr(content, "Sorry, I encountered an error") != NULL) return false;
+    return true;
+}
+
 
 static void outbound_dispatch_task(void *arg)
 {
@@ -185,7 +194,9 @@ static void outbound_dispatch_task(void *arg)
                     ESP_LOGI(TAG, "Telegram send success for %s (%d bytes)", msg.chat_id, (int)strlen(msg.content));
                     /* Final agent replies are spoken too (user request):
                      * every text answer also comes out of the speaker. */
-                    voice_client_speak(msg.content);
+                    if (should_speak_reply(msg.content)) {
+                        voice_client_speak(msg.content);
+                    }
                 }
             }
 #if MIMI_CLOUD_LINK_ENABLE
@@ -216,10 +227,11 @@ static void outbound_dispatch_task(void *arg)
                     ESP_LOGI(TAG, "Cloud send success for %s (%d bytes)",
                              msg.chat_id, (int)strlen(msg.content));
                     /* Final agent replies are spoken too (user request) */
-                    voice_client_speak(msg.content);
+                    if (should_speak_reply(msg.content)) {
+                        voice_client_speak(msg.content);
+                    }
                 }
             }
-        } else if (strcmp(msg.channel, MIMI_CHAN_FEISHU) == 0) {
 #else
         } else if (strcmp(msg.channel, MIMI_CHAN_FEISHU) == 0) {
 #endif
@@ -255,7 +267,7 @@ void app_main(void)
     esp_log_level_set("esp-x509-crt-bundle", ESP_LOG_WARN);
 
     ESP_LOGI(TAG, "========================================");
-    ESP_LOGI(TAG, "  MimiClaw - ESP32-S3 AI Agent");
+    ESP_LOGI(TAG, "  ESPET - ESP32-S3 AI Agent");
     ESP_LOGI(TAG, "========================================");
     display_status_init();
     display_status_set("Starting...", "");
@@ -292,6 +304,14 @@ void app_main(void)
     /* Start Serial CLI first (works without WiFi) */
     ESP_ERROR_CHECK(serial_cli_init());
 
+    /* Check if runtime connection loss requested immediate BLE onboarding */
+    if (wifi_manager_is_ble_prov_requested()) {
+        ESP_LOGW(TAG, "Wi-Fi connection lost at runtime. Entering BLE onboarding mode...");
+        display_status_set("WiFi Setup (BLE)", "PROV_ESPET");
+        wifi_onboard_ble_start();
+        return;
+    }
+
     /* Start WiFi */
     esp_err_t wifi_err = wifi_manager_start();
     bool wifi_ok = false;
@@ -312,13 +332,9 @@ void app_main(void)
     }
 
     if (!wifi_ok) {
-        ESP_LOGW(TAG, "Entering WiFi onboarding mode...");
-        wifi_onboard_start(WIFI_ONBOARD_MODE_CAPTIVE);  /* blocks, restarts on success */
+        ESP_LOGW(TAG, "Entering WiFi BLE onboarding mode...");
+        wifi_onboard_ble_start();  /* blocks, restarts on success */
         return;  /* unreachable */
-    }
-
-    if (wifi_onboard_start(WIFI_ONBOARD_MODE_ADMIN) != ESP_OK) {
-        ESP_LOGW(TAG, "Local admin portal unavailable; continuing without config hotspot");
     }
 
     {
@@ -365,5 +381,5 @@ void app_main(void)
         display_status_idle();   /* shows "Hi ESP to wake" */
     }
 
-    ESP_LOGI(TAG, "MimiClaw ready. Type 'help' for CLI commands.");
+    ESP_LOGI(TAG, "ESPET ready. Type 'help' for CLI commands.");
 }

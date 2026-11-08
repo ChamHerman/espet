@@ -27,7 +27,7 @@ from pathlib import Path
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed
 
@@ -61,6 +61,15 @@ async def mock_chat_completions(request: Request):
     body = await request.json()
     with mock_lock:
         mock_records["chatCompletions"].append({"auth": auth, "body": body})
+    if body.get("model") == "mock-sse-model":
+        sse_content = (
+            'data: {"id":"1","choices":[{"delta":{"content":"Hello "}}]}\n\n'
+            'data: {"id":"2","choices":[{"delta":{"content":"from SSE!"}}]}\n\n'
+            'data: [DONE]\n\n'
+        )
+        return Response(content=sse_content, media_type="text/event-stream")
+    if body.get("model") == "mock-bad-model":
+        return Response(content="Gateway Error: Not JSON", media_type="text/plain", status_code=200)
     return {
         "id": "chatcmpl-test",
         "object": "chat.completion",
@@ -435,7 +444,37 @@ async def _tc10_llm_relay():
         assert recorded["auth"] == "Bearer sk-mock-key-12345"
         assert recorded["body"]["model"] == "mock-relay-model"
         assert recorded["body"]["messages"][0]["content"] == "Ping mock LLM"
+        assert recorded["body"]["stream"] is False
 
+
+async def _tc11_test_llm_diagnostics():
+    _reset_state()
+    # 1. Standard JSON completion
+    res = http.post("/api/cloud/test-llm", json={
+        "base_url": f"{MOCK_BASE}/v1",
+        "api_key": "sk-test-diag-key",
+        "model": "mock-json-model",
+    }).json()
+    assert res.get("ok") is True
+    assert res.get("reply") == "Hello from mock cloud LLM!"
+
+    # 2. SSE streaming response fallback
+    res_sse = http.post("/api/cloud/test-llm", json={
+        "base_url": f"{MOCK_BASE}/v1",
+        "api_key": "sk-test-diag-key",
+        "model": "mock-sse-model",
+    }).json()
+    assert res_sse.get("ok") is True
+    assert res_sse.get("reply") == "Hello from SSE!"
+
+    # 3. Non-JSON 200 response returns clean error without unhandled JSONDecodeError
+    res_bad = http.post("/api/cloud/test-llm", json={
+        "base_url": f"{MOCK_BASE}/v1",
+        "api_key": "sk-test-diag-key",
+        "model": "mock-bad-model",
+    }).json()
+    assert res_bad.get("ok") is False
+    assert "Invalid response: Gateway Error: Not JSON" in res_bad.get("error", "")
 
 # ---------------------------------------------------------------------------
 # pytest-compatible wrappers + standalone runner
@@ -452,6 +491,7 @@ CASES = [
     ("TC-08 photo_out", _tc08_photo_out),
     ("TC-09 gateway_config", _tc09_gateway_config),
     ("TC-10 llm_relay", _tc10_llm_relay),
+    ("TC-11 test_llm_diagnostics", _tc11_test_llm_diagnostics),
 ]
 
 
@@ -494,6 +534,9 @@ def test_tc09_gateway_config():
 def test_tc10_llm_relay():
     asyncio.run(_tc10_llm_relay())
 
+
+def test_tc11_test_llm_diagnostics():
+    asyncio.run(_tc11_test_llm_diagnostics())
 
 if __name__ == "__main__":
     failures = 0

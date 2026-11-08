@@ -17,10 +17,12 @@ TTS:  edge-tts (Microsoft Edge neural voices, free, no API key) + ffmpeg
 
 import logging
 import math
+import os
 import struct
+import sys
 import tempfile
 from pathlib import Path
-
+import subprocess
 import numpy as np
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response
@@ -218,16 +220,81 @@ def check_and_fix_pitch(pcm16: np.ndarray, sample_rate: int = ESP_SAMPLE_RATE) -
 # ---------------------------------------------------------------------------
 # STT
 # ---------------------------------------------------------------------------
+def _setup_windows_cuda_dlls() -> None:
+    """Register nvidia-cublas and nvidia-cudnn directories for Windows Python 3.8+."""
+    if sys.platform != "win32":
+        return
+    import site
+    search_dirs = []
+    try:
+        search_dirs.extend(site.getsitepackages())
+    except Exception:
+        pass
+    user_site = getattr(site, "getusersitepackages", lambda: None)()
+    if user_site:
+        search_dirs.append(user_site)
+    for base in search_dirs:
+        for pkg in ("cublas", "cudnn"):
+            bin_dir = os.path.join(base, "nvidia", pkg, "bin")
+            if os.path.isdir(bin_dir):
+                try:
+                    os.add_dll_directory(bin_dir)
+                except Exception:
+                    pass
+
+
 def _get_stt_model():
-    """Load faster-whisper once (first call takes a few seconds)."""
+    """Load faster-whisper with device auto-detection and CPU fallback."""
     global _stt_model
-    if _stt_model is None:
-        from faster_whisper import WhisperModel
-        model_name = settings.voice_stt_model
-        logger.info("Loading faster-whisper model '%s' (first call only)...", model_name)
-        _stt_model = WhisperModel(
-            model_name, device="cpu", compute_type="int8", cpu_threads=4
-        )
+    if _stt_model is not None:
+        return _stt_model
+
+    from faster_whisper import WhisperModel
+    import ctranslate2
+
+    _setup_windows_cuda_dlls()
+
+    model_name = settings.voice_stt_model
+    pref_device = (settings.voice_stt_device or "auto").lower()
+    pref_compute = (settings.voice_stt_compute_type or "auto").lower()
+    cpu_threads = min(4, os.cpu_count() or 4)
+
+    cuda_available = False
+    try:
+        cuda_available = ctranslate2.get_cuda_device_count() > 0
+    except Exception:
+        pass
+
+    if pref_device in ("auto", "cuda") and cuda_available:
+        compute_type = "float16" if pref_compute == "auto" else pref_compute
+        try:
+            logger.info("Attempting faster-whisper '%s' on CUDA (%s)...", model_name, compute_type)
+            candidate = WhisperModel(
+                model_name,
+                device="cuda",
+                compute_type=compute_type,
+            )
+            # Eagerly probe CUDA execution to catch missing cublas64_12.dll or cudnn DLLs
+            dummy_probe = np.zeros(1600, dtype=np.float32)
+            list(candidate.transcribe(dummy_probe, max_new_tokens=1)[0])
+            _stt_model = candidate
+            logger.info("faster-whisper '%s' loaded and verified on CUDA GPU successfully.", model_name)
+            return _stt_model
+        except Exception as e:
+            logger.warning(
+                "CUDA initialization/probe failed for faster-whisper (%s). Falling back to CPU: %s",
+                e,
+                "For Windows NVIDIA GPU, run: pip install nvidia-cublas-cu12 nvidia-cudnn-cu12" if sys.platform == "win32" else ""
+            )
+    compute_type = "int8" if pref_compute == "auto" else pref_compute
+    logger.info("Loading faster-whisper model '%s' on CPU (%s, threads=%d)...", model_name, compute_type, cpu_threads)
+    _stt_model = WhisperModel(
+        model_name,
+        device="cpu",
+        compute_type=compute_type,
+        cpu_threads=cpu_threads,
+    )
+    logger.info("faster-whisper '%s' loaded on CPU successfully.", model_name)
     return _stt_model
 
 
@@ -268,20 +335,44 @@ def _transcribe_pcm(pcm16: np.ndarray, language: str | None) -> tuple[str, float
     target_lang = language if language else (allowed_langs[0] if len(allowed_langs) == 1 else None)
 
     try:
-        segments, info = model.transcribe(
-            tmp_path,
-            language=target_lang,
-            beam_size=3,
-            best_of=3,
-            repetition_penalty=1.2,
-            no_repeat_ngram_size=3,
-            max_new_tokens=96,
-            vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=500),
-            initial_prompt=settings.voice_stt_prompt or None,
-            condition_on_previous_text=False,
-        )
-
+        beam_size = max(1, settings.voice_stt_beam_size)
+        try:
+            segments, info = model.transcribe(
+                tmp_path,
+                language=target_lang,
+                beam_size=beam_size,
+                best_of=beam_size,
+                repetition_penalty=1.2,
+                no_repeat_ngram_size=3,
+                max_new_tokens=96,
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=500, min_speech_duration_ms=100),
+                initial_prompt=settings.voice_stt_prompt or None,
+                condition_on_previous_text=False,
+            )
+        except RuntimeError as e:
+            err_msg = str(e).lower()
+            if "cublas" in err_msg or "cuda" in err_msg:
+                logger.warning("CUDA execution failed at transcribe runtime (%s). Rebuilding model on CPU...", e)
+                global _stt_model
+                _stt_model = None
+                settings.voice_stt_device = "cpu"
+                model = _get_stt_model()
+                segments, info = model.transcribe(
+                    tmp_path,
+                    language=target_lang,
+                    beam_size=beam_size,
+                    best_of=beam_size,
+                    repetition_penalty=1.2,
+                    no_repeat_ngram_size=3,
+                    max_new_tokens=96,
+                    vad_filter=True,
+                    vad_parameters=dict(min_silence_duration_ms=500, min_speech_duration_ms=100),
+                    initial_prompt=settings.voice_stt_prompt or None,
+                    condition_on_previous_text=False,
+                )
+            else:
+                raise
         # Restrict detected language to allowed set (default: English and Chinese only)
         if not target_lang and allowed_langs and info.language not in allowed_langs:
             probs = dict(info.all_language_probs or [])
@@ -300,17 +391,16 @@ def _transcribe_pcm(pcm16: np.ndarray, language: str | None) -> tuple[str, float
             segments, info = model.transcribe(
                 tmp_path,
                 language=target_lang,
-                beam_size=3,
-                best_of=3,
+                beam_size=beam_size,
+                best_of=beam_size,
                 repetition_penalty=1.2,
                 no_repeat_ngram_size=3,
                 max_new_tokens=96,
                 vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=500),
+                vad_parameters=dict(min_silence_duration_ms=500, min_speech_duration_ms=100),
                 initial_prompt=settings.voice_stt_prompt or None,
                 condition_on_previous_text=False,
             )
-
         segs = list(segments)
         text = " ".join(seg.text.strip() for seg in segs).strip()
 
@@ -320,8 +410,8 @@ def _transcribe_pcm(pcm16: np.ndarray, language: str | None) -> tuple[str, float
             segments, info = model.transcribe(
                 tmp_path,
                 language=target_lang or (info.language if (not allowed_langs or info.language in allowed_langs) else "en"),
-                beam_size=3,
-                best_of=3,
+                beam_size=beam_size,
+                best_of=beam_size,
                 repetition_penalty=1.2,
                 no_repeat_ngram_size=3,
                 max_new_tokens=96,
@@ -329,7 +419,6 @@ def _transcribe_pcm(pcm16: np.ndarray, language: str | None) -> tuple[str, float
                 initial_prompt=settings.voice_stt_prompt or None,
                 condition_on_previous_text=False,
             )
-            segs = list(segments)
             text = " ".join(seg.text.strip() for seg in segs).strip()
 
         # Strip any foreign scripts outside English (ASCII) and Chinese (\u4e00-\u9fff)
@@ -417,19 +506,26 @@ async def _tts_to_wav(text: str, voice: str) -> bytes:
         communicate = edge_tts.Communicate(text, voice)
         await asyncio.wait_for(communicate.save(mp3_path), timeout=30)
 
-        proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-y", "-loglevel", "error", "-i", mp3_path,
-            "-ar", str(ESP_SAMPLE_RATE), "-ac", "1", "-sample_fmt", "s16",
-            wav_path,
-        )
+        # ponytail: subprocess.run in thread pool works on all loops (Proactor, Selector on Windows, uvloop)
+        def _run_ffmpeg() -> subprocess.CompletedProcess[bytes]:
+            return subprocess.run(
+                [
+                    "ffmpeg", "-y", "-loglevel", "error", "-i", mp3_path,
+                    "-ar", str(ESP_SAMPLE_RATE), "-ac", "1", "-sample_fmt", "s16",
+                    wav_path,
+                ],
+                capture_output=True,
+                timeout=30,
+            )
+
         try:
-            await asyncio.wait_for(proc.wait(), timeout=30)
-        except asyncio.TimeoutError:
-            proc.kill()
+            proc = await asyncio.to_thread(_run_ffmpeg)
+        except subprocess.TimeoutExpired:
             raise HTTPException(504, "ffmpeg timed out")
         if proc.returncode != 0:
-            raise HTTPException(500, "ffmpeg failed to convert TTS audio")
-
+            err_msg = proc.stderr.decode("utf-8", errors="replace").strip()
+            logger.error("ffmpeg failed (code %d): %s", proc.returncode, err_msg)
+            raise HTTPException(500, f"ffmpeg failed to convert TTS audio: {err_msg}")
         wav = Path(wav_path).read_bytes()
         logger.info("TTS ok (%.60s) -> %d bytes WAV", text, len(wav))
         return wav

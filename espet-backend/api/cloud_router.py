@@ -245,17 +245,21 @@ async def _llm_relay(websocket, request_id, body_str: str) -> None:
         await _reply(False, 0, json.dumps({"error": f"bad llm body: {e}"}))
         return
 
-    if cfg["model"]:
-        body["model"] = cfg["model"]   # server-side model override
+    if isinstance(body, dict):
+        body.setdefault("stream", False)
+        if cfg["model"]:
+            body["model"] = cfg["model"]   # server-side model override
 
     url = cfg["base_url"].rstrip("/") + "/chat/completions"
     try:
         async with httpx.AsyncClient(timeout=90) as client:
             resp = await client.post(
                 url, json=body,
-                headers={"Authorization": f"Bearer {cfg['api_key']}"})
+                headers={"Authorization": f"Bearer {cfg['api_key']}", "Accept": "application/json"})
         logger.info("LLM relay: %s -> HTTP %d (%d bytes)",
                     url, resp.status_code, len(resp.text))
+        if resp.status_code != 200 or len(resp.text) < 400:
+            logger.info("LLM relay payload preview: %.300s", resp.text)
         await _reply(resp.status_code == 200, resp.status_code, resp.text)
     except Exception as e:
         logger.warning("LLM relay to %s failed: %r", url, e)
@@ -317,7 +321,10 @@ async def test_telegram(payload: dict | None = None,
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(url)
-            data = resp.json()
+            try:
+                data = resp.json()
+            except (json.JSONDecodeError, ValueError):
+                data = {}
             if resp.status_code == 200 and data.get("ok"):
                 res = data.get("result", {})
                 return {
@@ -329,7 +336,7 @@ async def test_telegram(payload: dict | None = None,
                         "can_join_groups": res.get("can_join_groups"),
                     },
                 }
-            return {"ok": False, "error": data.get("description", f"HTTP {resp.status_code}")}
+            return {"ok": False, "error": data.get("description", resp.text[:200].strip() or f"HTTP {resp.status_code}")}
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
@@ -352,21 +359,37 @@ async def test_llm(payload: dict | None = None,
         "model": model,
         "messages": [{"role": "user", "content": "ping"}],
         "max_tokens": 10,
+        "stream": False,
     }
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.post(
                 url, json=body,
-                headers={"Authorization": f"Bearer {api_key}"})
+                headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"})
             if resp.status_code == 200:
-                data = resp.json()
-                reply = ""
                 try:
-                    reply = data["choices"][0]["message"]["content"]
-                except Exception:
+                    data = resp.json()
+                    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                    return {"ok": True, "model": model, "reply": (content or "").strip()}
+                except (json.JSONDecodeError, ValueError):
                     pass
-                return {"ok": True, "model": model, "reply": reply.strip()}
-            return {"ok": False, "status": resp.status_code, "error": resp.text[:300]}
+
+                text = resp.text
+                chunks: list[str] = []
+                for line in text.splitlines():
+                    sline = line.strip()
+                    if sline.startswith("data:") and not sline.startswith("data: [DONE]"):
+                        try:
+                            chunk = json.loads(sline[5:].strip())
+                            delta = chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                            if delta:
+                                chunks.append(delta)
+                        except Exception:
+                            pass
+                if chunks:
+                    return {"ok": True, "model": model, "reply": "".join(chunks).strip()}
+                return {"ok": False, "status": resp.status_code, "error": f"Invalid response: {text[:200].strip() or 'empty body'}"}
+            return {"ok": False, "status": resp.status_code, "error": resp.text[:300].strip() or f"HTTP {resp.status_code}"}
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
