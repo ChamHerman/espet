@@ -130,6 +130,17 @@ class TelegramGateway:
         device_id = self.registry.device_for_chat(chat_id)
         if device_id is None:
             device_id = self.registry.auto_bind_single_device(chat_id)
+            if device_id is not None:
+                _, dws = self.registry.get_connection(device_id)
+                if dws is not None:
+                    try:
+                        asyncio.create_task(dws.send_text(json.dumps({
+                            "type": "bind_sync",
+                            "chat_id": str(chat_id),
+                            "device_id": str(device_id),
+                        })))
+                    except Exception as e:
+                        logger.warning("Could not push auto-bind sync to %s: %s", device_id, e)
         if device_id is None:
             logger.warning("No device bound/connected for chat %s — dropping "
                            "'%.60s'", chat_id, text or "<non-text>")

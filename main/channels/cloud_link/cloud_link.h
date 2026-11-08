@@ -47,7 +47,6 @@ esp_err_t cloud_link_send_text(const char *chat_id, const char *text);
  * @brief True when the WebSocket is currently connected.
  */
 bool cloud_link_is_connected(void);
-
 /**
  * @brief Relay one LLM request through the cloud gateway (frame:
  *        llm.request / llm.response). The cloud adds its own API key and

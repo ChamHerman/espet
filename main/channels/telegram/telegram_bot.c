@@ -3,6 +3,9 @@
 #include "bus/message_bus.h"
 #include "proxy/http_proxy.h"
 #include "wifi/wifi_manager.h"
+#if MIMI_CLOUD_LINK_ENABLE
+#include "channels/cloud_link/cloud_link.h"
+#endif
 
 #include <string.h>
 #include <stdlib.h>
@@ -638,13 +641,41 @@ esp_err_t telegram_set_token(const char *token)
     return ESP_OK;
 }
 
+void telegram_set_last_chat_id(const char *chat_id)
+{
+    if (!chat_id || chat_id[0] == '\0') {
+        return;
+    }
+    if (strcmp(s_last_chat_id, chat_id) != 0) {
+        strncpy(s_last_chat_id, chat_id, sizeof(s_last_chat_id) - 1);
+        s_last_chat_id[sizeof(s_last_chat_id) - 1] = '\0';
+        nvs_handle_t nvs;
+        if (nvs_open(MIMI_NVS_TG, NVS_READWRITE, &nvs) == ESP_OK) {
+            nvs_set_str(nvs, TG_LAST_CHAT_NVS_KEY, chat_id);
+            nvs_commit(nvs);
+            nvs_close(nvs);
+        }
+    }
+}
+
+const char *telegram_get_last_chat_id(void)
+{
+    return s_last_chat_id;
+}
+
 esp_err_t telegram_send_to_last_chat(const char *text)
 {
-    if (s_last_chat_id[0] != '\0') {
-        return telegram_send_message(s_last_chat_id, text);
+    if (s_last_chat_id[0] == '\0') {
+        ESP_LOGW(TAG, "Skipping Telegram send: no active or bound Telegram chat ID yet");
+        return ESP_OK;
     }
-    ESP_LOGW(TAG, "Skipping Telegram send for button event: no active Telegram chat ID yet");
-    return ESP_OK;
+#if MIMI_CLOUD_LINK_ENABLE
+    if (cloud_link_is_connected()) {
+        ESP_LOGI(TAG, "Routing send_to_last_chat to cloud link for chat %s", s_last_chat_id);
+        return cloud_link_send_text(s_last_chat_id, text);
+    }
+#endif
+    return telegram_send_message(s_last_chat_id, text);
 }
 
 esp_err_t telegram_send_photo(const char *chat_id, const uint8_t *jpeg_data, size_t jpeg_len, const char *caption)

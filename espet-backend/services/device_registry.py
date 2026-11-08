@@ -117,6 +117,15 @@ class DeviceRegistry:
         with self._lock:
             return dict(self.chat_to_device)
 
+    def chats_for_device(self, device_id: str) -> list[str]:
+        did_str = str(device_id)
+        with self._lock:
+            return [cid for cid, did in self.chat_to_device.items() if did == did_str]
+
+    def primary_chat_for_device(self, device_id: str) -> str | None:
+        chats = self.chats_for_device(device_id)
+        return chats[0] if chats else None
+
     def auto_bind_single_device(self, chat_id: str | int) -> str | None:
         """Dev convenience: if exactly one device is connected and the chat is
         unbound, bind them. Returns the device_id or None."""

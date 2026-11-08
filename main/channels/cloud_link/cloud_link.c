@@ -28,6 +28,7 @@
 #include "tools/tool_audio.h"
 #include "voice/voice_client.h"
 
+#include "channels/telegram/telegram_bot.h"
 #include "bus/message_bus.h"
 
 static const char *TAG = "cloud";
@@ -104,6 +105,14 @@ static void transcribe_task_fn(void *arg)
 }
 
 /* -------------------------------------------------- inbound frame handling */
+static void sync_bound_chat(const cJSON *root)
+{
+    const cJSON *chat = cJSON_GetObjectItem(root, "chat_id");
+    if (cJSON_IsString(chat) && chat->valuestring[0] != '\0') {
+        telegram_set_last_chat_id(chat->valuestring);
+    }
+}
+
 
 static void handle_frame(char *json_str)
 {
@@ -118,6 +127,7 @@ static void handle_frame(char *json_str)
     if (strcmp(type_str, "message_in") == 0) {
         const cJSON *chat = cJSON_GetObjectItem(root, "chat_id");
         const cJSON *text = cJSON_GetObjectItem(root, "text");
+        sync_bound_chat(root);
         if (cJSON_IsString(chat) && cJSON_IsString(text)) {
             mimi_msg_t msg = {0};
             strlcpy(msg.channel, MIMI_CHAN_CLOUD, sizeof(msg.channel));
@@ -206,6 +216,10 @@ static void handle_frame(char *json_str)
         send_json(resp);
     } else if (strcmp(type_str, "hello_ack") == 0) {
         ESP_LOGI(TAG, "cloud gateway accepted this device");
+        sync_bound_chat(root);
+    } else if (strcmp(type_str, "bind_sync") == 0) {
+        sync_bound_chat(root);
+        ESP_LOGI(TAG, "received bind_sync from gateway");
     } else if (strcmp(type_str, "pong") == 0) {
         /* keepalive */
     } else if (strcmp(type_str, "error") == 0) {
@@ -390,6 +404,7 @@ esp_err_t cloud_link_start(void)
     snprintf(s_device_id, sizeof(s_device_id), "ESP-%02X%02X%02X%02X%02X%02X",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
+
     s_running = true;
     esp_err_t err = cloud_open();
     if (err != ESP_OK) {
@@ -445,6 +460,7 @@ esp_err_t cloud_link_send_text(const char *chat_id, const char *text)
     free(json);
     return (written >= 0) ? ESP_OK : ESP_FAIL;
 }
+
 
 esp_err_t cloud_link_llm_request(const char *body, size_t body_len,
                                  char *resp_buf, size_t resp_cap,

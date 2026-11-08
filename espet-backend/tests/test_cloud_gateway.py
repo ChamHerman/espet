@@ -476,6 +476,24 @@ async def _tc11_test_llm_diagnostics():
     assert res_bad.get("ok") is False
     assert "Invalid response: Gateway Error: Not JSON" in res_bad.get("error", "")
 
+
+async def _tc12_hello_ack_includes_bound_chat():
+    _reset_state()
+    registry.bind("-5358", "ESP-TC12")
+    async with connect(f"{GW_BASE}?key={DEVICE_KEY}") as ws:
+        await ws.send(json.dumps({"type": "hello", "device_id": "ESP-TC12"}))
+        reply = json.loads(await asyncio.wait_for(ws.recv(), 5))
+        assert reply["type"] == "hello_ack"
+        assert reply["device_id"] == "ESP-TC12"
+        assert reply.get("chat_id") == "-5358"
+
+        # Test live push when /bind endpoint is called
+        resp = http.post("/api/cloud/bind", json={"chat_id": "-9999", "device_id": "ESP-TC12"})
+        assert resp.json().get("ok") is True
+        sync_frame = json.loads(await asyncio.wait_for(ws.recv(), 5))
+        assert sync_frame["type"] == "bind_sync"
+        assert sync_frame["chat_id"] == "-9999"
+        assert sync_frame["device_id"] == "ESP-TC12"
 # ---------------------------------------------------------------------------
 # pytest-compatible wrappers + standalone runner
 # ---------------------------------------------------------------------------
@@ -492,6 +510,7 @@ CASES = [
     ("TC-09 gateway_config", _tc09_gateway_config),
     ("TC-10 llm_relay", _tc10_llm_relay),
     ("TC-11 test_llm_diagnostics", _tc11_test_llm_diagnostics),
+    ("TC-12 bound_chat_sync", _tc12_hello_ack_includes_bound_chat),
 ]
 
 
@@ -537,6 +556,9 @@ def test_tc10_llm_relay():
 
 def test_tc11_test_llm_diagnostics():
     asyncio.run(_tc11_test_llm_diagnostics())
+
+def test_tc12_hello_ack_includes_bound_chat():
+    asyncio.run(_tc12_hello_ack_includes_bound_chat())
 
 if __name__ == "__main__":
     failures = 0

@@ -104,8 +104,10 @@ async def ws_device(websocket: WebSocket, key: str = Query("")):
         return
 
     registry.register_connection(device_id, websocket)
+    primary_chat = registry.primary_chat_for_device(device_id) or ""
     await websocket.send_text(json.dumps({"type": "hello_ack",
-                                          "device_id": device_id}))
+                                          "device_id": device_id,
+                                          "chat_id": primary_chat}))
     logger.info("Device %s connected (fw=%s) — %d device(s) online",
                 device_id, hello.get("fw", "?"), len(registry.connected_devices()))
 
@@ -359,6 +361,16 @@ async def bind_chat(payload: dict | None = None,
     if not cid or not did:
         return {"ok": False, "error": "chat_id and device_id are required"}
     registry.bind(str(cid), str(did))
+    _, ws = registry.get_connection(str(did))
+    if ws is not None:
+        try:
+            await ws.send_text(json.dumps({
+                "type": "bind_sync",
+                "chat_id": str(cid),
+                "device_id": str(did),
+            }))
+        except Exception as e:
+            logger.warning("Could not push bind_sync to %s: %s", did, e)
     return {"ok": True, "chat_id": str(cid), "device_id": str(did)}
 
 
