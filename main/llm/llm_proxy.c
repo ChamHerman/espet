@@ -243,11 +243,15 @@ esp_err_t llm_proxy_init(void)
         safe_copy(s_provider, sizeof(s_provider), MIMI_SECRET_MODEL_PROVIDER);
     }
 
+#if MIMI_CLOUD_LINK_ENABLE
+    ESP_LOGI(TAG, "LLM proxy initialized (cloud-gateway relay; local model %s used only if backend override empty)", s_model);
+#else
     if (s_api_key[0]) {
         ESP_LOGI(TAG, "LLM proxy initialized (provider: %s, model: %s)", s_provider, s_model);
     } else {
         ESP_LOGW(TAG, "No API key. Use CLI: set_api_key <KEY>");
     }
+#endif
     return ESP_OK;
 }
 
@@ -624,8 +628,13 @@ esp_err_t llm_chat_tools(const char *system_prompt,
     cJSON_Delete(body);
     if (!post_data) return ESP_ERR_NO_MEM;
 
-    ESP_LOGI(TAG, "Calling LLM API with tools (provider: %s, model: %s, body: %d bytes)",
-             s_provider, s_model, (int)strlen(post_data));
+    if (llm_via_cloud()) {
+        ESP_LOGI(TAG, "LLM request via cloud gateway (backend owns provider/model/key), body: %d bytes",
+                 (int)strlen(post_data));
+    } else {
+        ESP_LOGI(TAG, "Calling LLM API with tools (provider: %s, model: %s, body: %d bytes)",
+                 s_provider, s_model, (int)strlen(post_data));
+    }
     llm_log_payload("LLM tools request", post_data);
 
     /* HTTP call */

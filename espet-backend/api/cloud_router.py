@@ -249,6 +249,7 @@ async def _llm_relay(websocket, request_id, body_str: str) -> None:
         body.setdefault("stream", False)
         if cfg["model"]:
             body["model"] = cfg["model"]   # server-side model override
+    used_model = body.get("model") if isinstance(body, dict) else None
 
     url = cfg["base_url"].rstrip("/") + "/chat/completions"
     try:
@@ -256,8 +257,8 @@ async def _llm_relay(websocket, request_id, body_str: str) -> None:
             resp = await client.post(
                 url, json=body,
                 headers={"Authorization": f"Bearer {cfg['api_key']}", "Accept": "application/json"})
-        logger.info("LLM relay: %s -> HTTP %d (%d bytes)",
-                    url, resp.status_code, len(resp.text))
+        logger.info("LLM relay: %s model=%s -> HTTP %d (%d bytes)",
+                    url, used_model, resp.status_code, len(resp.text))
         if resp.status_code != 200 or len(resp.text) < 400:
             logger.info("LLM relay payload preview: %.300s", resp.text)
         await _reply(resp.status_code == 200, resp.status_code, resp.text)
