@@ -1,5 +1,6 @@
 #include "tools/tool_files.h"
 #include "mimi_config.h"
+#include "channels/cloud_link/cloud_link.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -109,6 +110,9 @@ esp_err_t tool_write_file_execute(const char *input_json, char *output, size_t o
 
     snprintf(output, output_size, "OK: wrote %d bytes to %s", (int)written, path);
     ESP_LOGI(TAG, "write_file: %s (%d bytes)", path, (int)written);
+    if (strcmp(path, MIMI_MEMORY_FILE) == 0) {
+        cloud_link_send_sync_report();
+    }
     cJSON_Delete(root);
     return ESP_OK;
 }
@@ -212,6 +216,9 @@ esp_err_t tool_edit_file_execute(const char *input_json, char *output, size_t ou
 
     snprintf(output, output_size, "OK: edited %s (replaced %d bytes with %d bytes)", path, (int)old_len, (int)new_len);
     ESP_LOGI(TAG, "edit_file: %s", path);
+    if (strcmp(path, MIMI_MEMORY_FILE) == 0) {
+        cloud_link_send_sync_report();
+    }
     cJSON_Delete(root);
     return ESP_OK;
 }

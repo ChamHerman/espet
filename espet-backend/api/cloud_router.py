@@ -26,6 +26,7 @@ from services.gateway_settings import gateway_settings
 from services.telegram_gateway import TelegramGateway, get_gateway, set_gateway
 from services.rag_service import rag_service
 
+import config_store as store
 logger = logging.getLogger("espet-backend.cloud")
 
 router = APIRouter(prefix="/api/cloud", tags=["cloud"])
@@ -74,6 +75,23 @@ def restart_gateway() -> dict:
     else:
         logger.info("Telegram gateway stopped (disabled or no token)")
     return {"running": gw is not None}
+async def notify_device_sync(device_id: str) -> bool:
+    """
+    Sends sync_now frame to connected device WebSocket.
+    Returns True if sent, False if offline.
+    """
+    with registry._lock:
+        ws = registry.connections.get(device_id)
+    if ws:
+        try:
+            await ws.send_text(json.dumps({"type": "sync_now", "device_id": device_id}))
+            logger.info("Pushed sync_now frame to connected device %s", device_id)
+            return True
+        except Exception as e:
+            logger.warning("Failed to push sync_now to device %s: %s", device_id, e)
+            return False
+    return False
+
 
 
 @router.websocket("/ws/device")
@@ -103,6 +121,8 @@ async def ws_device(websocket: WebSocket, key: str = Query("")):
         await websocket.close(code=4402)
         return
 
+    client_ip = websocket.client.host if websocket.client else ""
+    registry.register_device(device_id, ip=client_ip, fw=str(hello.get("fw", "")))
     registry.register_connection(device_id, websocket)
     primary_chat = registry.primary_chat_for_device(device_id) or ""
     await websocket.send_text(json.dumps({"type": "hello_ack",
@@ -183,6 +203,19 @@ async def ws_device(websocket: WebSocket, key: str = Query("")):
                 fut = _pending_voice_listen.pop(device_id, None)
                 if fut and not fut.done():
                     fut.set_result(frame)
+            elif ftype == "device_sync_report":
+                memory_md = frame.get("memory_md")
+                jobs = frame.get("jobs")
+                store.apply_device_report(device_id, memory_md, jobs)
+                logger.info("Received device_sync_report from %s (memory_md %d bytes, %d jobs)",
+                            device_id, len(memory_md or ""), len(jobs or []))
+
+            elif ftype == "device_memory_update":
+                store.update_markdown("memory", frame.get("content", ""), device_id)
+
+            elif ftype == "device_jobs_update":
+                store.apply_device_report(device_id, memory_md=None, jobs=frame.get("jobs", []))
+
 
             else:
                 await websocket.send_text(json.dumps(
@@ -196,6 +229,7 @@ async def ws_device(websocket: WebSocket, key: str = Query("")):
             if fut and not fut.done():
                 fut.set_exception(RuntimeError("Device disconnected"))
         registry.remove_connection(device_id, websocket)
+        registry.mark_offline(device_id)
         logger.info("Device %s removed — %d device(s) online",
                     device_id, len(registry.connected_devices()))
 

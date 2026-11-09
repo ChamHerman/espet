@@ -29,6 +29,7 @@ export interface Job {
   created_at?: string;
   interval_s?: number;
   at_epoch?: number;
+  at_local?: string;
 }
 
 export interface Skill {

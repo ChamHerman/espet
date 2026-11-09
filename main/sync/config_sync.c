@@ -13,6 +13,7 @@
 #include "esp_http_client.h"
 #include "esp_heap_caps.h"
 #include "cJSON.h"
+#include "esp_mac.h"
 
 #include "mimi_config.h"
 #include "wifi/wifi_manager.h"
@@ -498,11 +499,17 @@ static cJSON *fetch_json(const char *path, size_t buf_size)
 
     http_body_t body = { .buf = buf, .used = 0, .cap = buf_size - 1, .overflow = false };
 
-    char url[160];
+    char url[256];
     char auth_hdr[96];
     char base[96];
     backend_discovery_base_url(base, sizeof(base));
-    snprintf(url, sizeof(url), "%s%s", base, path);
+    uint8_t mac[6] = {0};
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    char dev_id[20];
+    snprintf(dev_id, sizeof(dev_id), "ESP-%02X%02X%02X%02X%02X%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    char sep = strchr(path, '?') ? '&' : '?';
+    snprintf(url, sizeof(url), "%s%s%cdevice_id=%s", base, path, sep, dev_id);
     snprintf(auth_hdr, sizeof(auth_hdr), "Bearer %s", MIMI_BACKEND_API_KEY);
 
     esp_http_client_config_t config = {
@@ -520,6 +527,7 @@ static cJSON *fetch_json(const char *path, size_t buf_size)
     }
     esp_http_client_set_method(client, HTTP_METHOD_GET);
     esp_http_client_set_header(client, "Authorization", auth_hdr);
+    esp_http_client_set_header(client, "X-Device-Id", dev_id);
 
     esp_err_t err = esp_http_client_perform(client);
     int status = esp_http_client_get_status_code(client);
@@ -654,13 +662,22 @@ static void sync_task_main(void *arg)
         /* Sleep in 1s slices so a new interval from the web takes effect */
         uint32_t remaining = s_interval_s;
         while (remaining > 0 && s_task) {
-            vTaskDelay(pdMS_TO_TICKS(1000));
+            if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000)) > 0) {
+                break;
+            }
             remaining--;
         }
     }
 }
 
 /* ── Public API ──────────────────────────────────────────────── */
+void config_sync_trigger(void)
+{
+    if (s_task) {
+        xTaskNotifyGive(s_task);
+    }
+}
+
 
 esp_err_t config_sync_init(void)
 {

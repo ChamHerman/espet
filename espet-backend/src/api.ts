@@ -13,6 +13,16 @@ import type {
   MemoryQueryResponse,
   Skill,
 } from "./types";
+export interface DeviceInfo {
+  device_id: string;
+  name?: string;
+  online: boolean;
+  last_seen: string;
+  ip?: string;
+  fw?: string;
+  is_latest?: boolean;
+}
+
 
 export const API_KEY = "espet_secret_device_key_2026";
 
@@ -45,38 +55,43 @@ const json = (method: string, body: unknown): RequestInit => ({
 
 export const client = {
   // reads
-  config: () => api<ConfigBundle>("/api/config"),
+  devices: () => api<{ devices: DeviceInfo[]; latest_device_id: string }>("/api/devices"),
+  syncNow: (device_id: string) =>
+    api<{ ok: boolean; device_id: string; pushed: boolean }>("/api/config/sync-now", json("POST", { device_id })),
+  config: (device_id?: string) =>
+    api<ConfigBundle>(`/api/config${device_id ? `?device_id=${encodeURIComponent(device_id)}` : ""}`),
   health: () => api<Health>("/health"),
   auth: () => api<AuthStatus>("/auth/status"),
   tools: () => api<{ tools: McpTool[] }>("/api/tools"),
   avatar: () => api<AvatarState>("/api/ui/avatar"),
-  skills: () => api<{ skills: Skill[] }>("/api/ui/skills"),
+  skills: (device_id?: string) =>
+    api<{ skills: Skill[] }>(`/api/ui/skills${device_id ? `?device_id=${encodeURIComponent(device_id)}` : ""}`),
 
   // writes — every response echoes the fresh `versions` map (config_router)
-  saveProfile: (user_md: string) =>
-    api<ConfigBundle>("/api/ui/profile", json("PUT", { user_md })),
-  saveSoul: (soul_md: string) =>
-    api<ConfigBundle>("/api/ui/soul", json("PUT", { soul_md })),
-  saveMemory: (memory_md: string) =>
-    api<ConfigBundle>("/api/ui/memory", json("PUT", { memory_md })),
-  saveDevice: (d: { name: string; timezone: string; sync_interval_s: number }) =>
-    api<ConfigBundle>("/api/ui/device", json("PUT", d)),
+  saveProfile: (user_md: string, device_id?: string) =>
+    api<ConfigBundle>(`/api/ui/profile${device_id ? `?device_id=${encodeURIComponent(device_id)}` : ""}`, json("PUT", { user_md, device_id })),
+  saveSoul: (soul_md: string, device_id?: string) =>
+    api<ConfigBundle>(`/api/ui/soul${device_id ? `?device_id=${encodeURIComponent(device_id)}` : ""}`, json("PUT", { soul_md, device_id })),
+  saveMemory: (memory_md: string, device_id?: string) =>
+    api<ConfigBundle>(`/api/ui/memory${device_id ? `?device_id=${encodeURIComponent(device_id)}` : ""}`, json("PUT", { memory_md, device_id })),
+  saveDevice: (d: { name: string; timezone: string; sync_interval_s: number }, device_id?: string) =>
+    api<ConfigBundle>(`/api/ui/device${device_id ? `?device_id=${encodeURIComponent(device_id)}` : ""}`, json("PUT", { ...d, device_id })),
   saveAvatar: (mode: string, opts: Record<string, unknown>) =>
     api<AvatarState>("/api/ui/avatar", json("PUT", { mode, opts })),
 
-  createJob: (p: Partial<Job>) =>
-    api<ConfigBundle>("/api/ui/jobs", json("POST", p)),
-  updateJob: (id: string, p: Partial<Job>) =>
-    api<ConfigBundle>(`/api/ui/jobs/${id}`, json("PUT", p)),
-  deleteJob: (id: string) =>
-    api<ConfigBundle>(`/api/ui/jobs/${id}`, { method: "DELETE" }),
+  createJob: (p: Partial<Job>, device_id?: string) =>
+    api<ConfigBundle>(`/api/ui/jobs${device_id ? `?device_id=${encodeURIComponent(device_id)}` : ""}`, json("POST", { ...p, device_id })),
+  updateJob: (id: string, p: Partial<Job>, device_id?: string) =>
+    api<ConfigBundle>(`/api/ui/jobs/${id}${device_id ? `?device_id=${encodeURIComponent(device_id)}` : ""}`, json("PUT", { ...p, device_id })),
+  deleteJob: (id: string, device_id?: string) =>
+    api<ConfigBundle>(`/api/ui/jobs/${id}${device_id ? `?device_id=${encodeURIComponent(device_id)}` : ""}`, { method: "DELETE" }),
 
-  createSkill: (p: Partial<Skill>) =>
-    api<{ skills: Skill[] }>("/api/ui/skills", json("POST", p)),
-  updateSkill: (id: string, p: Partial<Skill>) =>
-    api<{ skills: Skill[] }>(`/api/ui/skills/${id}`, json("PUT", p)),
-  deleteSkill: (id: string) =>
-    api<{ skills: Skill[] }>(`/api/ui/skills/${id}`, { method: "DELETE" }),
+  createSkill: (p: Partial<Skill>, device_id?: string) =>
+    api<{ skills: Skill[] }>(`/api/ui/skills${device_id ? `?device_id=${encodeURIComponent(device_id)}` : ""}`, json("POST", { ...p, device_id })),
+  updateSkill: (id: string, p: Partial<Skill>, device_id?: string) =>
+    api<{ skills: Skill[] }>(`/api/ui/skills/${id}${device_id ? `?device_id=${encodeURIComponent(device_id)}` : ""}`, json("PUT", { ...p, device_id })),
+  deleteSkill: (id: string, device_id?: string) =>
+    api<{ skills: Skill[] }>(`/api/ui/skills/${id}${device_id ? `?device_id=${encodeURIComponent(device_id)}` : ""}`, { method: "DELETE" }),
 
   reconnectMcp: () => api("/api/mcp/reconnect", json("POST", {})),
 

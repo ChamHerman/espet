@@ -4,7 +4,7 @@
    SourceField: the device parses `# Title` as the literal first line and caps
    each file at 8192 bytes. */
 
-import { Button, Input, Modal, Switch } from "antd";
+import { Button, Input, Modal, Switch, Tooltip } from "antd";
 import { useEffect, useState } from "react";
 import { client } from "../api";
 import { Icon } from "../components/Icon";
@@ -26,7 +26,7 @@ interface Draft {
 const blank = (): Draft => ({ id: null, name: "", content: "", enabled: true });
 
 export function SkillsView() {
-  const { config, patchConfig, toast, confirm } = useApp();
+  const { config, patchConfig, toast, confirm, selectedDeviceId } = useApp();
   const { styles } = useLayout();
   const [skills, setSkills] = useState<Skill[]>([]);
   const [draft, setDraft] = useState<Draft | null>(null);
@@ -34,14 +34,14 @@ export function SkillsView() {
 
   const reload = () =>
     client
-      .skills()
+      .skills(selectedDeviceId)
       .then((r) => setSkills(r.skills || []))
       .catch((e) => toast((e as Error).message, "error"));
 
   useEffect(() => {
     reload();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [selectedDeviceId]);
 
   if (!config) return null;
 
@@ -63,16 +63,23 @@ export function SkillsView() {
     setSaving(true);
     try {
       const res = draft.id
-        ? await client.updateSkill(draft.id, {
-            name: draft.name,
-            content: draft.content,
-            enabled: draft.enabled,
-          })
-        : await client.createSkill({
-            name: draft.name,
-            content: draft.content,
-            enabled: draft.enabled,
-          });
+        ? await client.updateSkill(
+            draft.id,
+            {
+              name: draft.name,
+              content: draft.content,
+              enabled: draft.enabled,
+            },
+            selectedDeviceId
+          )
+        : await client.createSkill(
+            {
+              name: draft.name,
+              content: draft.content,
+              enabled: draft.enabled,
+            },
+            selectedDeviceId
+          );
       patchVersion(res);
       setDraft(null);
       toast(draft.id ? "Skill updated" : "Skill created");
@@ -85,7 +92,7 @@ export function SkillsView() {
 
   const toggle = async (s: Skill, enabled: boolean) => {
     try {
-      const res = await client.updateSkill(s.id, { enabled });
+      const res = await client.updateSkill(s.id, { enabled }, selectedDeviceId);
       setSkills(res.skills);
       toast(enabled ? "Skill enabled" : "Skill disabled");
     } catch (e) {
@@ -102,7 +109,7 @@ export function SkillsView() {
     });
     if (!ok) return;
     try {
-      const res = await client.deleteSkill(s.id);
+      const res = await client.deleteSkill(s.id, selectedDeviceId);
       setSkills(res.skills);
       toast("Skill deleted");
     } catch (e) {
@@ -114,8 +121,17 @@ export function SkillsView() {
     <div className={styles.stack}>
       <Card>
         <div className={styles.cardHead}>
-          <div className={styles.cardTitle}>
-            <Icon name="book" /> Skills
+          <div style={{ display: "flex", alignItems: "center" }}>
+            <div className={styles.cardTitle}>
+              <Icon name="book" /> Skills
+            </div>
+            <Tooltip title="Skills created here are written to /spiffs/skills/ on the device. A skill must start with a # Title heading — that's what the device parses. Each skill is a markdown playbook the agent can follow.">
+              <Icon
+                name="info"
+                size={15}
+                style={{ color: "#a3a3a3", cursor: "pointer", marginLeft: 8 }}
+              />
+            </Tooltip>
           </div>
           <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
             <Badge>
@@ -185,15 +201,6 @@ export function SkillsView() {
           )}
         </div>
       </Card>
-      <div className={styles.sectionNote}>
-        <Icon name="info" size={16} />
-        <span>
-          Skills created here are written to{" "}
-          <span className="espet-mono">/spiffs/skills/</span> on the device. A
-          skill must start with a <span className="espet-mono"># Title</span>{" "}
-          heading — that's what the device parses.
-        </span>
-      </div>
 
       <Modal
         title={draft?.id ? "Edit skill" : "New skill"}

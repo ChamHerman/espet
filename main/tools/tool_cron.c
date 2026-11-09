@@ -1,6 +1,7 @@
 #include "tools/tool_cron.h"
 #include "cron/cron_service.h"
 #include "bus/message_bus.h"
+#include "channels/cloud_link/cloud_link.h"
 
 #include <string.h>
 #include <time.h>
@@ -113,6 +114,7 @@ esp_err_t tool_cron_add_execute(const char *input_json, char *output, size_t out
     }
 
     ESP_LOGI(TAG, "cron_add: %s", output);
+    cloud_link_send_sync_report();
     return ESP_OK;
 }
 
@@ -187,6 +189,7 @@ esp_err_t tool_cron_remove_execute(const char *input_json, char *output, size_t 
 
     if (err == ESP_OK) {
         snprintf(output, output_size, "OK: Removed cron job %s", job_id_copy);
+        cloud_link_send_sync_report();
     } else if (err == ESP_ERR_NOT_FOUND) {
         snprintf(output, output_size, "Error: job '%s' not found", job_id_copy);
     } else {

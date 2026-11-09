@@ -25,6 +25,7 @@
 #include "freertos/task.h"
 #include "mimi_config.h"
 #include "sync/backend_discovery.h"
+#include "sync/config_sync.h"
 #include "tools/tool_audio.h"
 #include "voice/voice_client.h"
 
@@ -80,7 +81,82 @@ static void send_hello(void)
              s_device_id, esp_get_idf_version());
     send_json(hello);
     ESP_LOGI(TAG, "hello sent as %s", s_device_id);
+    cloud_link_send_sync_report();
 }
+esp_err_t cloud_link_send_sync_report(void)
+{
+    if (!s_client || !esp_websocket_client_is_connected(s_client)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON_AddStringToObject(root, "type", "device_sync_report");
+    cJSON_AddStringToObject(root, "device_id", s_device_id);
+
+    /* 1. Read MEMORY.md */
+    FILE *f_mem = fopen(MIMI_MEMORY_FILE, "r");
+    if (f_mem) {
+        fseek(f_mem, 0, SEEK_END);
+        long sz = ftell(f_mem);
+        fseek(f_mem, 0, SEEK_SET);
+        if (sz > 0 && sz <= 16384) {
+            char *mem_buf = malloc(sz + 1);
+            if (mem_buf) {
+                size_t nr = fread(mem_buf, 1, sz, f_mem);
+                mem_buf[nr] = '\0';
+                cJSON_AddStringToObject(root, "memory_md", mem_buf);
+                free(mem_buf);
+            }
+        }
+        fclose(f_mem);
+    } else {
+        cJSON_AddStringToObject(root, "memory_md", "");
+    }
+
+    /* 2. Read cron.json */
+    FILE *f_cron = fopen(MIMI_CRON_FILE, "r");
+    cJSON *jobs_arr = NULL;
+    if (f_cron) {
+        fseek(f_cron, 0, SEEK_END);
+        long csz = ftell(f_cron);
+        fseek(f_cron, 0, SEEK_SET);
+        if (csz > 0 && csz <= 16384) {
+            char *cron_buf = malloc(csz + 1);
+            if (cron_buf) {
+                size_t cnr = fread(cron_buf, 1, csz, f_cron);
+                cron_buf[cnr] = '\0';
+                cJSON *cron_root = cJSON_Parse(cron_buf);
+                if (cron_root) {
+                    cJSON *jitem = cJSON_GetObjectItem(cron_root, "jobs");
+                    if (jitem && cJSON_IsArray(jitem)) {
+                        jobs_arr = cJSON_Duplicate(jitem, true);
+                    }
+                    cJSON_Delete(cron_root);
+                }
+                free(cron_buf);
+            }
+        }
+        fclose(f_cron);
+    }
+    if (!jobs_arr) {
+        jobs_arr = cJSON_CreateArray();
+    }
+    cJSON_AddItemToObject(root, "jobs", jobs_arr);
+
+    char *rendered = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!rendered) {
+        return ESP_ERR_NO_MEM;
+    }
+    send_json(rendered);
+    free(rendered);
+    ESP_LOGI(TAG, "device_sync_report sent");
+    return ESP_OK;
+}
+
 
 typedef struct {
     size_t samples;
@@ -222,6 +298,9 @@ static void handle_frame(char *json_str)
         ESP_LOGI(TAG, "received bind_sync from gateway");
     } else if (strcmp(type_str, "pong") == 0) {
         /* keepalive */
+    } else if (strcmp(type_str, "sync_now") == 0) {
+        config_sync_trigger();
+        ESP_LOGI(TAG, "Received sync_now from backend — triggered immediate config sync");
     } else if (strcmp(type_str, "error") == 0) {
         const cJSON *detail = cJSON_GetObjectItem(root, "detail");
         ESP_LOGW(TAG, "gateway error: %s",

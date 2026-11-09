@@ -30,4 +30,9 @@ esp_err_t config_sync_init(void);
  * Create the background sync task. Safe to call before WiFi is up —
  * the task waits for a connection itself.
  */
+
+/**
+ * Trigger an immediate config sync cycle.
+ */
+void config_sync_trigger(void);
 esp_err_t config_sync_start(void);

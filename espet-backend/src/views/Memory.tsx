@@ -13,6 +13,7 @@ import {
   Select,
   Space,
   Tag,
+  Tooltip,
 } from "antd";
 import { useEffect, useState } from "react";
 import { client } from "../api";
@@ -47,7 +48,7 @@ interface ItemDraft {
 }
 
 export function MemoryView() {
-  const { config, patchConfig, setDirty, toast, confirm } = useApp();
+  const { config, patchConfig, setDirty, toast, confirm, selectedDeviceId } = useApp();
   const { styles } = useLayout();
 
   // Tier 1: On-Device MEMORY.md state
@@ -103,13 +104,13 @@ export function MemoryView() {
 
   const save = async () => {
     try {
-      const res = await client.saveMemory(draft);
+      const res = await client.saveMemory(draft, selectedDeviceId);
       patchConfig((c) => {
         c.memory_md = draft;
         c.versions.memory = res.versions.memory;
       });
       setDirty("memory", false);
-      toast("MEMORY.md saved — device will pull it");
+      toast("MEMORY.md saved and pushed to physical device");
     } catch (e) {
       toast((e as Error).message, "error");
     }
@@ -122,6 +123,7 @@ export function MemoryView() {
     try {
       const res = await client.listMemories({
         category: activeCategory === "all" ? undefined : activeCategory,
+        device_id: selectedDeviceId,
       });
       setMemories(res.items || []);
       setTotalCount(res.total || 0);
@@ -135,7 +137,7 @@ export function MemoryView() {
   useEffect(() => {
     reloadMemories();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeCategory]);
+  }, [activeCategory, selectedDeviceId]);
 
   const handleTestSearch = async () => {
     const q = testQuery.trim();
@@ -146,7 +148,7 @@ export function MemoryView() {
     }
     setSearching(true);
     try {
-      const res = await client.queryMemory(q, 5);
+      const res = await client.queryMemory(q, 5, 0.28, selectedDeviceId);
       setSearchResults(res.results || []);
       setSearchLatency(res.latency_ms);
     } catch (e) {
@@ -192,8 +194,8 @@ export function MemoryView() {
         await client.createMemoryItem({
           content,
           category: itemDraft.category,
+          device_id: selectedDeviceId,
         });
-        toast("Memory stored and vector indexed");
       }
       setModalOpen(false);
       reloadMemories();
@@ -227,17 +229,19 @@ export function MemoryView() {
   return (
     <div className={styles.stack}>
       {/* ── Tier 1: On-Device Identity Summary (MEMORY.md) ── */}
-      <Alert
-        type="info"
-        showIcon
-        message="On-Device Memory (MEMORY.md)"
-        description="High-level identity summary kept small (<2KB) for on-device SPIFFS sync. The agent reads this on boot to know who ESPET is. Long-term factual and episodic memory is stored separately in backend SQLite-Vec below."
-      />
-
       <Card>
         <div className={styles.cardHead}>
-          <div className={styles.cardTitle}>
-            <Icon name="sparkles" /> Identity & Profile Summary
+          <div style={{ display: "flex", alignItems: "center" }}>
+            <div className={styles.cardTitle}>
+              <Icon name="sparkles" /> Identity &amp; Profile Summary (MEMORY.md)
+            </div>
+            <Tooltip title="High-level identity summary kept small (<2KB) for on-device SPIFFS sync. The agent reads this on boot to maintain identity continuity across reboots. Synchronized 2-way with the physical device.">
+              <Icon
+                name="info"
+                size={15}
+                style={{ color: "#a3a3a3", cursor: "pointer", marginLeft: 8 }}
+              />
+            </Tooltip>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
             <SectionDirtyChip section="memory" />
@@ -299,34 +303,22 @@ export function MemoryView() {
       </Card>
 
       {/* ── Tier 2: Long-Term Vector Memory (SQLite-Vec RAG) ── */}
-      <Alert
-        type="warning"
-        showIcon
-        message="Long-Term Vector Memory Modification Warning"
-        description="Directly modifying or deleting long-term memories alters ESPET's historical grounding and neural vector recall. Changes re-index immediately into SQLite-Vec and directly govern future RAG context injections."
-      />
-
       <Card>
         <div className={styles.cardHead}>
-          <div className={styles.cardTitle}>
-            <Icon name="database" /> Long-Term Memory (SQLite-Vec RAG)
+          <div style={{ display: "flex", alignItems: "center" }}>
+            <div className={styles.cardTitle}>
+              <Icon name="database" /> Long-Term Memory (SQLite-Vec RAG)
+            </div>
+            <Tooltip title="Permanent vector memory database powered by BAAI/bge-small-en-v1.5 and sqlite-vec. ESPET automatically writes here via autonomous tool interactions over time. Search tests vector similarity (<0.28 cosine distance) scoped to this device.">
+              <Icon
+                name="info"
+                size={15}
+                style={{ color: "#a3a3a3", cursor: "pointer", marginLeft: 8 }}
+              />
+            </Tooltip>
           </div>
           <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
             <Badge>{totalCount} records</Badge>
-            <Button
-              icon={<Icon name="refresh" size={15} />}
-              onClick={async () => {
-                try {
-                  const res = await client.syncFromMemoryMd();
-                  toast(`Synced ${res.indexed} new fact(s) from MEMORY.md into Vector DB`);
-                  reloadMemories();
-                } catch (e) {
-                  toast((e as Error).message, "error");
-                }
-              }}
-            >
-              Sync from MEMORY.md
-            </Button>
             <Button
               type="primary"
               icon={<Icon name="plus" size={15} />}
@@ -351,8 +343,13 @@ export function MemoryView() {
             marginBottom: 16,
           }}
         >
-          <div style={{ fontSize: 13, fontWeight: 600, color: "#d4d4d4", marginBottom: 6 }}>
-            Semantic Vector Search Tester (NFR-5 Latency Compliance)
+          <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
+            <span style={{ fontSize: 13, fontWeight: 600, color: "#d4d4d4" }}>
+              Semantic Vector Search Tester (NFR-5 Latency Compliance)
+            </span>
+            <Tooltip title="Tests semantic vector search scoped strictly to the selected device, returning nearest cosine distance matches in milliseconds.">
+              <Icon name="info" size={14} style={{ color: "#a3a3a3", cursor: "pointer" }} />
+            </Tooltip>
           </div>
           <div style={{ display: "flex", gap: 10 }}>
             <Input

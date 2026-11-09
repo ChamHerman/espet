@@ -12,6 +12,7 @@ import {
   Radio,
   Select,
   Switch,
+  Tooltip,
 } from "antd";
 import dayjs from "dayjs";
 import { useState } from "react";
@@ -73,7 +74,7 @@ const destText = (j: Job) =>
   j.channel === "telegram" ? `Telegram · chat ${j.chat_id}` : "Device (OLED + voice)";
 
 export function ScheduleView() {
-  const { config, patchConfig, toast, confirm } = useApp();
+  const { config, patchConfig, toast, confirm, selectedDeviceId } = useApp();
   const { styles } = useLayout();
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<Job | null>(null);
@@ -116,14 +117,14 @@ export function ScheduleView() {
 
     try {
       const res = editing
-        ? await client.updateJob(editing.id, payload)
-        : await client.createJob(payload);
+        ? await client.updateJob(editing.id, payload, selectedDeviceId)
+        : await client.createJob(payload, selectedDeviceId);
       patchConfig((c) => {
         c.jobs = res.jobs;
         c.versions.jobs = res.versions.jobs;
       });
       setOpen(false);
-      toast(editing ? "Job updated" : "Job created");
+      toast(editing ? "Job updated and pushed to device" : "Job created and pushed to device");
     } catch (e) {
       toast((e as Error).message, "error");
     }
@@ -131,7 +132,7 @@ export function ScheduleView() {
 
   const toggle = async (j: Job, enabled: boolean) => {
     try {
-      const res = await client.updateJob(j.id, { enabled });
+      const res = await client.updateJob(j.id, { enabled }, selectedDeviceId);
       patchConfig((c) => {
         c.jobs = res.jobs;
         c.versions.jobs = res.versions.jobs;
@@ -151,7 +152,7 @@ export function ScheduleView() {
     });
     if (!ok) return;
     try {
-      const res = await client.deleteJob(j.id);
+      const res = await client.deleteJob(j.id, selectedDeviceId);
       patchConfig((c) => {
         c.jobs = res.jobs;
         c.versions.jobs = res.versions.jobs;
@@ -166,8 +167,17 @@ export function ScheduleView() {
     <div className={styles.stack}>
       <Card>
         <div className={styles.cardHead}>
-          <div className={styles.cardTitle}>
-            <Icon name="calendar" /> Scheduled jobs
+          <div style={{ display: "flex", alignItems: "center" }}>
+            <div className={styles.cardTitle}>
+              <Icon name="calendar" /> Scheduled Jobs
+            </div>
+            <Tooltip title="Cron jobs running autonomously on the physical ESPET device. Synced 2-way between device and backend to ensure complete alignment. Device limits: 16 jobs, 31-char name, 255-char message.">
+              <Icon
+                name="info"
+                size={15}
+                style={{ color: "#a3a3a3", cursor: "pointer", marginLeft: 8 }}
+              />
+            </Tooltip>
           </div>
           <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
             <Badge>{jobs.length}/{JOB_MAX} slots</Badge>
@@ -229,15 +239,6 @@ export function ScheduleView() {
           )}
         </div>
       </Card>
-      <div className={`${styles.sectionNote}`}>
-        <Icon name="info" size={16} />
-        <span>
-          Jobs created here are pushed to the device as{" "}
-          <span className="espet-mono">cron.json</span>. Jobs ESPET creates by
-          itself (e.g. “remind me at 5pm” by voice) live only on the device and
-          are preserved during sync.
-        </span>
-      </div>
 
       <Modal
         title={editing ? "Edit scheduled job" : "New scheduled job"}

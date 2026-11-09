@@ -1,7 +1,7 @@
 /* UI chrome icons — inline lucide-style SVG paths (ported from legacy app.js).
    Brand marks (Google, etc.) come from @lobehub/icons where used. */
 
-import type { ReactNode } from "react";
+import type { CSSProperties, ReactNode } from "react";
 
 const P: Record<string, ReactNode> = {
   dashboard: (
@@ -162,17 +162,20 @@ export function Icon({
   size = 18,
   className,
   strokeWidth = 2,
+  style,
 }: {
   name: IconName;
   size?: number;
   className?: string;
   strokeWidth?: number;
+  style?: CSSProperties;
 }) {
   return (
     <svg
       className={className}
       width={size}
       height={size}
+      style={style}
       viewBox="0 0 24 24"
       fill="none"
       stroke="currentColor"
