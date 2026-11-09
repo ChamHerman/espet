@@ -206,3 +206,16 @@ async def sync_from_memory_md(
             existing_texts.add(item.lower())
 
     return {"ok": True, "indexed": indexed, "total_lines": len(lines)}
+
+
+@router.post("/auto-organize", summary="Clean noisy action records and organize memories")
+async def auto_organize_memory(
+    device_id: str = Query("espet_s3_01"),
+    _key: str = Depends(verify_device_key),
+) -> dict[str, Any]:
+    try:
+        cleaned = await asyncio.to_thread(rag_service.delete_noisy_actions, device_id=device_id)
+        return {"ok": True, "cleaned_actions": cleaned, "device_id": device_id}
+    except Exception as e:
+        logger.error("Auto-organize memory failed: %r", e)
+        raise HTTPException(status_code=500, detail=str(e))

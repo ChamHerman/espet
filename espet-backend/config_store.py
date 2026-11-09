@@ -56,11 +56,10 @@ SKILL_NAME_MAX = 48        # slug chars; +".md" + "skills/" stays under 64
 # backend starts with the same state the device was flashed with.
 _DEFAULT_USER_MD = """# User Profile
 
-- Name: ESPET
+- Name: (not set)
 - Language: Chinese / English
 - Timezone: Asia/Kuala_Lumpur
 """
-
 _DEFAULT_SOUL_MD = """I am ESPET, a personal AI assistant running on an ESP32-S3 microcontroller.
 
 Personality:
@@ -78,11 +77,10 @@ Behavior Rules:
 - **Stop Yapping**: Be extremely concise. Avoid phrases like "I can do that for you!" or "Here are your options." Just do the task.
 """
 
-_DEFAULT_MEMORY_MD = """# Long-term Memory
+_DEFAULT_MEMORY_MD = """# Working Memory
 
-(empty - ESPET will write memories here as it learns)
+(empty - ESPET writes active task context and working notes here)
 """
-
 # Default skill files — mirrors spiffs_data/skills/ so the dashboard starts
 # populated with the same skills the device was flashed with.
 _DEFAULT_SKILLS = [
@@ -341,6 +339,97 @@ def update_markdown(section: str, content: str, device_id: str | None = None) ->
         _save_unlocked(cfg, device_id)
         return cfg
 
+
+def parse_user_md(md: str) -> dict:
+    fields = {"name": "", "language": "", "timezone": "", "notes": []}
+    for line in md.split("\n"):
+        m = re.match(r"^-\s*(Name|Language|Timezone):\s*(.*)$", line, re.IGNORECASE)
+        if m:
+            fields[m.group(1).lower()] = m.group(2).strip()
+        elif (
+            line.strip() == "# User Profile"
+            or (line.strip() == "" and not fields["name"] and not fields["language"] and not fields["timezone"])
+        ):
+            continue
+        else:
+            fields["notes"].append(line)
+    while fields["notes"] and fields["notes"][0].strip() == "":
+        fields["notes"].pop(0)
+    while fields["notes"] and fields["notes"][-1].strip() == "":
+        fields["notes"].pop()
+    return fields
+
+
+def build_user_md(fields: dict) -> str:
+    name = fields.get("name") or "(not set)"
+    lang = fields.get("language") or ""
+    tz = fields.get("timezone") or ""
+    parts = [
+        "# User Profile",
+        "",
+        f"- Name: {name}",
+        f"- Language: {lang}",
+        f"- Timezone: {tz}",
+    ]
+    notes = "\n".join(fields.get("notes", [])).strip()
+    if notes:
+        parts.extend(["", notes])
+    return "\n".join(parts) + "\n"
+
+
+def patch_user_profile(
+    device_id: str | None = None,
+    name: str | None = None,
+    language: str | None = None,
+    timezone: str | None = None,
+    note: str | None = None,
+) -> bool:
+    """
+    Patches USER.md if incoming fields actually differ from current values.
+    Returns True if an update was committed, False if no change.
+    """
+    with _lock:
+        cfg = _load_unlocked(device_id)
+        current_md = cfg.get("user_md", "")
+        fields = parse_user_md(current_md)
+        changed = False
+
+        if name is not None:
+            clean_name = name.strip()
+            if clean_name and clean_name != "(not set)" and fields.get("name") != clean_name:
+                fields["name"] = clean_name
+                changed = True
+
+        if language is not None:
+            clean_lang = language.strip()
+            if clean_lang and fields.get("language") != clean_lang:
+                fields["language"] = clean_lang
+                changed = True
+
+        if timezone is not None:
+            clean_tz = timezone.strip()
+            if clean_tz and fields.get("timezone") != clean_tz:
+                fields["timezone"] = clean_tz
+                changed = True
+
+        if note is not None:
+            clean_note = note.strip()
+            if clean_note:
+                # Check if note already recorded
+                existing_text = "\n".join(fields.get("notes", []))
+                if clean_note.lower() not in existing_text.lower():
+                    formatted_bullet = f"- {clean_note}"
+                    fields["notes"].append(formatted_bullet)
+                    changed = True
+
+        if not changed:
+            return False
+
+        new_md = build_user_md(fields)
+        cfg["user_md"] = new_md
+        _bump(cfg, "user")
+        _save_unlocked(cfg, device_id)
+        return True
 
 # ── Avatar (dashboard-only) ───────────────────────────────────────
 

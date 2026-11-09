@@ -172,11 +172,9 @@ export function ScheduleView() {
               <Icon name="calendar" /> Scheduled Jobs
             </div>
             <Tooltip title="Cron jobs running autonomously on the physical ESPET device. Synced 2-way between device and backend to ensure complete alignment. Device limits: 16 jobs, 31-char name, 255-char message.">
-              <Icon
-                name="info"
-                size={15}
-                style={{ color: "#a3a3a3", cursor: "pointer", marginLeft: 8 }}
-              />
+              <span style={{ display: "inline-flex", alignItems: "center", cursor: "pointer", marginLeft: 8 }}>
+                <Icon name="info" size={15} style={{ color: "#a3a3a3" }} />
+              </span>
             </Tooltip>
           </div>
           <div style={{ display: "flex", gap: 10, alignItems: "center" }}>

@@ -24,7 +24,7 @@ import { useApp } from "../store";
 import { Badge, Card, useLayout } from "../ui";
 import type { MemoryItem, MemoryQueryResult } from "../types";
 
-export const EMPTY_MEMORY = `# Long-term Memory\n\n(empty - ESPET will write memories here as it learns)\n`;
+export const EMPTY_MEMORY = `# Working Memory\n\n(empty - ESPET writes active task context and working notes here)\n`;
 
 const CATEGORIES = [
   { value: "all", label: "All Categories" },
@@ -55,7 +55,8 @@ export function MemoryView() {
   const server = config?.memory_md ?? "";
   const [draft, setDraft] = useState(server);
   const [note, setNote] = useState("");
-
+  const [memoryModalOpen, setMemoryModalOpen] = useState(false);
+  const [organizing, setOrganizing] = useState(false);
   // Tier 2: Long-Term SQLite-Vec Memory state
   const [memories, setMemories] = useState<MemoryItem[]>([]);
   const [totalCount, setTotalCount] = useState(0);
@@ -93,15 +94,27 @@ export function MemoryView() {
 
   const clear = async () => {
     const ok = await confirm({
-      title: "Clear on-device memory?",
+      title: "Clear on-device working memory?",
       message:
-        "MEMORY.md on device flash will be replaced with an empty template at next sync. Long-term vector memory in SQLite will be preserved.",
+        "MEMORY.md on device flash will be replaced with an empty working scratchpad template at next sync. Long-term vector memory in SQLite will be preserved.",
       okLabel: "Clear MEMORY.md",
       danger: true,
     });
     if (ok) apply(EMPTY_MEMORY);
   };
 
+  const autoOrganize = async () => {
+    setOrganizing(true);
+    try {
+      const res = await client.autoOrganizeMemory(selectedDeviceId);
+      toast(`Auto-organize complete: cleaned ${res.cleaned_actions} noisy action records.`);
+      reloadMemories();
+    } catch (e) {
+      toast((e as Error).message, "error");
+    } finally {
+      setOrganizing(false);
+    }
+  };
   const save = async () => {
     try {
       const res = await client.saveMemory(draft, selectedDeviceId);
@@ -228,19 +241,17 @@ export function MemoryView() {
 
   return (
     <div className={styles.stack}>
-      {/* ── Tier 1: On-Device Identity Summary (MEMORY.md) ── */}
+      {/* ── Tier 1: On-Device Working Memory (MEMORY.md) ── */}
       <Card>
         <div className={styles.cardHead}>
           <div style={{ display: "flex", alignItems: "center" }}>
             <div className={styles.cardTitle}>
-              <Icon name="sparkles" /> Identity &amp; Profile Summary (MEMORY.md)
+              <Icon name="sparkles" /> Working Memory (Device Scratchpad)
             </div>
-            <Tooltip title="High-level identity summary kept small (<2KB) for on-device SPIFFS sync. The agent reads this on boot to maintain identity continuity across reboots. Synchronized 2-way with the physical device.">
-              <Icon
-                name="info"
-                size={15}
-                style={{ color: "#a3a3a3", cursor: "pointer", marginLeft: 8 }}
-              />
+            <Tooltip title="On-device working scratchpad (<2KB) for physical ESP32 flash sync. The agent uses this for active task context across reboots. User profile belongs in USER.md; long-term semantic memories are in SQLite-Vec RAG below.">
+              <span style={{ display: "inline-flex", alignItems: "center", cursor: "pointer", marginLeft: 8 }}>
+                <Icon name="info" size={15} style={{ color: "#a3a3a3" }} />
+              </span>
             </Tooltip>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
@@ -250,12 +261,48 @@ export function MemoryView() {
             </span>
           </div>
         </div>
-        <SourceField
-          label="Content (markdown)"
-          value={draft}
-          placeholder="# Long-term Memory"
-          onChange={apply}
-        />
+
+        {/* Bounded Scrollable Read-Only Preview */}
+        <div style={{ position: "relative", marginTop: 8 }}>
+          <div
+            style={{
+              maxHeight: 220,
+              overflowY: "auto",
+              background: "#141414",
+              border: "1px solid #262626",
+              borderRadius: 8,
+              padding: 12,
+              fontFamily: "monospace",
+              fontSize: 13,
+              color: "#d4d4d4",
+              whiteSpace: "pre-wrap",
+              wordBreak: "break-word",
+              lineHeight: 1.5,
+            }}
+          >
+            {draft.trim() ? draft : <span style={{ color: "#525252" }}>(empty working memory)</span>}
+          </div>
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              marginTop: 8,
+            }}
+          >
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <Tag color="default">{draft.split("\n").length} lines</Tag>
+              <Tag color="default">{new TextEncoder().encode(draft).length} bytes</Tag>
+            </div>
+            <Button
+              icon={<Icon name="edit" size={14} />}
+              onClick={() => setMemoryModalOpen(true)}
+            >
+              Edit Working Memory
+            </Button>
+          </div>
+        </div>
+
         <div style={{ marginTop: 12 }}>
           <div style={{ fontSize: 12, color: "#a3a3a3", marginBottom: 4 }}>
             Quick note
@@ -263,7 +310,7 @@ export function MemoryView() {
           <div style={{ display: "flex", gap: 10 }}>
             <Input
               value={note}
-              placeholder="e.g. User prefers concise responses"
+              placeholder="e.g. Active task: investigating sensor reading jitter"
               onChange={(e) => setNote(e.target.value)}
               onPressEnter={appendNote}
             />
@@ -272,36 +319,67 @@ export function MemoryView() {
             </Button>
           </div>
           <div style={{ fontSize: 12, color: "#737373", marginTop: 4 }}>
-            Adds a dated bullet at the end of MEMORY.md without opening the editor.
+            Adds a dated bullet at the end of MEMORY.md.
           </div>
         </div>
-        <div
-          style={{
-            display: "flex",
-            justifyContent: "space-between",
-            gap: 10,
-            marginTop: 16,
-          }}
-        >
-          <Button danger onClick={clear} icon={<Icon name="trash" size={15} />}>
-            Clear MEMORY.md
-          </Button>
-          <Space>
-            <Button onClick={() => apply(config.memory_md)} disabled={!dirty}>
-              Revert
-            </Button>
+
+        {dirty && (
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "flex-end",
+              gap: 10,
+              marginTop: 14,
+            }}
+          >
+            <Button onClick={() => apply(config.memory_md)}>Revert</Button>
             <Button
               type="primary"
-              disabled={!dirty}
               icon={<Icon name="save" size={15} />}
               onClick={save}
             >
               Save MEMORY.md
             </Button>
-          </Space>
-        </div>
+          </div>
+        )}
       </Card>
 
+      {/* Working Memory Editor Modal */}
+      <Modal
+        open={memoryModalOpen}
+        title="Edit Working Memory (MEMORY.md)"
+        width={760}
+        onCancel={() => setMemoryModalOpen(false)}
+        footer={[
+          <Button key="clear" danger onClick={clear} icon={<Icon name="trash" size={14} />}>
+            Clear
+          </Button>,
+          <Button key="revert" onClick={() => apply(config.memory_md)} disabled={!dirty}>
+            Revert
+          </Button>,
+          <Button
+            key="save"
+            type="primary"
+            disabled={!dirty}
+            icon={<Icon name="save" size={14} />}
+            onClick={async () => {
+              await save();
+              setMemoryModalOpen(false);
+            }}
+          >
+            Save to Device
+          </Button>,
+        ]}
+      >
+        <div style={{ paddingTop: 8 }}>
+          <SourceField
+            label="Content (markdown)"
+            value={draft}
+            placeholder="# Working Memory"
+            onChange={apply}
+          />
+        </div>
+      </Modal>
       {/* ── Tier 2: Long-Term Vector Memory (SQLite-Vec RAG) ── */}
       <Card>
         <div className={styles.cardHead}>
@@ -310,15 +388,20 @@ export function MemoryView() {
               <Icon name="database" /> Long-Term Memory (SQLite-Vec RAG)
             </div>
             <Tooltip title="Permanent vector memory database powered by BAAI/bge-small-en-v1.5 and sqlite-vec. ESPET automatically writes here via autonomous tool interactions over time. Search tests vector similarity (<0.28 cosine distance) scoped to this device.">
-              <Icon
-                name="info"
-                size={15}
-                style={{ color: "#a3a3a3", cursor: "pointer", marginLeft: 8 }}
-              />
+              <span style={{ display: "inline-flex", alignItems: "center", cursor: "pointer", marginLeft: 8 }}>
+                <Icon name="info" size={15} style={{ color: "#a3a3a3" }} />
+              </span>
             </Tooltip>
           </div>
           <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
             <Badge>{totalCount} records</Badge>
+            <Button
+              icon={<Icon name="sparkles" size={15} />}
+              loading={organizing}
+              onClick={autoOrganize}
+            >
+              AI Auto-Organize
+            </Button>
             <Button
               type="primary"
               icon={<Icon name="plus" size={15} />}
@@ -348,7 +431,9 @@ export function MemoryView() {
               Semantic Vector Search Tester (NFR-5 Latency Compliance)
             </span>
             <Tooltip title="Tests semantic vector search scoped strictly to the selected device, returning nearest cosine distance matches in milliseconds.">
-              <Icon name="info" size={14} style={{ color: "#a3a3a3", cursor: "pointer" }} />
+              <span style={{ display: "inline-flex", alignItems: "center", cursor: "pointer" }}>
+                <Icon name="info" size={14} style={{ color: "#a3a3a3" }} />
+              </span>
             </Tooltip>
           </div>
           <div style={{ display: "flex", gap: 10 }}>

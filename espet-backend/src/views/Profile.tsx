@@ -226,11 +226,9 @@ export function ProfileView() {
               <Icon name="user" /> User Profile
             </div>
             <Tooltip title="What the agent knows about you — preferred name, language, timezone, and background context. Saved content is synchronized directly to USER.md on the device.">
-              <Icon
-                name="info"
-                size={15}
-                style={{ color: "#a3a3a3", cursor: "pointer", marginLeft: 8 }}
-              />
+              <span style={{ display: "inline-flex", alignItems: "center", cursor: "pointer", marginLeft: 8 }}>
+                <Icon name="info" size={15} style={{ color: "#a3a3a3" }} />
+              </span>
             </Tooltip>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>

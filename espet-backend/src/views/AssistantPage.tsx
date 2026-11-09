@@ -76,11 +76,9 @@ export function DeviceSyncBar() {
             <Icon name="cpu" size={18} /> Target ESPET Device
           </div>
           <Tooltip title="Select which physical ESPET device to synchronize with. All personality, profile, memory, and scheduled jobs in this tab directly mirror the physical flash of the selected device.">
-            <Icon
-              name="info"
-              size={15}
-              style={{ color: "#a3a3a3", cursor: "pointer", marginLeft: 4 }}
-            />
+            <span style={{ display: "inline-flex", alignItems: "center", cursor: "pointer", marginLeft: 4 }}>
+              <Icon name="info" size={15} style={{ color: "#a3a3a3" }} />
+            </span>
           </Tooltip>
         </div>
 

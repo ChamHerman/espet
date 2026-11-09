@@ -126,11 +126,9 @@ export function SkillsView() {
               <Icon name="book" /> Skills
             </div>
             <Tooltip title="Skills created here are written to /spiffs/skills/ on the device. A skill must start with a # Title heading — that's what the device parses. Each skill is a markdown playbook the agent can follow.">
-              <Icon
-                name="info"
-                size={15}
-                style={{ color: "#a3a3a3", cursor: "pointer", marginLeft: 8 }}
-              />
+              <span style={{ display: "inline-flex", alignItems: "center", cursor: "pointer", marginLeft: 8 }}>
+                <Icon name="info" size={15} style={{ color: "#a3a3a3" }} />
+              </span>
             </Tooltip>
           </div>
           <div style={{ display: "flex", gap: 10, alignItems: "center" }}>

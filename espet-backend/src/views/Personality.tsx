@@ -225,11 +225,9 @@ export function PersonalityView() {
               <Icon name="sparkles" /> Personality &amp; Behavior
             </div>
             <Tooltip title="The first instruction the agent reads in every prompt — defines personality, values, and hard behavior rules. Strong constraints like 'Stop Yapping' and 'Take Initiative' visibly improve small model responses.">
-              <Icon
-                name="info"
-                size={15}
-                style={{ color: "#a3a3a3", cursor: "pointer", marginLeft: 8 }}
-              />
+              <span style={{ display: "inline-flex", alignItems: "center", cursor: "pointer", marginLeft: 8 }}>
+                <Icon name="info" size={15} style={{ color: "#a3a3a3" }} />
+              </span>
             </Tooltip>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>

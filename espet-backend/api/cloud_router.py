@@ -25,7 +25,7 @@ from services.device_registry import DeviceRegistry
 from services.gateway_settings import gateway_settings
 from services.telegram_gateway import TelegramGateway, get_gateway, set_gateway
 from services.rag_service import rag_service
-
+from services.memory_organizer import memory_organizer
 import config_store as store
 logger = logging.getLogger("espet-backend.cloud")
 
@@ -346,10 +346,24 @@ async def _llm_relay(websocket, request_id, body_str: str, device_id: str = "esp
         await _reply(resp.status_code == 200, resp.status_code, resp.text)
         if resp.status_code == 200:
             asyncio.create_task(_capture_episodic_action(device_id, resp.text))
+            if user_query:
+                asyncio.create_task(
+                    memory_organizer.extract_from_turn(device_id, user_query, resp.text)
+                )
     except Exception as e:
-        logger.warning("LLM relay to %s failed: %r", url, e)
         await _reply(False, 0, json.dumps({"error": f"{type(e).__name__}: {e}"}))
 
+
+NOISE_TOOLS = {
+    "get_current_time",
+    "cron_list",
+    "gpio_read",
+    "gpio_read_all",
+    "read_file",
+    "list_dir",
+    "memory_search",
+    "memory_save",
+}
 
 async def _capture_episodic_action(device_id: str, resp_text: str) -> None:
     try:
@@ -363,7 +377,7 @@ async def _capture_episodic_action(device_id: str, resp_text: str) -> None:
             fn = tc.get("function", {})
             name = fn.get("name", "")
             args = fn.get("arguments", "")
-            if name and name not in ("memory_save", "memory_search"):
+            if name and name not in NOISE_TOOLS:
                 summary = f"Action: executed tool {name} with args {args[:120]}"
                 await asyncio.to_thread(
                     rag_service.add_memory,

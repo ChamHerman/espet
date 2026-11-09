@@ -236,10 +236,10 @@ esp_err_t tool_registry_init(void)
 
     mimi_tool_t gr = {
         .name = "gpio_read",
-        .description = "Read a GPIO pin state (returns 1 for HIGH, 0 for LOW). Fixed hardware pins: GPIO 39 = GREEN Button, GPIO 38 = WHITE Button.",
+        .description = "Read a GPIO pin state (returns 1 for HIGH, 0 for LOW). Fixed hardware pins: GPIO 41 = GREEN Button (GPIO 38/39 are shared I2S audio clocks).",
         .input_schema_json =
             "{\"type\":\"object\","
-            "\"properties\":{\"pin\":{\"type\":\"integer\",\"description\":\"GPIO pin number (e.g. 39 for GREEN Button, 38 for WHITE Button)\"}},"
+            "\"properties\":{\"pin\":{\"type\":\"integer\",\"description\":\"GPIO pin number (e.g. 41 for GREEN Button)\"}},"
             "\"required\":[\"pin\"]}",
         .execute = tool_gpio_read_execute,
     };

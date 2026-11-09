@@ -116,6 +116,8 @@ export const client = {
     api<MemoryQueryResponse>("/api/memory/query", json("POST", { query, top_k, threshold, device_id })),
   syncFromMemoryMd: (device_id = "espet_s3_01") =>
     api<{ ok: boolean; indexed: number; total_lines: number }>(`/api/memory/sync-from-md?device_id=${device_id}`, json("POST", {})),
+  autoOrganizeMemory: (device_id = "espet_s3_01") =>
+    api<{ ok: boolean; cleaned_actions: number; device_id: string }>(`/api/memory/auto-organize?device_id=${encodeURIComponent(device_id)}`, json("POST", {})),
 };
 
 /* Device WebSocket gateway address for the direct-chat view (localStorage;

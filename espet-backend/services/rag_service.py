@@ -139,6 +139,41 @@ class RAGService:
             logger.info("Deleted memory chunk %d", chunk_id)
         return deleted
 
+    def delete_noisy_actions(self, device_id: str) -> int:
+        """
+        Clean up noisy read-only and memory query tool executions from episodic action logs.
+        """
+        patterns = [
+            "Action: executed tool get_current_time%",
+            "Action: executed tool cron_list%",
+            "Action: executed tool gpio_read%",
+            "Action: executed tool read_file%",
+            "Action: executed tool list_dir%",
+            "Action: executed tool memory_search%",
+            "Action: executed tool memory_save%",
+        ]
+        deleted_count = 0
+        with self.db._lock:
+            conn = self.db.get_conn()
+            with conn:
+                cur = conn.cursor()
+                # Find chunk IDs matching noisy patterns
+                where_pattern = " OR ".join(["content LIKE ?" for _ in patterns])
+                query = f"""
+                    SELECT id FROM memory_chunks
+                    WHERE device_id = ? AND source_type = 'action' AND ({where_pattern})
+                """
+                cur.execute(query, (device_id, *patterns))
+                rows = cur.fetchall()
+                chunk_ids = [r[0] for r in rows]
+                if chunk_ids:
+                    placeholders = ",".join("?" * len(chunk_ids))
+                    cur.execute(f"DELETE FROM vec_memories WHERE chunk_id IN ({placeholders})", chunk_ids)
+                    cur.execute(f"DELETE FROM memory_chunks WHERE id IN ({placeholders})", chunk_ids)
+                    deleted_count = cur.rowcount
+        logger.info("Deleted %d noisy action records for device %s", deleted_count, device_id)
+        return deleted_count
+
     def get_memory(self, chunk_id: int) -> dict | None:
         row = self.db.fetchone(
             """
