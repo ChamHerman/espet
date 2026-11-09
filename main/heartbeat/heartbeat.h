@@ -9,15 +9,20 @@
 esp_err_t heartbeat_init(void);
 
 /**
- * Start the heartbeat timer. Checks HEARTBEAT.md periodically
- * and sends a prompt to the agent if actionable tasks are found.
+ * Start periodic heartbeat checks (dispatched via cron task).
+ * Checks HEARTBEAT.md periodically and sends a prompt to the agent if actionable tasks are found.
  */
 esp_err_t heartbeat_start(void);
 
 /**
- * Stop and delete the heartbeat timer.
+ * Stop periodic heartbeat checks.
  */
 void heartbeat_stop(void);
+
+/**
+ * Check if heartbeat polling is enabled.
+ */
+bool heartbeat_is_enabled(void);
 
 /**
  * Manually trigger a heartbeat check (for CLI testing).

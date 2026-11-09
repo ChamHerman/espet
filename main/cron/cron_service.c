@@ -1,6 +1,7 @@
 #include "cron/cron_service.h"
 #include "mimi_config.h"
 #include "bus/message_bus.h"
+#include "heartbeat/heartbeat.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -301,10 +302,20 @@ static void cron_process_due_jobs(void)
 static void cron_task_main(void *arg)
 {
     (void)arg;
+    uint32_t intervals_elapsed = 0;
+    const uint32_t heartbeat_interval_count =
+        (MIMI_HEARTBEAT_INTERVAL_MS / MIMI_CRON_CHECK_INTERVAL_MS);
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(MIMI_CRON_CHECK_INTERVAL_MS));
         cron_process_due_jobs();
+
+        if (heartbeat_interval_count > 0 && ++intervals_elapsed >= heartbeat_interval_count) {
+            intervals_elapsed = 0;
+            if (heartbeat_is_enabled()) {
+                heartbeat_trigger();
+            }
+        }
     }
 }
 
