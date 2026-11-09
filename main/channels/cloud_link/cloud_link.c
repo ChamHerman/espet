@@ -25,14 +25,16 @@
 #include "freertos/task.h"
 #include "mimi_config.h"
 #include "sync/backend_discovery.h"
+#include "sync/config_sync.h"
 #include "tools/tool_audio.h"
 #include "voice/voice_client.h"
 
+#include "channels/telegram/telegram_bot.h"
 #include "bus/message_bus.h"
 
 static const char *TAG = "cloud";
 
-#define CLOUD_FRAME_MAX 1024
+#define CLOUD_FRAME_MAX (36 * 1024)
 
 static esp_websocket_client_handle_t s_client;
 static volatile bool s_running;
@@ -79,7 +81,82 @@ static void send_hello(void)
              s_device_id, esp_get_idf_version());
     send_json(hello);
     ESP_LOGI(TAG, "hello sent as %s", s_device_id);
+    cloud_link_send_sync_report();
 }
+esp_err_t cloud_link_send_sync_report(void)
+{
+    if (!s_client || !esp_websocket_client_is_connected(s_client)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON_AddStringToObject(root, "type", "device_sync_report");
+    cJSON_AddStringToObject(root, "device_id", s_device_id);
+
+    /* 1. Read MEMORY.md */
+    FILE *f_mem = fopen(MIMI_MEMORY_FILE, "r");
+    if (f_mem) {
+        fseek(f_mem, 0, SEEK_END);
+        long sz = ftell(f_mem);
+        fseek(f_mem, 0, SEEK_SET);
+        if (sz > 0 && sz <= 16384) {
+            char *mem_buf = malloc(sz + 1);
+            if (mem_buf) {
+                size_t nr = fread(mem_buf, 1, sz, f_mem);
+                mem_buf[nr] = '\0';
+                cJSON_AddStringToObject(root, "memory_md", mem_buf);
+                free(mem_buf);
+            }
+        }
+        fclose(f_mem);
+    } else {
+        cJSON_AddStringToObject(root, "memory_md", "");
+    }
+
+    /* 2. Read cron.json */
+    FILE *f_cron = fopen(MIMI_CRON_FILE, "r");
+    cJSON *jobs_arr = NULL;
+    if (f_cron) {
+        fseek(f_cron, 0, SEEK_END);
+        long csz = ftell(f_cron);
+        fseek(f_cron, 0, SEEK_SET);
+        if (csz > 0 && csz <= 16384) {
+            char *cron_buf = malloc(csz + 1);
+            if (cron_buf) {
+                size_t cnr = fread(cron_buf, 1, csz, f_cron);
+                cron_buf[cnr] = '\0';
+                cJSON *cron_root = cJSON_Parse(cron_buf);
+                if (cron_root) {
+                    cJSON *jitem = cJSON_GetObjectItem(cron_root, "jobs");
+                    if (jitem && cJSON_IsArray(jitem)) {
+                        jobs_arr = cJSON_Duplicate(jitem, true);
+                    }
+                    cJSON_Delete(cron_root);
+                }
+                free(cron_buf);
+            }
+        }
+        fclose(f_cron);
+    }
+    if (!jobs_arr) {
+        jobs_arr = cJSON_CreateArray();
+    }
+    cJSON_AddItemToObject(root, "jobs", jobs_arr);
+
+    char *rendered = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!rendered) {
+        return ESP_ERR_NO_MEM;
+    }
+    send_json(rendered);
+    free(rendered);
+    ESP_LOGI(TAG, "device_sync_report sent");
+    return ESP_OK;
+}
+
 
 typedef struct {
     size_t samples;
@@ -104,6 +181,14 @@ static void transcribe_task_fn(void *arg)
 }
 
 /* -------------------------------------------------- inbound frame handling */
+static void sync_bound_chat(const cJSON *root)
+{
+    const cJSON *chat = cJSON_GetObjectItem(root, "chat_id");
+    if (cJSON_IsString(chat) && chat->valuestring[0] != '\0') {
+        telegram_set_last_chat_id(chat->valuestring);
+    }
+}
+
 
 static void handle_frame(char *json_str)
 {
@@ -118,6 +203,7 @@ static void handle_frame(char *json_str)
     if (strcmp(type_str, "message_in") == 0) {
         const cJSON *chat = cJSON_GetObjectItem(root, "chat_id");
         const cJSON *text = cJSON_GetObjectItem(root, "text");
+        sync_bound_chat(root);
         if (cJSON_IsString(chat) && cJSON_IsString(text)) {
             mimi_msg_t msg = {0};
             strlcpy(msg.channel, MIMI_CHAN_CLOUD, sizeof(msg.channel));
@@ -206,8 +292,15 @@ static void handle_frame(char *json_str)
         send_json(resp);
     } else if (strcmp(type_str, "hello_ack") == 0) {
         ESP_LOGI(TAG, "cloud gateway accepted this device");
+        sync_bound_chat(root);
+    } else if (strcmp(type_str, "bind_sync") == 0) {
+        sync_bound_chat(root);
+        ESP_LOGI(TAG, "received bind_sync from gateway");
     } else if (strcmp(type_str, "pong") == 0) {
         /* keepalive */
+    } else if (strcmp(type_str, "sync_now") == 0) {
+        config_sync_trigger();
+        ESP_LOGI(TAG, "Received sync_now from backend — triggered immediate config sync");
     } else if (strcmp(type_str, "error") == 0) {
         const cJSON *detail = cJSON_GetObjectItem(root, "detail");
         ESP_LOGW(TAG, "gateway error: %s",
@@ -225,11 +318,11 @@ static void handle_text_chunk(esp_websocket_event_data_t *data)
     if (data->payload_offset == 0) {
         if (data->payload_len > CLOUD_FRAME_MAX) {
             ESP_LOGW(TAG, "frame too large (%d) — dropped", data->payload_len);
-            s_rx_total = data->payload_len;   /* swallow remaining slices */
+            s_rx_total = (data->data_len < data->payload_len) ? (size_t)data->payload_len : 0;
             return;
         }
         if (!s_rx_buf) {
-            s_rx_buf = heap_caps_malloc(CLOUD_FRAME_MAX + 1, MALLOC_CAP_SPIRAM);
+            s_rx_buf = heap_caps_calloc(1, CLOUD_FRAME_MAX + 1, MALLOC_CAP_SPIRAM);
             if (!s_rx_buf) {
                 return;
             }
@@ -249,8 +342,10 @@ static void handle_text_chunk(esp_websocket_event_data_t *data)
     }
 
     if ((size_t)(data->payload_offset + data->data_len) >= s_rx_total) {
-        s_rx_buf[s_rx_len] = '\0';
-        handle_frame(s_rx_buf);
+        if (s_rx_total <= CLOUD_FRAME_MAX && s_rx_buf) {
+            s_rx_buf[s_rx_len] = '\0';
+            handle_frame(s_rx_buf);
+        }
         s_rx_len = 0;
         s_rx_total = 0;
     }
@@ -390,6 +485,7 @@ esp_err_t cloud_link_start(void)
     snprintf(s_device_id, sizeof(s_device_id), "ESP-%02X%02X%02X%02X%02X%02X",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
+
     s_running = true;
     esp_err_t err = cloud_open();
     if (err != ESP_OK) {
@@ -445,6 +541,7 @@ esp_err_t cloud_link_send_text(const char *chat_id, const char *text)
     free(json);
     return (written >= 0) ? ESP_OK : ESP_FAIL;
 }
+
 
 esp_err_t cloud_link_llm_request(const char *body, size_t body_len,
                                  char *resp_buf, size_t resp_cap,

@@ -51,17 +51,17 @@ export const PRIMARY: ViewMeta[] = [
 export const ASSISTANT: ViewMeta[] = [
   {
     id: "personality",
-    label: "Personality",
+    label: "Personality & Behavior",
     icon: "sparkles",
-    title: "Personality",
+    title: "Personality & Behavior",
     subtitle:
       "Character and behavior rules — synced to the device as SOUL.md.",
   },
   {
     id: "profile",
-    label: "Profile",
+    label: "User Profile",
     icon: "user",
-    title: "Profile",
+    title: "User Profile",
     subtitle:
       "Who ESPET is assisting — synced to the device as USER.md.",
   },
@@ -75,9 +75,9 @@ export const ASSISTANT: ViewMeta[] = [
   },
   {
     id: "schedule",
-    label: "Schedule",
+    label: "Scheduled Jobs",
     icon: "calendar",
-    title: "Schedule",
+    title: "Scheduled Jobs",
     subtitle:
       "Proactive jobs: briefings and reminders the device runs on its own.",
   },

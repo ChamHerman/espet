@@ -24,7 +24,9 @@ from config import settings
 from services.device_registry import DeviceRegistry
 from services.gateway_settings import gateway_settings
 from services.telegram_gateway import TelegramGateway, get_gateway, set_gateway
-
+from services.rag_service import rag_service
+from services.memory_organizer import memory_organizer
+import config_store as store
 logger = logging.getLogger("espet-backend.cloud")
 
 router = APIRouter(prefix="/api/cloud", tags=["cloud"])
@@ -73,6 +75,23 @@ def restart_gateway() -> dict:
     else:
         logger.info("Telegram gateway stopped (disabled or no token)")
     return {"running": gw is not None}
+async def notify_device_sync(device_id: str) -> bool:
+    """
+    Sends sync_now frame to connected device WebSocket.
+    Returns True if sent, False if offline.
+    """
+    with registry._lock:
+        ws = registry.connections.get(device_id)
+    if ws:
+        try:
+            await ws.send_text(json.dumps({"type": "sync_now", "device_id": device_id}))
+            logger.info("Pushed sync_now frame to connected device %s", device_id)
+            return True
+        except Exception as e:
+            logger.warning("Failed to push sync_now to device %s: %s", device_id, e)
+            return False
+    return False
+
 
 
 @router.websocket("/ws/device")
@@ -102,9 +121,13 @@ async def ws_device(websocket: WebSocket, key: str = Query("")):
         await websocket.close(code=4402)
         return
 
+    client_ip = websocket.client.host if websocket.client else ""
+    registry.register_device(device_id, ip=client_ip, fw=str(hello.get("fw", "")))
     registry.register_connection(device_id, websocket)
+    primary_chat = registry.primary_chat_for_device(device_id) or ""
     await websocket.send_text(json.dumps({"type": "hello_ack",
-                                          "device_id": device_id}))
+                                          "device_id": device_id,
+                                          "chat_id": primary_chat}))
     logger.info("Device %s connected (fw=%s) — %d device(s) online",
                 device_id, hello.get("fw", "?"), len(registry.connected_devices()))
 
@@ -160,7 +183,7 @@ async def ws_device(websocket: WebSocket, key: str = Query("")):
                          "ok": False, "status": 0,
                          "body": json.dumps({"error": "empty llm body"})}))
                     continue
-                asyncio.create_task(_llm_relay(websocket, request_id, body_str))
+                asyncio.create_task(_llm_relay(websocket, request_id, body_str, device_id=device_id))
 
             elif ftype == "ping":
                 await websocket.send_text(json.dumps({"type": "pong"}))
@@ -180,6 +203,19 @@ async def ws_device(websocket: WebSocket, key: str = Query("")):
                 fut = _pending_voice_listen.pop(device_id, None)
                 if fut and not fut.done():
                     fut.set_result(frame)
+            elif ftype == "device_sync_report":
+                memory_md = frame.get("memory_md")
+                jobs = frame.get("jobs")
+                store.apply_device_report(device_id, memory_md, jobs)
+                logger.info("Received device_sync_report from %s (memory_md %d bytes, %d jobs)",
+                            device_id, len(memory_md or ""), len(jobs or []))
+
+            elif ftype == "device_memory_update":
+                store.update_markdown("memory", frame.get("content", ""), device_id)
+
+            elif ftype == "device_jobs_update":
+                store.apply_device_report(device_id, memory_md=None, jobs=frame.get("jobs", []))
+
 
             else:
                 await websocket.send_text(json.dumps(
@@ -193,6 +229,7 @@ async def ws_device(websocket: WebSocket, key: str = Query("")):
             if fut and not fut.done():
                 fut.set_exception(RuntimeError("Device disconnected"))
         registry.remove_connection(device_id, websocket)
+        registry.mark_offline(device_id)
         logger.info("Device %s removed — %d device(s) online",
                     device_id, len(registry.connected_devices()))
 
@@ -221,7 +258,7 @@ async def _photo_logged(gateway, chat_id: str, image: bytes, caption: str) -> No
 # provider, returning the raw provider response to the device.
 # ---------------------------------------------------------------------------
 
-async def _llm_relay(websocket, request_id, body_str: str) -> None:
+async def _llm_relay(websocket, request_id, body_str: str, device_id: str = "espet_s3_01") -> None:
     cfg = gateway_settings.llm_config()
 
     async def _reply(ok: bool, status: int, body_text: str) -> None:
@@ -250,21 +287,111 @@ async def _llm_relay(websocket, request_id, body_str: str) -> None:
         if cfg["model"]:
             body["model"] = cfg["model"]   # server-side model override
 
+        # --- RAG Injection ---
+        messages = body.get("messages")
+        if isinstance(messages, list) and messages:
+            user_query = ""
+            for msg in reversed(messages):
+                if isinstance(msg, dict) and msg.get("role") == "user":
+                    c = msg.get("content")
+                    if isinstance(c, str):
+                        user_query = c.strip()
+                    elif isinstance(c, list):
+                        parts = [p.get("text", "") for p in c if isinstance(p, dict) and p.get("type") == "text"]
+                        user_query = " ".join(parts).strip()
+                    if user_query:
+                        break
+
+            if user_query:
+                try:
+                    rag_res = await asyncio.to_thread(
+                        rag_service.search,
+                        query=user_query,
+                        device_id=device_id,
+                        top_k=settings.rag_top_k,
+                        threshold=settings.rag_threshold,
+                    )
+                    if rag_res.get("results"):
+                        lines = ["## Retrieved Long-Term Memory (via SQLite-Vec RAG):"]
+                        for item in rag_res["results"]:
+                            lines.append(f"- [{item['source_type']}]: {item['content']}")
+                        injected_block = "\n".join(lines)
+
+                        if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
+                            orig_content = messages[0].get("content") or ""
+                            messages[0]["content"] = f"{orig_content}\n\n{injected_block}".strip()
+                        else:
+                            messages.insert(0, {"role": "system", "content": injected_block})
+
+                        logger.info(
+                            "rag: Injected %d memory chunk(s) for device %s (%.2f ms)",
+                            len(rag_res["results"]),
+                            device_id,
+                            rag_res.get("latency_ms", 0.0),
+                        )
+                except Exception as ex:
+                    logger.warning("rag: search/injection failed: %r", ex)
+    used_model = body.get("model") if isinstance(body, dict) else None
+
     url = cfg["base_url"].rstrip("/") + "/chat/completions"
     try:
         async with httpx.AsyncClient(timeout=90) as client:
             resp = await client.post(
                 url, json=body,
                 headers={"Authorization": f"Bearer {cfg['api_key']}", "Accept": "application/json"})
-        logger.info("LLM relay: %s -> HTTP %d (%d bytes)",
-                    url, resp.status_code, len(resp.text))
+        logger.info("LLM relay: %s model=%s -> HTTP %d (%d bytes)",
+                    url, used_model, resp.status_code, len(resp.text))
         if resp.status_code != 200 or len(resp.text) < 400:
             logger.info("LLM relay payload preview: %.300s", resp.text)
         await _reply(resp.status_code == 200, resp.status_code, resp.text)
+        if resp.status_code == 200:
+            asyncio.create_task(_capture_episodic_action(device_id, resp.text))
+            if user_query:
+                async def _safe_extract():
+                    try:
+                        await memory_organizer.extract_from_turn(device_id, user_query, resp.text)
+                    except Exception as ex:
+                        logger.warning("MemoryOrganizer extraction task failed for %s: %r", device_id, ex)
+                asyncio.create_task(_safe_extract())
     except Exception as e:
         logger.warning("LLM relay to %s failed: %r", url, e)
         await _reply(False, 0, json.dumps({"error": f"{type(e).__name__}: {e}"}))
 
+
+NOISE_TOOLS = {
+    "get_current_time",
+    "cron_list",
+    "gpio_read",
+    "gpio_read_all",
+    "read_file",
+    "list_dir",
+    "memory_search",
+    "memory_save",
+}
+
+async def _capture_episodic_action(device_id: str, resp_text: str) -> None:
+    try:
+        data = json.loads(resp_text)
+        choices = data.get("choices", [])
+        if not choices:
+            return
+        msg = choices[0].get("message", {})
+        tool_calls = msg.get("tool_calls", [])
+        for tc in tool_calls:
+            fn = tc.get("function", {})
+            name = fn.get("name", "")
+            args = fn.get("arguments", "")
+            if name and name not in NOISE_TOOLS:
+                summary = f"Action: executed tool {name} with args {args[:120]}"
+                await asyncio.to_thread(
+                    rag_service.add_memory,
+                    device_id=device_id,
+                    content=summary,
+                    source_type="action",
+                    source_ref="relay_tool",
+                )
+    except Exception as e:
+        logger.debug("Episodic action capture skipped: %r", e)
 
 # ---------------------------------------------------------------------------
 # REST — bindings & connected devices (device-key guarded)
@@ -286,6 +413,16 @@ async def bind_chat(payload: dict | None = None,
     if not cid or not did:
         return {"ok": False, "error": "chat_id and device_id are required"}
     registry.bind(str(cid), str(did))
+    _, ws = registry.get_connection(str(did))
+    if ws is not None:
+        try:
+            await ws.send_text(json.dumps({
+                "type": "bind_sync",
+                "chat_id": str(cid),
+                "device_id": str(did),
+            }))
+        except Exception as e:
+            logger.warning("Could not push bind_sync to %s: %s", did, e)
     return {"ok": True, "chat_id": str(cid), "device_id": str(did)}
 
 

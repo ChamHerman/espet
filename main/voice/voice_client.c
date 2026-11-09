@@ -23,6 +23,7 @@
 #include "sync/backend_discovery.h"
 #include "tools/tool_audio.h"
 #include "bus/message_bus.h"
+#include "channels/telegram/telegram_bot.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
@@ -842,6 +843,7 @@ static void voice_task(void *arg)
                      stt_res.wake_word ? stt_res.wake_word : "",
                      stt_res.raw_text ? stt_res.raw_text : "");
 
+            telegram_send_to_last_chat("I heard you dy! Mic confirmed working.");
             display_status_set("Listening...", "");
 
             if (stt_res.text && strlen(stt_res.text) > 0) {

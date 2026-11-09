@@ -15,20 +15,29 @@ from __future__ import annotations
 import json
 import logging
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 
 logger = logging.getLogger("espet-backend.registry")
 
 
 class DeviceRegistry:
-    def __init__(self, persist_path: str | Path = "data/cloud_bindings.json"):
+    def __init__(
+        self,
+        persist_path: str | Path = "data/cloud_bindings.json",
+        devices_path: str | Path = "data/devices.json",
+    ):
         self.persist_path = Path(persist_path)
+        self.devices_path = Path(devices_path)
         self._lock = threading.Lock()
         # device_id -> live websocket (or None when offline)
         self.connections: dict[str, object] = {}
         # chat_id (str) -> device_id
         self.chat_to_device: dict[str, str] = {}
+        # device_id -> device info dict
+        self.devices: dict[str, dict] = {}
         self._load()
+        self._load_devices()
 
     # ------------------------------------------------------------- persistence
 
@@ -54,6 +63,83 @@ class DeviceRegistry:
         except Exception as e:
             logger.warning("Could not persist bindings to %s: %s",
                            self.persist_path, e)
+    def _load_devices(self) -> None:
+        if not self.devices_path.exists():
+            return
+        try:
+            data = json.loads(self.devices_path.read_text(encoding="utf-8"))
+            with self._lock:
+                for item in data.get("devices", []):
+                    did = str(item.get("device_id") or "").strip()
+                    if did:
+                        self.devices[did] = item
+        except Exception as e:
+            logger.warning("Could not load devices from %s: %s", self.devices_path, e)
+
+    def _save_devices_locked(self) -> None:
+        try:
+            self.devices_path.parent.mkdir(parents=True, exist_ok=True)
+            self.devices_path.write_text(
+                json.dumps({"devices": list(self.devices.values())}, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            logger.warning("Could not persist devices to %s: %s", self.devices_path, e)
+
+    def register_device(self, device_id: str, ip: str = "", fw: str = "") -> dict:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            dev = self.devices.get(device_id, {
+                "device_id": device_id,
+                "name": device_id,
+                "online": True,
+                "last_seen": now_iso,
+                "ip": ip,
+                "fw": fw,
+            })
+            dev["online"] = True
+            dev["last_seen"] = now_iso
+            if ip:
+                dev["ip"] = ip
+            if fw:
+                dev["fw"] = fw
+            self.devices[device_id] = dev
+            self._save_devices_locked()
+            return dict(dev)
+
+    def mark_offline(self, device_id: str) -> None:
+        with self._lock:
+            if device_id in self.devices:
+                self.devices[device_id]["online"] = False
+                self._save_devices_locked()
+
+    def list_devices(self) -> list[dict]:
+        with self._lock:
+            if not self.devices:
+                seed = {
+                    "device_id": "espet_s3_01",
+                    "name": "ESPET",
+                    "online": False,
+                    "last_seen": "2026-11-09T00:00:00Z",
+                    "ip": "127.0.0.1",
+                    "fw": "v5.5.4",
+                }
+                self.devices["espet_s3_01"] = seed
+                self._save_devices_locked()
+
+            res = []
+            for did, d in self.devices.items():
+                item = dict(d)
+                if did in self.connections:
+                    item["online"] = True
+                res.append(item)
+            res.sort(key=lambda x: str(x.get("last_seen", "")), reverse=True)
+            return res
+
+    def get_latest_device_id(self) -> str:
+        devs = self.list_devices()
+        return devs[0]["device_id"] if devs else "espet_s3_01"
+
 
     # ------------------------------------------------------------- connections
 
@@ -116,6 +202,15 @@ class DeviceRegistry:
     def bindings(self) -> dict[str, str]:
         with self._lock:
             return dict(self.chat_to_device)
+
+    def chats_for_device(self, device_id: str) -> list[str]:
+        did_str = str(device_id)
+        with self._lock:
+            return [cid for cid, did in self.chat_to_device.items() if did == did_str]
+
+    def primary_chat_for_device(self, device_id: str) -> str | None:
+        chats = self.chats_for_device(device_id)
+        return chats[0] if chats else None
 
     def auto_bind_single_device(self, chat_id: str | int) -> str | None:
         """Dev convenience: if exactly one device is connected and the chat is

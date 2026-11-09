@@ -29,6 +29,7 @@ export interface Job {
   created_at?: string;
   interval_s?: number;
   at_epoch?: number;
+  at_local?: string;
 }
 
 export interface Skill {
@@ -82,4 +83,34 @@ export interface McpTool {
   description?: string;
   input_schema?: Record<string, unknown>;
   server?: string;
+}
+
+export interface MemoryItem {
+  id: number;
+  user_id: string;
+  device_id: string;
+  source_type: string;
+  source_ref?: string;
+  content: string;
+  metadata_json?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface MemoryQueryResult {
+  id: number;
+  content: string;
+  source_type: string;
+  source_ref?: string;
+  created_at: string;
+  distance: number;
+  similarity: number;
+}
+
+export interface MemoryQueryResponse {
+  query: string;
+  device_id: string;
+  latency_ms: number;
+  count: number;
+  results: MemoryQueryResult[];
 }

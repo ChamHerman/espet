@@ -6,6 +6,8 @@
 # Database
 db/*.db
 db/*.db-journal
+db/*.db-wal
+db/*.db-shm
 
 # Device config store (user data, seeded on first run)
 data/

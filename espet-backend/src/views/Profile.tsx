@@ -3,7 +3,7 @@
    agent expect) and a raw **Markdown** tab (SourceField: exact-byte edit +
    preview). Switching tabs converts in both directions. */
 
-import { Button, Input, Select, Space, Tabs, Typography } from "antd";
+import { Button, Input, Select, Space, Tabs, Tooltip, Typography } from "antd";
 import { useMemo, useState } from "react";
 import { client } from "../api";
 import { Icon } from "../components/Icon";
@@ -67,7 +67,7 @@ export function buildUserMd(f: UserFields): string {
 const norm = (s: string) => s.trim().replace(/\s+/g, " ");
 
 export function ProfileView() {
-  const { config, patchConfig, setDirty, toast } = useApp();
+  const { config, patchConfig, setDirty, toast, selectedDeviceId } = useApp();
   const { styles } = useLayout();
   const server = useMemo(
     () => (config ? parseUserMd(config.user_md) : null),
@@ -78,6 +78,24 @@ export function ProfileView() {
   const [raw, setRaw] = useState(() => (config ? config.user_md : ""));
   if (!config || !server || !draft) return null;
 
+  const detectedTz = useMemo(() => {
+    try {
+      const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      return TIMEZONES.includes(tz) ? tz : "Asia/Kuala_Lumpur";
+    } catch {
+      return "Asia/Kuala_Lumpur";
+    }
+  }, []);
+
+  const resetToDefault = () => {
+    const def: UserFields = {
+      name: "ESPET",
+      language: "Chinese / English",
+      timezone: detectedTz,
+      notes: [],
+    };
+    track(def);
+  };
   const serverMd = buildUserMd(server);
   const currentMd = tab === "fields" ? buildUserMd(draft) : raw;
   const dirty = norm(currentMd) !== norm(serverMd);
@@ -103,7 +121,7 @@ export function ProfileView() {
   const save = async () => {
     const md = tab === "fields" ? buildUserMd(draft) : raw;
     try {
-      const res = await client.saveProfile(md);
+      const res = await client.saveProfile(md, selectedDeviceId);
       patchConfig((c) => {
         c.user_md = md;
         c.versions.user = res.versions.user;
@@ -111,7 +129,7 @@ export function ProfileView() {
       setDraft(parseUserMd(md));
       setRaw(md);
       setDirty("profile", false);
-      toast("Profile saved — device will pull it");
+      toast("Profile saved and pushed to physical device");
     } catch (e) {
       toast((e as Error).message, "error");
     }
@@ -203,8 +221,15 @@ export function ProfileView() {
     <div className={styles.stack}>
       <Card>
         <div className={styles.cardHead}>
-          <div className={styles.cardTitle}>
-            <Icon name="user" /> User profile
+          <div style={{ display: "flex", alignItems: "center" }}>
+            <div className={styles.cardTitle}>
+              <Icon name="user" /> User Profile
+            </div>
+            <Tooltip title="What the agent knows about you — preferred name, language, timezone, and background context. Saved content is synchronized directly to USER.md on the device.">
+              <span style={{ display: "inline-flex", alignItems: "center", cursor: "pointer", marginLeft: 8 }}>
+                <Icon name="info" size={15} style={{ color: "#a3a3a3" }} />
+              </span>
+            </Tooltip>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
             <SectionDirtyChip section="profile" />
@@ -224,6 +249,9 @@ export function ProfileView() {
         />
         <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 16 }}>
           <Space>
+            <Button onClick={resetToDefault}>
+              Reset to default
+            </Button>
             <Button onClick={revert} disabled={!dirty}>
               Revert
             </Button>
@@ -238,10 +266,6 @@ export function ProfileView() {
           </Space>
         </div>
       </Card>
-      <div className={styles.sectionNote}>
-        <Icon name="info" size={16} />
-        <span>Saved content is pulled by the device at its next sync.</span>
-      </div>
     </div>
   );
 }

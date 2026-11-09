@@ -34,6 +34,7 @@ from websockets.exceptions import ConnectionClosed
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from api.cloud_router import router as cloud_router, registry
+from api.config_router import router as config_router
 from services.device_registry import DeviceRegistry
 from services.gateway_settings import gateway_settings
 from services.telegram_gateway import get_gateway
@@ -152,6 +153,7 @@ MOCK_BASE = f"http://127.0.0.1:{mock_port}"
 
 gw_app = FastAPI()
 gw_app.include_router(cloud_router)
+gw_app.include_router(config_router)
 
 
 @gw_app.on_event("startup")
@@ -476,6 +478,75 @@ async def _tc11_test_llm_diagnostics():
     assert res_bad.get("ok") is False
     assert "Invalid response: Gateway Error: Not JSON" in res_bad.get("error", "")
 
+
+async def _tc12_hello_ack_includes_bound_chat():
+    _reset_state()
+    registry.bind("-5358", "ESP-TC12")
+    async with connect(f"{GW_BASE}?key={DEVICE_KEY}") as ws:
+        await ws.send(json.dumps({"type": "hello", "device_id": "ESP-TC12"}))
+        reply = json.loads(await asyncio.wait_for(ws.recv(), 5))
+        assert reply["type"] == "hello_ack"
+        assert reply["device_id"] == "ESP-TC12"
+        assert reply.get("chat_id") == "-5358"
+
+        # Test live push when /bind endpoint is called
+        resp = http.post("/api/cloud/bind", json={"chat_id": "-9999", "device_id": "ESP-TC12"})
+        assert resp.json().get("ok") is True
+        sync_frame = json.loads(await asyncio.wait_for(ws.recv(), 5))
+        assert sync_frame["type"] == "bind_sync"
+        assert sync_frame["chat_id"] == "-9999"
+        assert sync_frame["device_id"] == "ESP-TC12"
+async def _tc13_device_registry_and_sync():
+    _reset_state()
+    # 1. Device list before connection
+    devs_resp = http.get("/api/devices")
+    assert devs_resp.status_code == 200
+    data = devs_resp.json()
+    assert "devices" in data
+    assert "latest_device_id" in data
+
+    # 2. Connect device
+    async with connect(f"{GW_BASE}?key={DEVICE_KEY}") as ws:
+        await ws.send(json.dumps({"type": "hello", "device_id": "ESP-SYNC01", "fw": "v5.5.4"}))
+        await ws.recv()  # hello_ack
+
+        # Verify device list reflects online status
+        devs = http.get("/api/devices").json()["devices"]
+        target = next((d for d in devs if d["device_id"] == "ESP-SYNC01"), None)
+        assert target is not None
+        assert target["online"] is True
+
+        # 3. Device reports on-device state
+        report_memory = "# Device Memory\n- Reported from physical device\n"
+        report_jobs = [{"id": "devj01", "name": "Physical Job", "kind": "every", "interval_s": 300, "message": "ping"}]
+        await ws.send(json.dumps({
+            "type": "device_sync_report",
+            "device_id": "ESP-SYNC01",
+            "memory_md": report_memory,
+            "jobs": report_jobs,
+        }))
+        await asyncio.sleep(0.1)
+
+        # Verify config for ESP-SYNC01 reflects reported memory and jobs
+        cfg = http.get("/api/config?device_id=ESP-SYNC01").json()
+        assert cfg["memory_md"] == report_memory
+        assert any(j["id"] == "devj01" for j in cfg["jobs"])
+
+        # 4. Trigger sync-now from backend
+        sync_resp = http.post("/api/config/sync-now", json={"device_id": "ESP-SYNC01"}).json()
+        assert sync_resp["ok"] is True
+        assert sync_resp["pushed"] is True
+        frame = json.loads(await asyncio.wait_for(ws.recv(), 5))
+        assert frame["type"] == "sync_now"
+        assert frame["device_id"] == "ESP-SYNC01"
+
+    # 5. Offline after disconnect
+    await asyncio.sleep(0.3)
+    devs_after = http.get("/api/devices").json()["devices"]
+    target_after = next((d for d in devs_after if d["device_id"] == "ESP-SYNC01"), None)
+    assert target_after is not None
+    assert target_after["online"] is False
+
 # ---------------------------------------------------------------------------
 # pytest-compatible wrappers + standalone runner
 # ---------------------------------------------------------------------------
@@ -492,6 +563,8 @@ CASES = [
     ("TC-09 gateway_config", _tc09_gateway_config),
     ("TC-10 llm_relay", _tc10_llm_relay),
     ("TC-11 test_llm_diagnostics", _tc11_test_llm_diagnostics),
+    ("TC-12 bound_chat_sync", _tc12_hello_ack_includes_bound_chat),
+    ("TC-13 device_registry_and_sync", _tc13_device_registry_and_sync),
 ]
 
 
@@ -537,6 +610,12 @@ def test_tc10_llm_relay():
 
 def test_tc11_test_llm_diagnostics():
     asyncio.run(_tc11_test_llm_diagnostics())
+
+def test_tc12_hello_ack_includes_bound_chat():
+    asyncio.run(_tc12_hello_ack_includes_bound_chat())
+def test_tc13_device_registry_and_sync():
+    asyncio.run(_tc13_device_registry_and_sync())
+
 
 if __name__ == "__main__":
     failures = 0

@@ -13,7 +13,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { client } from "./api";
+import { client, type DeviceInfo } from "./api";
 import type { AuthStatus, ConfigBundle, Health } from "./types";
 
 export type Section = "profile" | "soul" | "memory" | "device";
@@ -29,8 +29,11 @@ interface Store {
   dirty: Partial<Record<Section, boolean>>;
   maxVersion: number | null;
   serverOnline: boolean;
-  loadConfig: (force?: boolean) => Promise<ConfigBundle>;
-  refreshHealth: () => Promise<void>;
+  selectedDeviceId: string;
+  devices: DeviceInfo[];
+  setSelectedDeviceId: (id: string) => void;
+  refreshDevices: () => Promise<void>;
+  loadConfig: (device_id?: string) => Promise<ConfigBundle>;
   refreshAuth: () => Promise<void>;
   patchConfig: (fn: (c: ConfigBundle) => void) => void;
   setDirty: (s: Section, v: boolean) => void;
@@ -59,10 +62,37 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [health, setHealth] = useState<Health | null>(null);
   const [auth, setAuth] = useState<AuthStatus | null>(null);
   const [dirty, setDirtyMap] = useState<Partial<Record<Section, boolean>>>({});
-  const loadingRef = useRef(false);
+  const [selectedDeviceId, setSelectedDeviceIdState] = useState<string>(
+    () => localStorage.getItem("espet.selected_device_id") || ""
+  );
+  const [devices, setDevices] = useState<DeviceInfo[]>([]);
+  const selectedDevRef = useRef(selectedDeviceId);
+  selectedDevRef.current = selectedDeviceId;
 
-  const loadConfig = useCallback(async () => {
-    const c = await client.config();
+  const setSelectedDeviceId = useCallback((id: string) => {
+    setSelectedDeviceIdState(id);
+    localStorage.setItem("espet.selected_device_id", id);
+  }, []);
+
+  const refreshDevices = useCallback(async () => {
+    try {
+      const res = await client.devices();
+      setDevices(res.devices || []);
+      const saved = localStorage.getItem("espet.selected_device_id");
+      const matched = res.devices.find((d) => d.device_id === saved);
+      const chosen = matched ? matched.device_id : (res.latest_device_id || "espet_s3_01");
+      if (chosen !== selectedDevRef.current) {
+        setSelectedDeviceIdState(chosen);
+        localStorage.setItem("espet.selected_device_id", chosen);
+      }
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const loadConfig = useCallback(async (device_id?: string) => {
+    const target = device_id || selectedDevRef.current || undefined;
+    const c = await client.config(target);
     setConfig(c);
     return c;
   }, []);
@@ -84,13 +114,26 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, []);
 
   useEffect(() => {
-    loadConfig().catch(() => setConfig(null));
+    (async () => {
+      let initialDev = localStorage.getItem("espet.selected_device_id") || "";
+      try {
+        const res = await client.devices();
+        setDevices(res.devices || []);
+        if (!initialDev || !res.devices.some((d) => d.device_id === initialDev)) {
+          initialDev = res.latest_device_id || (res.devices[0]?.device_id ?? "espet_s3_01");
+          localStorage.setItem("espet.selected_device_id", initialDev);
+        }
+        setSelectedDeviceIdState(initialDev);
+      } catch {
+        if (!initialDev) initialDev = "espet_s3_01";
+      }
+      loadConfig(initialDev).catch(() => setConfig(null));
+    })();
     refreshHealth();
     refreshAuth();
     const t = setInterval(refreshHealth, 30000);
     return () => clearInterval(t);
   }, [loadConfig, refreshHealth, refreshAuth]);
-
   const patchConfig = useCallback((fn: (c: ConfigBundle) => void) => {
     setConfig((prev) => {
       if (!prev) return prev;
@@ -157,6 +200,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     dirty,
     maxVersion,
     serverOnline: !!health,
+    selectedDeviceId,
+    devices,
+    setSelectedDeviceId,
+    refreshDevices,
     loadConfig,
     refreshHealth,
     refreshAuth,

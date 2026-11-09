@@ -1,7 +1,8 @@
 /* UI chrome icons — inline lucide-style SVG paths (ported from legacy app.js).
    Brand marks (Google, etc.) come from @lobehub/icons where used. */
 
-import type { ReactNode } from "react";
+import React, { forwardRef } from "react";
+import type { ReactNode, SVGProps } from "react";
 
 const P: Record<string, ReactNode> = {
   dashboard: (
@@ -147,26 +148,33 @@ const P: Record<string, ReactNode> = {
       <path d="M12 20h.01" />
     </>
   ),
+  search: (
+    <>
+      <circle cx="11" cy="11" r="8" />
+      <path d="m21 21-4.3-4.3" />
+    </>
+  ),
 };
 
 export type IconName = keyof typeof P;
 
-export function Icon({
-  name,
-  size = 18,
-  className,
-  strokeWidth = 2,
-}: {
+export interface IconProps extends SVGProps<SVGSVGElement> {
   name: IconName;
   size?: number;
-  className?: string;
   strokeWidth?: number;
-}) {
+}
+
+export const Icon = forwardRef<SVGSVGElement, IconProps>(function Icon(
+  { name, size = 18, className, strokeWidth = 2, style, ...rest },
+  ref
+) {
   return (
     <svg
+      ref={ref}
       className={className}
       width={size}
       height={size}
+      style={style}
       viewBox="0 0 24 24"
       fill="none"
       stroke="currentColor"
@@ -174,8 +182,9 @@ export function Icon({
       strokeLinecap="round"
       strokeLinejoin="round"
       aria-hidden="true"
+      {...rest}
     >
       {P[name]}
     </svg>
   );
-}
+});

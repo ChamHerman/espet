@@ -24,6 +24,7 @@ from api.config_router import router as config_router
 from api.voice_router import router as voice_router
 from api.ui_router import router as ui_router
 from api.cloud_router import router as cloud_router
+from api.memory_router import router as memory_router
 from mcp.client import mcp_client_manager
 from config import settings
 
@@ -163,6 +164,7 @@ app.include_router(auth_router)
 app.include_router(config_router)
 app.include_router(voice_router)
 app.include_router(cloud_router)
+app.include_router(memory_router)
 
 # Alias /ws/device -> /api/cloud/ws/device for firmware compatibility
 from fastapi import Query, WebSocket

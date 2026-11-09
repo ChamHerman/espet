@@ -58,9 +58,8 @@ _DEFAULT_USER_MD = """# User Profile
 
 - Name: (not set)
 - Language: Chinese / English
-- Timezone: (not set)
+- Timezone: Asia/Kuala_Lumpur
 """
-
 _DEFAULT_SOUL_MD = """I am ESPET, a personal AI assistant running on an ESP32-S3 microcontroller.
 
 Personality:
@@ -78,11 +77,10 @@ Behavior Rules:
 - **Stop Yapping**: Be extremely concise. Avoid phrases like "I can do that for you!" or "Here are your options." Just do the task.
 """
 
-_DEFAULT_MEMORY_MD = """# Long-term Memory
+_DEFAULT_MEMORY_MD = """# Working Memory
 
-(empty - ESPET will write memories here as it learns)
+(empty - ESPET writes active task context and working notes here)
 """
-
 # Default skill files — mirrors spiffs_data/skills/ so the dashboard starts
 # populated with the same skills the device was flashed with.
 _DEFAULT_SKILLS = [
@@ -257,11 +255,19 @@ def _default_config() -> dict:
     }
 
 
-def _load_unlocked() -> dict:
-    """Read config.json, seeding defaults on first run. Caller holds lock."""
-    if _CONFIG_FILE.exists():
+def _device_config_path(device_id: str | None) -> Path:
+    if not device_id or not str(device_id).strip():
+        return _CONFIG_FILE
+    clean_id = re.sub(r'[^a-zA-Z0-9_-]', '_', str(device_id).strip())
+    return _DATA_DIR / f"config_{clean_id}.json"
+
+
+def _load_unlocked(device_id: str | None = None) -> dict:
+    """Read config JSON, seeding defaults on first run or copying from config.json. Caller holds lock."""
+    target = _device_config_path(device_id)
+    if target.exists():
         try:
-            with open(_CONFIG_FILE, "r", encoding="utf-8") as f:
+            with open(target, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
             # Forward-fill any keys added after this file was created
             base = _default_config()
@@ -274,34 +280,52 @@ def _load_unlocked() -> dict:
             # Corrupt file: back it up and start fresh rather than crash
             import logging
             logging.getLogger(logger_name).error(
-                "config.json unreadable (%s); reseeding defaults", e
+                "%s unreadable (%s); reseeding defaults", target.name, e
             )
             try:
-                _CONFIG_FILE.rename(_CONFIG_FILE.with_suffix(".json.corrupt"))
+                target.rename(target.with_suffix(".json.corrupt"))
             except OSError:
                 pass
-    return _default_config()
+
+    # If per-device file doesn't exist, copy initial state from _CONFIG_FILE or _default_config()
+    if target != _CONFIG_FILE and _CONFIG_FILE.exists():
+        try:
+            with open(_CONFIG_FILE, "r", encoding="utf-8") as f:
+                seed = json.load(f)
+            base = _default_config()
+            for key, value in base.items():
+                seed.setdefault(key, value)
+            seed["versions"] = {**base["versions"], **seed.get("versions", {})}
+            seed["device"] = {**base["device"], **seed.get("device", {})}
+            _save_unlocked(seed, device_id)
+            return seed
+        except Exception:
+            pass
+
+    cfg = _default_config()
+    _save_unlocked(cfg, device_id)
+    return cfg
 
 
-def _save_unlocked(cfg: dict) -> None:
-    """Atomically write config.json. Caller holds lock."""
+def _save_unlocked(cfg: dict, device_id: str | None = None) -> None:
+    """Atomically write device config JSON. Caller holds lock."""
     _DATA_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = _CONFIG_FILE.with_suffix(".json.tmp")
+    target = _device_config_path(device_id)
+    tmp = target.with_suffix(".json.tmp")
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
-    tmp.replace(_CONFIG_FILE)
+    tmp.replace(target)
 
 
-def get_config() -> dict:
+def get_config(device_id: str | None = None) -> dict:
     with _lock:
-        return _load_unlocked()
-
+        return _load_unlocked(device_id)
 
 def _bump(cfg: dict, section: str) -> None:
     cfg["versions"][section] = cfg["versions"].get(section, 0) + 1
 
 
-def update_markdown(section: str, content: str) -> dict:
+def update_markdown(section: str, content: str, device_id: str | None = None) -> dict:
     """
     Update user_md / soul_md / memory_md. Returns the full config.
     """
@@ -309,12 +333,103 @@ def update_markdown(section: str, content: str) -> dict:
         raise ValueError(f"unknown markdown section: {section}")
 
     with _lock:
-        cfg = _load_unlocked()
+        cfg = _load_unlocked(device_id)
         cfg[f"{section}_md"] = content
         _bump(cfg, section)
-        _save_unlocked(cfg)
+        _save_unlocked(cfg, device_id)
         return cfg
 
+
+def parse_user_md(md: str) -> dict:
+    fields = {"name": "", "language": "", "timezone": "", "notes": []}
+    for line in md.split("\n"):
+        m = re.match(r"^-\s*(Name|Language|Timezone):\s*(.*)$", line, re.IGNORECASE)
+        if m:
+            fields[m.group(1).lower()] = m.group(2).strip()
+        elif (
+            line.strip() == "# User Profile"
+            or (line.strip() == "" and not fields["name"] and not fields["language"] and not fields["timezone"])
+        ):
+            continue
+        else:
+            fields["notes"].append(line)
+    while fields["notes"] and fields["notes"][0].strip() == "":
+        fields["notes"].pop(0)
+    while fields["notes"] and fields["notes"][-1].strip() == "":
+        fields["notes"].pop()
+    return fields
+
+
+def build_user_md(fields: dict) -> str:
+    name = fields.get("name") or "(not set)"
+    lang = fields.get("language") or ""
+    tz = fields.get("timezone") or ""
+    parts = [
+        "# User Profile",
+        "",
+        f"- Name: {name}",
+        f"- Language: {lang}",
+        f"- Timezone: {tz}",
+    ]
+    notes = "\n".join(fields.get("notes", [])).strip()
+    if notes:
+        parts.extend(["", notes])
+    return "\n".join(parts) + "\n"
+
+
+def patch_user_profile(
+    device_id: str | None = None,
+    name: str | None = None,
+    language: str | None = None,
+    timezone: str | None = None,
+    note: str | None = None,
+) -> bool:
+    """
+    Patches USER.md if incoming fields actually differ from current values.
+    Returns True if an update was committed, False if no change.
+    """
+    with _lock:
+        cfg = _load_unlocked(device_id)
+        current_md = cfg.get("user_md", "")
+        fields = parse_user_md(current_md)
+        changed = False
+
+        if name is not None:
+            clean_name = name.strip()
+            if clean_name and clean_name != "(not set)" and fields.get("name") != clean_name:
+                fields["name"] = clean_name
+                changed = True
+
+        if language is not None:
+            clean_lang = language.strip()
+            if clean_lang and fields.get("language") != clean_lang:
+                fields["language"] = clean_lang
+                changed = True
+
+        if timezone is not None:
+            clean_tz = timezone.strip()
+            if clean_tz and fields.get("timezone") != clean_tz:
+                fields["timezone"] = clean_tz
+                changed = True
+
+        if note is not None:
+            clean_note = note.strip()
+            if clean_note:
+                # Check if note already recorded
+                existing_text = "\n".join(fields.get("notes", []))
+                if clean_note.lower() not in existing_text.lower():
+                    formatted_bullet = f"- {clean_note}"
+                    fields["notes"].append(formatted_bullet)
+                    changed = True
+
+        if not changed:
+            return False
+
+        new_md = build_user_md(fields)
+        cfg["user_md"] = new_md
+        _bump(cfg, "user")
+        _save_unlocked(cfg, device_id)
+        return True
 
 # ── Avatar (dashboard-only) ───────────────────────────────────────
 
@@ -355,9 +470,11 @@ def update_avatar(mode: str, opts: dict) -> dict:
         return cfg, None
 
 
-def update_device_settings(name: str, timezone_iana: str, sync_interval_s: int) -> dict:
+def update_device_settings(
+    name: str, timezone_iana: str, sync_interval_s: int, device_id: str | None = None
+) -> dict:
     with _lock:
-        cfg = _load_unlocked()
+        cfg = _load_unlocked(device_id)
         dev = cfg["device"]
         if name:
             dev["name"] = name.strip()[:31]
@@ -366,7 +483,7 @@ def update_device_settings(name: str, timezone_iana: str, sync_interval_s: int) 
         if sync_interval_s:
             dev["sync_interval_s"] = max(60, min(int(sync_interval_s), 86400))
         _bump(cfg, "device")
-        _save_unlocked(cfg)
+        _save_unlocked(cfg, device_id)
         return cfg
 
 
@@ -374,7 +491,7 @@ def _job_out_of_range(value: int, low: int, high: int) -> bool:
     return value < low or value > high
 
 
-def add_job(payload: dict) -> dict:
+def add_job(payload: dict, device_id: str | None = None) -> tuple[dict, str | None]:
     """
     Create a web-managed cron job. payload fields (device schema):
       name, kind ("every"|"at"), interval_s | at_local (ISO local datetime),
@@ -384,7 +501,7 @@ def add_job(payload: dict) -> dict:
     """
     error = _validate_job_payload(payload)
     if error:
-        return get_config(), error
+        return get_config(device_id), error
 
     job = {
         "id": secrets.token_hex(4),  # 8 hex chars, same shape the device uses
@@ -398,29 +515,28 @@ def add_job(payload: dict) -> dict:
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    if job["kind"] == "every":
-        job["interval_s"] = int(payload["interval_s"])
-    else:
-        job["at_epoch"] = local_to_epoch(payload["at_local"], get_config()["device"]["timezone"])
-
     with _lock:
-        cfg = _load_unlocked()
+        cfg = _load_unlocked(device_id)
+        if job["kind"] == "every":
+            job["interval_s"] = int(payload["interval_s"])
+        else:
+            job["at_epoch"] = local_to_epoch(payload["at_local"], cfg["device"]["timezone"])
+
         if len(cfg["jobs"]) >= JOB_MAX_COUNT:
             return cfg, f"Job limit reached ({JOB_MAX_COUNT}). Delete a job first."
         cfg["jobs"].append(job)
         _bump(cfg, "jobs")
-        _save_unlocked(cfg)
+        _save_unlocked(cfg, device_id)
         return cfg, None
 
-
-def update_job(job_id: str, payload: dict) -> dict:
+def update_job(job_id: str, payload: dict, device_id: str | None = None) -> tuple[dict, str | None]:
     """Edit an existing web job. Returns (config, error)."""
     error = _validate_job_payload(payload, require_all=False)
     if error:
-        return get_config(), error
+        return get_config(device_id), error
 
     with _lock:
-        cfg = _load_unlocked()
+        cfg = _load_unlocked(device_id)
         job = next((j for j in cfg["jobs"] if j["id"] == job_id), None)
         if not job:
             return cfg, f"Job {job_id} not found"
@@ -449,16 +565,90 @@ def update_job(job_id: str, payload: dict) -> dict:
             job.pop("interval_s", None)
 
         _bump(cfg, "jobs")
-        _save_unlocked(cfg)
+        _save_unlocked(cfg, device_id)
         return cfg, None
 
 
-def delete_job(job_id: str) -> dict:
+def delete_job(job_id: str, device_id: str | None = None) -> dict:
     with _lock:
-        cfg = _load_unlocked()
+        cfg = _load_unlocked(device_id)
         cfg["jobs"] = [j for j in cfg["jobs"] if j["id"] != job_id]
         _bump(cfg, "jobs")
-        _save_unlocked(cfg)
+        _save_unlocked(cfg, device_id)
+        return cfg
+
+
+def apply_device_report(
+    device_id: str, memory_md: str | None, jobs: list | None
+) -> dict:
+    """
+    Applies on-device state report from physical ESPET device.
+    Updates memory_md if provided and non-empty.
+    Merges incoming device jobs without dropping web jobs.
+    Increments section versions if content changed and saves.
+    """
+    with _lock:
+        cfg = _load_unlocked(device_id)
+        changed = False
+
+        if memory_md and memory_md.strip():
+            if cfg.get("memory_md") != memory_md:
+                cfg["memory_md"] = memory_md
+                _bump(cfg, "memory")
+                changed = True
+
+        if jobs is not None and isinstance(jobs, list):
+            existing_jobs = cfg.get("jobs", [])
+            existing_by_id = {j["id"]: j for j in existing_jobs}
+            jobs_changed = False
+
+            for dev_job in jobs:
+                if not isinstance(dev_job, dict) or "id" not in dev_job:
+                    continue
+                jid = dev_job["id"]
+                if jid in existing_by_id:
+                    cur = existing_by_id[jid]
+                    for k in (
+                        "name",
+                        "enabled",
+                        "kind",
+                        "message",
+                        "channel",
+                        "chat_id",
+                        "interval_s",
+                        "at_epoch",
+                        "delete_after_run",
+                    ):
+                        if k in dev_job and dev_job[k] != cur.get(k):
+                            cur[k] = dev_job[k]
+                            jobs_changed = True
+                else:
+                    new_j = {
+                        "id": jid,
+                        "name": str(dev_job.get("name") or "job")[:JOB_MAX_NAME],
+                        "enabled": bool(dev_job.get("enabled", True)),
+                        "kind": dev_job.get("kind", "every"),
+                        "message": str(dev_job.get("message") or "")[:JOB_MAX_MESSAGE],
+                        "channel": dev_job.get("channel", "system"),
+                        "chat_id": dev_job.get("chat_id", "cron"),
+                        "delete_after_run": bool(dev_job.get("delete_after_run", False)),
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    if new_j["kind"] == "every":
+                        new_j["interval_s"] = int(dev_job.get("interval_s") or 3600)
+                    else:
+                        new_j["at_epoch"] = int(dev_job.get("at_epoch") or 0)
+                    existing_jobs.append(new_j)
+                    existing_by_id[jid] = new_j
+                    jobs_changed = True
+
+            if jobs_changed:
+                cfg["jobs"] = existing_jobs
+                _bump(cfg, "jobs")
+                changed = True
+
+        if changed:
+            _save_unlocked(cfg, device_id)
         return cfg
 
 
@@ -504,11 +694,11 @@ def _validate_skill_payload(payload: dict, require_all: bool = True) -> str | No
     return None
 
 
-def add_skill(payload: dict) -> tuple[dict, str | None]:
+def add_skill(payload: dict, device_id: str | None = None) -> tuple[dict, str | None]:
     """Create a web-managed skill. Returns (config, error_string)."""
     error = _validate_skill_payload(payload)
     if error:
-        return get_config(), error
+        return get_config(device_id), error
 
     skill = {
         "id": secrets.token_hex(4),
@@ -520,25 +710,26 @@ def add_skill(payload: dict) -> tuple[dict, str | None]:
     }
 
     with _lock:
-        cfg = _load_unlocked()
+        cfg = _load_unlocked(device_id)
         if len(cfg["skills"]) >= SKILL_MAX_COUNT:
             return cfg, f"Skill limit reached ({SKILL_MAX_COUNT}). Delete a skill first."
         if any(s["filename"] == skill["filename"] for s in cfg["skills"]):
             return cfg, f"A skill named '{skill['name']}' already exists"
         cfg["skills"].append(skill)
         _bump(cfg, "skills")
-        _save_unlocked(cfg)
+        _save_unlocked(cfg, device_id)
         return cfg, None
 
-
-def update_skill(skill_id: str, payload: dict) -> tuple[dict, str | None]:
+def update_skill(
+    skill_id: str, payload: dict, device_id: str | None = None
+) -> tuple[dict, str | None]:
     """Edit an existing web skill. Returns (config, error)."""
     error = _validate_skill_payload(payload, require_all=False)
     if error:
-        return get_config(), error
+        return get_config(device_id), error
 
     with _lock:
-        cfg = _load_unlocked()
+        cfg = _load_unlocked(device_id)
         skill = next((s for s in cfg["skills"] if s["id"] == skill_id), None)
         if not skill:
             return cfg, f"Skill {skill_id} not found"
@@ -559,21 +750,20 @@ def update_skill(skill_id: str, payload: dict) -> tuple[dict, str | None]:
             skill["enabled"] = bool(payload["enabled"])
 
         _bump(cfg, "skills")
-        _save_unlocked(cfg)
+        _save_unlocked(cfg, device_id)
         return cfg, None
 
 
-def delete_skill(skill_id: str) -> tuple[dict, str | None]:
+def delete_skill(skill_id: str, device_id: str | None = None) -> tuple[dict, str | None]:
     with _lock:
-        cfg = _load_unlocked()
+        cfg = _load_unlocked(device_id)
         remaining = [s for s in cfg["skills"] if s["id"] != skill_id]
         if len(remaining) == len(cfg["skills"]):
             return cfg, f"Skill {skill_id} not found"
         cfg["skills"] = remaining
         _bump(cfg, "skills")
-        _save_unlocked(cfg)
+        _save_unlocked(cfg, device_id)
         return cfg, None
-
 
 def skills_sync_bundle(cfg: dict) -> dict:
     """Payload for GET /api/skills/sync (the ESP32). Enabled skills only —
