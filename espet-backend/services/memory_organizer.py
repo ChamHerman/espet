@@ -142,8 +142,10 @@ class MemoryOrganizer:
             "stream": False,
         }
 
+        raw_reply = ""
+        timeout_s = 30.0
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_s, connect=10.0)) as client:
                 resp = await client.post(
                     url,
                     json=body,
@@ -152,12 +154,18 @@ class MemoryOrganizer:
                         "Accept": "application/json",
                     },
                 )
+        except httpx.TimeoutException:
+            logger.warning("MemoryOrganizer LLM request timed out after %.1fs", timeout_s)
+            return {"error": "timeout"}
+        except Exception as e:
+            logger.warning("MemoryOrganizer LLM request failed: %r", e)
+            return {"error": str(e)}
 
-            if resp.status_code != 200:
-                logger.warning("MemoryOrganizer LLM call failed with HTTP %d: %s", resp.status_code, resp.text[:200])
-                return {"error": f"HTTP {resp.status_code}"}
+        if resp.status_code != 200:
+            logger.warning("MemoryOrganizer LLM call failed with HTTP %d: %s", resp.status_code, resp.text[:200])
+            return {"error": f"HTTP {resp.status_code}"}
 
-            raw_reply = ""
+        try:
             try:
                 reply_json = resp.json()
                 raw_reply = reply_json.get("choices", [{}])[0].get("message", {}).get("content", "")
@@ -169,7 +177,6 @@ class MemoryOrganizer:
         except Exception as e:
             logger.warning("MemoryOrganizer failed to parse extraction JSON: %r (raw: %.150s)", e, raw_reply)
             return {"error": str(e)}
-
         profile_update = parsed_data.get("profile_update")
         if profile_update and isinstance(profile_update, dict):
             name = profile_update.get("name")

@@ -347,10 +347,14 @@ async def _llm_relay(websocket, request_id, body_str: str, device_id: str = "esp
         if resp.status_code == 200:
             asyncio.create_task(_capture_episodic_action(device_id, resp.text))
             if user_query:
-                asyncio.create_task(
-                    memory_organizer.extract_from_turn(device_id, user_query, resp.text)
-                )
+                async def _safe_extract():
+                    try:
+                        await memory_organizer.extract_from_turn(device_id, user_query, resp.text)
+                    except Exception as ex:
+                        logger.warning("MemoryOrganizer extraction task failed for %s: %r", device_id, ex)
+                asyncio.create_task(_safe_extract())
     except Exception as e:
+        logger.warning("LLM relay to %s failed: %r", url, e)
         await _reply(False, 0, json.dumps({"error": f"{type(e).__name__}: {e}"}))
 
 
