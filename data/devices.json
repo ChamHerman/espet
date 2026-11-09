@@ -1,0 +1,84 @@
+{
+  "devices": [
+    {
+      "device_id": "ESP-TC02",
+      "name": "ESP-TC02",
+      "online": false,
+      "last_seen": "2026-11-09T14:35:38.649197+00:00",
+      "ip": "127.0.0.1",
+      "fw": "test"
+    },
+    {
+      "device_id": "ESP-TC03",
+      "name": "ESP-TC03",
+      "online": false,
+      "last_seen": "2026-11-09T14:35:38.654379+00:00",
+      "ip": "127.0.0.1",
+      "fw": ""
+    },
+    {
+      "device_id": "ESP-TC04",
+      "name": "ESP-TC04",
+      "online": false,
+      "last_seen": "2026-11-09T14:35:38.924914+00:00",
+      "ip": "127.0.0.1",
+      "fw": ""
+    },
+    {
+      "device_id": "ESP-TC05",
+      "name": "ESP-TC05",
+      "online": false,
+      "last_seen": "2026-11-09T14:35:38.989256+00:00",
+      "ip": "127.0.0.1",
+      "fw": ""
+    },
+    {
+      "device_id": "ESP-TC07",
+      "name": "ESP-TC07",
+      "online": false,
+      "last_seen": "2026-11-09T14:35:40.263423+00:00",
+      "ip": "127.0.0.1",
+      "fw": "test"
+    },
+    {
+      "device_id": "ESP-TC08",
+      "name": "ESP-TC08",
+      "online": false,
+      "last_seen": "2026-11-09T14:35:40.487815+00:00",
+      "ip": "127.0.0.1",
+      "fw": ""
+    },
+    {
+      "device_id": "ESP-TC10",
+      "name": "ESP-TC10",
+      "online": false,
+      "last_seen": "2026-11-09T14:35:40.558140+00:00",
+      "ip": "127.0.0.1",
+      "fw": ""
+    },
+    {
+      "device_id": "ESP-TC12",
+      "name": "ESP-TC12",
+      "online": false,
+      "last_seen": "2026-11-09T14:35:41.435371+00:00",
+      "ip": "127.0.0.1",
+      "fw": ""
+    },
+    {
+      "device_id": "ESP-SYNC01",
+      "name": "ESP-SYNC01",
+      "online": false,
+      "last_seen": "2026-11-09T14:35:41.451273+00:00",
+      "ip": "127.0.0.1",
+      "fw": "v5.5.4"
+    },
+    {
+      "device_id": "ESP-TIME01",
+      "name": "ESP-TIME01",
+      "online": false,
+      "last_seen": "2026-11-09T14:35:41.886488+00:00",
+      "ip": "127.0.0.1",
+      "fw": "v5.5.4"
+    }
+  ]
+}
