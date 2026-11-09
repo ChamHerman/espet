@@ -11,6 +11,7 @@
 #include "nvs.h"
 #include "esp_attr.h"
 #include "esp_system.h"
+#include "esp_netif_sntp.h"
 
 static const char *TAG = "wifi";
 
@@ -93,6 +94,14 @@ static void event_handler(void *arg, esp_event_base_t event_base,
             dns.ip.u_addr.ip4.addr = esp_ip4addr_aton("1.1.1.1");
             esp_netif_set_dns_info(sta_netif, ESP_NETIF_DNS_BACKUP, &dns);
             ESP_LOGI(TAG, "Public DNS fallback set (8.8.8.8, 1.1.1.1)");
+        }
+
+        static bool s_sntp_initialized = false;
+        if (!s_sntp_initialized) {
+            esp_sntp_config_t sntp_cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+            esp_netif_sntp_init(&sntp_cfg);
+            s_sntp_initialized = true;
+            ESP_LOGI(TAG, "SNTP fallback client initialized");
         }
 
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);

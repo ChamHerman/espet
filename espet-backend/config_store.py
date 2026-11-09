@@ -24,6 +24,7 @@ Job merge contract with the device:
 import json
 import re
 import secrets
+import time
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -601,7 +602,7 @@ def apply_device_report(
             existing_jobs = cfg.get("jobs", [])
             existing_by_id = {j["id"]: j for j in existing_jobs}
             jobs_changed = False
-
+            now_epoch = time.time()
             for dev_job in jobs:
                 if not isinstance(dev_job, dict) or "id" not in dev_job:
                     continue
@@ -641,6 +642,23 @@ def apply_device_report(
                     existing_jobs.append(new_j)
                     existing_by_id[jid] = new_j
                     jobs_changed = True
+
+            incoming_ids = {
+                dev_job["id"]
+                for dev_job in jobs
+                if isinstance(dev_job, dict) and "id" in dev_job
+            }
+            for j in existing_jobs:
+                if j.get("kind") == "at" and j.get("enabled", True):
+                    is_deleted_on_device = (
+                        j["id"] not in incoming_ids
+                        and j.get("delete_after_run", False)
+                        and j.get("at_epoch", 0) <= now_epoch
+                    )
+                    is_overdue = j.get("at_epoch", 0) > 0 and j.get("at_epoch", 0) < (now_epoch - 900)
+                    if is_deleted_on_device or is_overdue:
+                        j["enabled"] = False
+                        jobs_changed = True
 
             if jobs_changed:
                 cfg["jobs"] = existing_jobs
@@ -861,6 +879,7 @@ def device_bundle(cfg: dict) -> dict:
     """
     dev = cfg["device"]
     return {
+        "server_epoch": int(time.time()),
         "versions": cfg["versions"],
         "user_md": cfg["user_md"],
         "soul_md": cfg["soul_md"],

@@ -8,7 +8,6 @@
 #include <stdbool.h>
 #include <ctype.h>
 #include "freertos/FreeRTOS.h"
-#include "freertos/timers.h"
 #include "esp_log.h"
 
 static const char *TAG = "heartbeat";
@@ -17,7 +16,7 @@ static const char *TAG = "heartbeat";
     "Read " MIMI_HEARTBEAT_FILE " and follow any instructions or tasks listed there. " \
     "If nothing needs attention, reply with just: HEARTBEAT_OK"
 
-static TimerHandle_t s_heartbeat_timer = NULL;
+static volatile bool s_heartbeat_enabled = false;
 
 /* ── Content check ────────────────────────────────────────────── */
 
@@ -103,60 +102,33 @@ static bool heartbeat_send(void)
     return true;
 }
 
-/* ── Timer callback ───────────────────────────────────────────── */
-
-static void heartbeat_timer_callback(TimerHandle_t xTimer)
-{
-    (void)xTimer;
-    heartbeat_send();
-}
-
 /* ── Public API ───────────────────────────────────────────────── */
 
 esp_err_t heartbeat_init(void)
 {
     ESP_LOGI(TAG, "Heartbeat service initialized (file: %s, interval: %ds)",
              MIMI_HEARTBEAT_FILE, MIMI_HEARTBEAT_INTERVAL_MS / 1000);
+    s_heartbeat_enabled = false;
     return ESP_OK;
 }
 
 esp_err_t heartbeat_start(void)
 {
-    if (s_heartbeat_timer) {
-        ESP_LOGW(TAG, "Heartbeat timer already running");
-        return ESP_OK;
-    }
-
-    s_heartbeat_timer = xTimerCreate(
-        "heartbeat",
-        pdMS_TO_TICKS(MIMI_HEARTBEAT_INTERVAL_MS),
-        pdTRUE,    /* auto-reload */
-        NULL,
-        heartbeat_timer_callback
-    );
-
-    if (!s_heartbeat_timer) {
-        ESP_LOGE(TAG, "Failed to create heartbeat timer");
-        return ESP_FAIL;
-    }
-
-    if (xTimerStart(s_heartbeat_timer, pdMS_TO_TICKS(1000)) != pdPASS) {
-        ESP_LOGE(TAG, "Failed to start heartbeat timer");
-        return ESP_FAIL;
-    }
-
-    ESP_LOGI(TAG, "Heartbeat started (every %d min)", MIMI_HEARTBEAT_INTERVAL_MS / 60000);
+    s_heartbeat_enabled = true;
+    ESP_LOGI(TAG, "Heartbeat started (every %d min, dispatched via cron task)",
+             MIMI_HEARTBEAT_INTERVAL_MS / 60000);
     return ESP_OK;
 }
 
 void heartbeat_stop(void)
 {
-    if (s_heartbeat_timer) {
-        xTimerStop(s_heartbeat_timer, pdMS_TO_TICKS(1000));
-        xTimerDelete(s_heartbeat_timer, pdMS_TO_TICKS(1000));
-        s_heartbeat_timer = NULL;
-        ESP_LOGI(TAG, "Heartbeat stopped");
-    }
+    s_heartbeat_enabled = false;
+    ESP_LOGI(TAG, "Heartbeat stopped");
+}
+
+bool heartbeat_is_enabled(void)
+{
+    return s_heartbeat_enabled;
 }
 
 bool heartbeat_trigger(void)
