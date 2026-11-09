@@ -79,12 +79,12 @@ static const char *TAG = "voice";
 #define ACK_CACHE_BYTES        (96 * 1024)  /* "Yes?" WAV cache in PSRAM */
 
 #define UTTERANCE_MAX_MS       2500         /* cap on wake word utterance (2.5s) */
-#define CMD_MAX_MS             4500         /* hard cap on command capture (4.5s) */
+#define CMD_MAX_MS             8000         /* hard cap on command capture (8.0s) */
 #define CMD_MAX_SAMPLES        (TOOL_AUDIO_SAMPLE_RATE * CMD_MAX_MS / 1000)
-#define CMD_LEAD_MS            4000         /* grace to START talking in 2-step command */
-#define CMD_SILENCE_MS         700          /* stop after 700 ms trailing silence for fast cutoff */
+#define CMD_LEAD_MS            3500         /* initial silence / wait-for-speech timeout (3.5s) */
+#define CMD_SILENCE_MS         1200         /* endpointing trailing silence cutoff (1.2s) */
+#define CMD_MIN_SPEECH_MS      300          /* minimum speech duration to validate real utterance (300ms) */
 #define CMD_SILENCE_RMS        280          /* trailing silence baseline threshold */
-
 #define VOICE_HTTP_TIMEOUT_MS  30000
 #define VOICE_HTTP_RX_MAX      (2 * 1024 * 1024)  /* PSRAM */
 #define VOICE_TX_CHUNK         (4 * 1024)
@@ -492,6 +492,7 @@ static void voice_run_command(void)
     size_t total = 0;
     int64_t start_ms = esp_timer_get_time() / 1000;
     int64_t last_speech_ms = 0;
+    uint32_t speech_ms = 0;
     bool heard_speech = false;
 
     bool capturing = true;
@@ -505,8 +506,11 @@ static void voice_run_command(void)
             int32_t rms = calc_ac_rms(scratch, written);
             /* Only count as real speech if rms reaches speech level */
             if (rms >= vad_trigger_threshold()) {
-                heard_speech = true;
+                if (!heard_speech) {
+                    heard_speech = true;
+                }
                 last_speech_ms = esp_timer_get_time() / 1000;
+                speech_ms += VAD_CHUNK_MS;
             }
         }
         if (full) {
@@ -515,17 +519,26 @@ static void voice_run_command(void)
 
         int64_t now = esp_timer_get_time() / 1000;
 
-        /* Early stop ONLY IF:
-         * 1. User actually spoke real speech (heard_speech == true)
-         * 2. At least 2.5s have elapsed since we started listening (guaranteed minimum speaking time)
-         * 3. User has been silent for at least 1.2s since their last speech
-         */
-        if (heard_speech && (now - start_ms >= 2500) && (now - last_speech_ms >= 1200)) {
-            ESP_LOGI(TAG, "[CMD] speech ended with %lld ms trailing silence", (long long)(now - last_speech_ms));
+        /* 1. Initial silence timeout (no speech within 3.5s) */
+        if (!heard_speech && (now - start_ms >= CMD_LEAD_MS)) {
+            ESP_LOGI(TAG, "[CMD] wait-for-speech timeout (%d ms) — no speech detected", CMD_LEAD_MS);
+            telegram_send_to_last_chat("⏱️ Listening timed out (no speech heard).");
+            tool_audio_beep(BEEP_TIMEOUT_HZ, BEEP_MS, BEEP_VOL);
+            tool_audio_clear_cache();
+            s_busy = false;
+            s_busy_start_ms = 0;
+            display_status_idle();
+            return;
+        }
+
+        /* 2. Trailing silence cutoff (speech ended with >= 1.2s silence) */
+        if (heard_speech && (speech_ms >= CMD_MIN_SPEECH_MS) && (now - last_speech_ms >= CMD_SILENCE_MS)) {
+            ESP_LOGI(TAG, "[CMD] speech ended with %lld ms trailing silence (speech_ms=%u)",
+                     (long long)(now - last_speech_ms), (unsigned)speech_ms);
             break;
         }
 
-        /* Hard cap at 4.5 seconds countdown */
+        /* 3. Hard cap reached (8.0s) */
         if (now - start_ms >= CMD_MAX_MS) {
             ESP_LOGI(TAG, "[CMD] full %d ms countdown reached", CMD_MAX_MS);
             break;
@@ -538,6 +551,7 @@ static void voice_run_command(void)
 
     if (total < TOOL_AUDIO_SAMPLE_RATE / 2) {
         ESP_LOGW(TAG, "command capture too short (< 500ms)");
+        telegram_send_to_last_chat("⚠️ Command too short or unclear.");
         tool_audio_beep(BEEP_TIMEOUT_HZ, BEEP_MS, BEEP_VOL);
         tool_audio_clear_cache();
         s_busy = false;
@@ -563,6 +577,7 @@ static void voice_run_command(void)
     bool ok = voice_client_transcribe_full(pcm, samples, &stt_res);
     if (!ok) {
         ESP_LOGW(TAG, "transcript failed or backend unavailable");
+        telegram_send_to_last_chat("⚠️ Speech recognition failed or backend unavailable.");
         tool_audio_beep(BEEP_TIMEOUT_HZ, BEEP_MS, BEEP_VOL);
         tool_audio_clear_cache();
         s_busy = false;
@@ -597,6 +612,7 @@ static void voice_run_command(void)
     if (!cmd_text || strlen(cmd_text) < 1) {
         ESP_LOGW(TAG, "no valid command text — clearing cache and returning to listen");
         if (cmd_text) free(cmd_text);
+        telegram_send_to_last_chat("⚠️ Didn't catch that. Please speak again.");
         tool_audio_beep(BEEP_TIMEOUT_HZ, BEEP_MS, BEEP_VOL);
         tool_audio_clear_cache();
         s_busy = false;
@@ -604,6 +620,11 @@ static void voice_run_command(void)
         display_status_idle();
         return;
     }
+
+    /* Provide immediate feedback of recognized user command to Telegram */
+    char you_msg[384];
+    snprintf(you_msg, sizeof(you_msg), "🗣️ You: \"%s\"", cmd_text);
+    telegram_send_to_last_chat(you_msg);
 
     mimi_msg_t msg = {0};
     strlcpy(msg.channel, MIMI_CHAN_SYSTEM, sizeof(msg.channel));
@@ -843,13 +864,18 @@ static void voice_task(void *arg)
                      stt_res.wake_word ? stt_res.wake_word : "",
                      stt_res.raw_text ? stt_res.raw_text : "");
 
-            telegram_send_to_last_chat("I heard you dy! Mic confirmed working.");
+            /* Feedback will be sent below depending on one-shot vs wake-only */
             display_status_set("Listening...", "");
 
             if (stt_res.text && strlen(stt_res.text) > 0) {
                 /* Case 1: One-shot command! E.g. "Hey Mimi turn on the LED" */
                 ESP_LOGI(TAG, "*** ONE-SHOT COMMAND: '%.60s' ***", stt_res.text);
                 display_status_set("Thinking...", "");
+                char notif[384];
+                snprintf(notif, sizeof(notif), "🎤 Wake word matched: %s\n🗣️ You: \"%s\"",
+                         stt_res.wake_word ? stt_res.wake_word : "ESPET", stt_res.text);
+                telegram_send_to_last_chat(notif);
+
 
                 mimi_msg_t msg = {0};
                 strlcpy(msg.channel, MIMI_CHAN_SYSTEM, sizeof(msg.channel));
@@ -872,6 +898,7 @@ static void voice_task(void *arg)
             } else {
                 /* Case 2: Wake word only! E.g. "Mimi" or "Hey Mimi" */
                 ESP_LOGI(TAG, "*** WAKE WORD ONLY — playing 'Yes?' and listening for command ***");
+                telegram_send_to_last_chat("🎤 I heard you! Listening for your command...");
                 ack_play();
                 /* voice_run_command() waits out ACK_SETTLE_MS internally, which
                  * covers the ack's amp tail + room reverb. Only the ring/DMA
