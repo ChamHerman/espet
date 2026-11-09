@@ -2,6 +2,7 @@
 #include "mimi_config.h"
 #include "bus/message_bus.h"
 #include "heartbeat/heartbeat.h"
+#include "channels/cloud_link/cloud_link.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -242,6 +243,10 @@ static esp_err_t cron_save_jobs(void)
 static void cron_process_due_jobs(void)
 {
     time_t now = time(NULL);
+    if (now < MIMI_MIN_VALID_EPOCH) {
+        /* Clock uncalibrated (< Nov 2023). Skip processing until time is synchronized. */
+        return;
+    }
 
     bool changed = false;
 
@@ -250,6 +255,24 @@ static void cron_process_due_jobs(void)
         if (!job->enabled) continue;
         if (job->next_run <= 0) continue;
         if (job->next_run > now) continue;
+        /* Check if one-shot job is stale/expired (>15 minutes overdue) */
+        if (job->kind == CRON_KIND_AT && (now - job->at_epoch > MIMI_CRON_STALE_THRESHOLD_S)) {
+            ESP_LOGW(TAG, "Dropping expired one-shot job '%s' (%s): due %lld, now %lld (%llds overdue)",
+                     job->name, job->id, (long long)job->at_epoch, (long long)now,
+                     (long long)(now - job->at_epoch));
+            if (job->delete_after_run) {
+                for (int j = i; j < s_job_count - 1; j++) {
+                    s_jobs[j] = s_jobs[j + 1];
+                }
+                s_job_count--;
+                i--;
+            } else {
+                job->enabled = false;
+                job->next_run = 0;
+            }
+            changed = true;
+            continue;
+        }
 
         /* Job is due — fire it */
         ESP_LOGI(TAG, "Cron job firing: %s (%s)", job->name, job->id);
@@ -296,6 +319,7 @@ static void cron_process_due_jobs(void)
 
     if (changed) {
         cron_save_jobs();
+        cloud_link_send_sync_report();
     }
 }
 

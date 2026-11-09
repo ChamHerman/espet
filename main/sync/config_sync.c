@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include "freertos/FreeRTOS.h"
@@ -277,8 +278,13 @@ static esp_err_t apply_jobs(cJSON *jobs_arr)
                         cJSON_CreateNumber((double)(now + (iv ? (time_t)iv->valuedouble : 60))));
                 } else {
                     cJSON *at = cJSON_GetObjectItem(job, "at_epoch");
-                    cJSON_ReplaceItemInObject(job, "next_run",
-                        cJSON_CreateNumber(at ? at->valuedouble : 0));
+                    if (now > MIMI_MIN_VALID_EPOCH && at && at->valuedouble < (double)(now - MIMI_CRON_STALE_THRESHOLD_S)) {
+                        cJSON_ReplaceItemInObject(job, "enabled", cJSON_CreateFalse());
+                        cJSON_ReplaceItemInObject(job, "next_run", cJSON_CreateNumber(0));
+                    } else {
+                        cJSON_ReplaceItemInObject(job, "next_run",
+                            cJSON_CreateNumber(at ? at->valuedouble : 0));
+                    }
                 }
             }
             cJSON_ReplaceItemViaPointer(merged, existing, job);
@@ -290,7 +296,10 @@ static esp_err_t apply_jobs(cJSON *jobs_arr)
                         cJSON_CreateNumber((double)(now + (iv ? (time_t)iv->valuedouble : 60))));
                 } else {
                     cJSON *at = cJSON_GetObjectItem(job, "at_epoch");
-                    if (at && at->valuedouble > (double)now) {
+                    if (now > MIMI_MIN_VALID_EPOCH && at && at->valuedouble < (double)(now - MIMI_CRON_STALE_THRESHOLD_S)) {
+                        cJSON_ReplaceItemInObject(job, "enabled", cJSON_CreateFalse());
+                        cJSON_ReplaceItemInObject(job, "next_run", cJSON_CreateNumber(0));
+                    } else if (at) {
                         cJSON_ReplaceItemInObject(job, "next_run",
                             cJSON_CreateNumber(at->valuedouble));
                     }
@@ -607,6 +616,16 @@ static void sync_once(void)
 {
     cJSON *bundle = fetch_config_bundle();
     if (!bundle) return;
+    /* Sync clock from backend server if server_epoch is present */
+    cJSON *epoch_item = cJSON_GetObjectItem(bundle, "server_epoch");
+    if (epoch_item && cJSON_IsNumber(epoch_item)) {
+        time_t s_epoch = (time_t)epoch_item->valuedouble;
+        if (s_epoch > MIMI_MIN_VALID_EPOCH) {
+            struct timeval tv = { .tv_sec = s_epoch, .tv_usec = 0 };
+            settimeofday(&tv, NULL);
+            ESP_LOGI(TAG, "Clock synced from backend server: epoch %lld", (long long)s_epoch);
+        }
+    }
 
     cJSON *versions = cJSON_GetObjectItem(bundle, "versions");
     if (!versions || !cJSON_IsObject(versions)) {

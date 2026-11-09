@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 
 import httpx
 
@@ -125,9 +126,16 @@ async def ws_device(websocket: WebSocket, key: str = Query("")):
     registry.register_device(device_id, ip=client_ip, fw=str(hello.get("fw", "")))
     registry.register_connection(device_id, websocket)
     primary_chat = registry.primary_chat_for_device(device_id) or ""
-    await websocket.send_text(json.dumps({"type": "hello_ack",
-                                          "device_id": device_id,
-                                          "chat_id": primary_chat}))
+    cur_epoch = int(time.time())
+    dev_cfg = store.get_config(device_id)
+    dev_tz = dev_cfg.get("device", {}).get("timezone", "UTC")
+    await websocket.send_text(json.dumps({
+        "type": "hello_ack",
+        "device_id": device_id,
+        "chat_id": primary_chat,
+        "server_epoch": cur_epoch,
+        "tz": dev_tz,
+    }))
     logger.info("Device %s connected (fw=%s) — %d device(s) online",
                 device_id, hello.get("fw", "?"), len(registry.connected_devices()))
 

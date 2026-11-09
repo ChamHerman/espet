@@ -547,6 +547,24 @@ async def _tc13_device_registry_and_sync():
     assert target_after is not None
     assert target_after["online"] is False
 
+async def _tc14_time_sync_and_cron_pruning():
+    _reset_state()
+    # 1. GET /api/config includes server_epoch
+    res = http.get("/api/config")
+    assert res.status_code == 200
+    cfg_data = res.json()
+    assert "server_epoch" in cfg_data
+    assert abs(cfg_data["server_epoch"] - time.time()) < 5
+
+    # 2. hello_ack includes server_epoch and tz
+    async with connect(f"{GW_BASE}?key={DEVICE_KEY}") as ws:
+        await ws.send(json.dumps({"type": "hello", "device_id": "ESP-TIME01", "fw": "v5.5.4"}))
+        ack = json.loads(await asyncio.wait_for(ws.recv(), 5))
+        assert ack["type"] == "hello_ack"
+        assert "server_epoch" in ack
+        assert abs(ack["server_epoch"] - time.time()) < 5
+        assert "tz" in ack
+
 # ---------------------------------------------------------------------------
 # pytest-compatible wrappers + standalone runner
 # ---------------------------------------------------------------------------
@@ -565,6 +583,7 @@ CASES = [
     ("TC-11 test_llm_diagnostics", _tc11_test_llm_diagnostics),
     ("TC-12 bound_chat_sync", _tc12_hello_ack_includes_bound_chat),
     ("TC-13 device_registry_and_sync", _tc13_device_registry_and_sync),
+    ("TC-14 time_sync_and_cron_pruning", _tc14_time_sync_and_cron_pruning),
 ]
 
 
@@ -615,6 +634,8 @@ def test_tc12_hello_ack_includes_bound_chat():
     asyncio.run(_tc12_hello_ack_includes_bound_chat())
 def test_tc13_device_registry_and_sync():
     asyncio.run(_tc13_device_registry_and_sync())
+def test_tc14_time_sync_and_cron_pruning():
+    asyncio.run(_tc14_time_sync_and_cron_pruning())
 
 
 if __name__ == "__main__":

@@ -12,6 +12,8 @@
 #include <string.h>
 #include <stdio.h>
 
+#include <time.h>
+#include <sys/time.h>
 #include "cJSON.h"
 #include "esp_crt_bundle.h"
 #include "esp_event.h"
@@ -293,10 +295,22 @@ static void handle_frame(char *json_str)
     } else if (strcmp(type_str, "hello_ack") == 0) {
         ESP_LOGI(TAG, "cloud gateway accepted this device");
         sync_bound_chat(root);
+        const cJSON *ep = cJSON_GetObjectItem(root, "server_epoch");
+        if (ep && cJSON_IsNumber(ep) && ep->valuedouble > MIMI_MIN_VALID_EPOCH) {
+            struct timeval tv = { .tv_sec = (time_t)ep->valuedouble, .tv_usec = 0 };
+            settimeofday(&tv, NULL);
+            ESP_LOGI(TAG, "Clock synced from hello_ack: epoch %lld", (long long)tv.tv_sec);
+        }
+    } else if (strcmp(type_str, "time_sync") == 0) {
+        const cJSON *ep = cJSON_GetObjectItem(root, "epoch");
+        if (ep && cJSON_IsNumber(ep) && ep->valuedouble > MIMI_MIN_VALID_EPOCH) {
+            struct timeval tv = { .tv_sec = (time_t)ep->valuedouble, .tv_usec = 0 };
+            settimeofday(&tv, NULL);
+            ESP_LOGI(TAG, "Clock synced from time_sync frame: epoch %lld", (long long)tv.tv_sec);
+        }
     } else if (strcmp(type_str, "bind_sync") == 0) {
         sync_bound_chat(root);
         ESP_LOGI(TAG, "received bind_sync from gateway");
-    } else if (strcmp(type_str, "pong") == 0) {
         /* keepalive */
     } else if (strcmp(type_str, "sync_now") == 0) {
         config_sync_trigger();
