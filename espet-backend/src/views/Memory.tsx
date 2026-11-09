@@ -314,6 +314,20 @@ export function MemoryView() {
           <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
             <Badge>{totalCount} records</Badge>
             <Button
+              icon={<Icon name="refresh" size={15} />}
+              onClick={async () => {
+                try {
+                  const res = await client.syncFromMemoryMd();
+                  toast(`Synced ${res.indexed} new fact(s) from MEMORY.md into Vector DB`);
+                  reloadMemories();
+                } catch (e) {
+                  toast((e as Error).message, "error");
+                }
+              }}
+            >
+              Sync from MEMORY.md
+            </Button>
+            <Button
               type="primary"
               icon={<Icon name="plus" size={15} />}
               onClick={openCreateModal}
@@ -322,7 +336,6 @@ export function MemoryView() {
             </Button>
           </div>
         </div>
-
         <p className={styles.cardSub}>
           Permanent vector memory database powered by BAAI/bge-small-en-v1.5 and sqlite-vec.
           The agent automatically writes here via MCP tools and retrieves relevant facts before every LLM response.

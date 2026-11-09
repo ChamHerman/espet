@@ -180,6 +180,9 @@ def test_retrieval_latency(temp_db):
             source_type="synthetic",
         )
 
+    # Warmup ONNX runtime
+    rag.search(query="warmup", device_id="espet_perf_01", top_k=1)
+
     # Measure search latency over 10 queries
     latencies = []
     for _ in range(10):

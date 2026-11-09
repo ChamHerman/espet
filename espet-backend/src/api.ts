@@ -99,6 +99,8 @@ export const client = {
     api<{ ok: boolean; deleted: boolean; id: number }>(`/api/memory/item/${id}`, { method: "DELETE" }),
   queryMemory: (query: string, top_k = 3, threshold = 0.28, device_id = "espet_s3_01") =>
     api<MemoryQueryResponse>("/api/memory/query", json("POST", { query, top_k, threshold, device_id })),
+  syncFromMemoryMd: (device_id = "espet_s3_01") =>
+    api<{ ok: boolean; indexed: number; total_lines: number }>(`/api/memory/sync-from-md?device_id=${device_id}`, json("POST", {})),
 };
 
 /* Device WebSocket gateway address for the direct-chat view (localStorage;

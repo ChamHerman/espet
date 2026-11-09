@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from auth.device_auth import verify_device_key
 from services.rag_service import rag_service
+import config_store as store
 
 logger = logging.getLogger("espet-backend.api.memory")
 
@@ -170,3 +171,38 @@ async def archive_daily_notes(
     except Exception as e:
         logger.error("Archive daily note failed: %r", e)
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/sync-from-md", summary="Import and index MEMORY.md content into SQLite-Vec")
+async def sync_from_memory_md(
+    device_id: str = Query("espet_s3_01"),
+    _key: str = Depends(verify_device_key),
+) -> dict[str, Any]:
+    cfg = store.get_config()
+    content = cfg.get("memory_md", "")
+    lines = []
+    for raw in content.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith("(empty"):
+            continue
+        if line.startswith("- ") or line.startswith("* "):
+            line = line[2:].strip()
+        if len(line) >= 3:
+            lines.append(line)
+
+    indexed = 0
+    existing = await asyncio.to_thread(rag_service.list_memories, device_id=device_id, limit=200)
+    existing_texts = {e["content"].strip().lower() for e in existing}
+
+    for item in lines:
+        if item.lower() not in existing_texts:
+            await asyncio.to_thread(
+                rag_service.add_memory,
+                device_id=device_id,
+                content=item,
+                source_type="fact",
+                source_ref="MEMORY.md",
+            )
+            indexed += 1
+            existing_texts.add(item.lower())
+
+    return {"ok": True, "indexed": indexed, "total_lines": len(lines)}
