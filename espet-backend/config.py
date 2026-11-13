@@ -39,6 +39,8 @@ class Settings(BaseSettings):
     drive_mcp_url: str = "https://drivemcp.googleapis.com/mcp/v1"
 
     # --- Voice pipeline (STT/TTS) ---
+    # Hardware mic effective sample rate: True = ESP32 mono DMA captures at 8kHz, auto-upsample to 16kHz
+    voice_hw_rate_8k: bool = True
     # STT: faster-whisper model size: tiny, base, small, medium...
     voice_stt_model: str = "base"
     # STT device: "auto", "cuda", or "cpu"

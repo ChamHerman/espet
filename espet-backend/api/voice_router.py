@@ -199,15 +199,24 @@ def detect_pitch_f0(data: np.ndarray, fs: int = ESP_SAMPLE_RATE) -> float:
 
 def check_and_fix_pitch(pcm16: np.ndarray, sample_rate: int = ESP_SAMPLE_RATE) -> tuple[np.ndarray, bool]:
     """
-    Detect if the audio has double-speed/octave-up chipmunk pitch due to
-    hardware DMA mono slot-mask decimation (effective 8 kHz played as 16 kHz).
-    If pitch is abnormal (> 270 Hz median for voiced speech), upsamples 8k -> 16k
-    to restore normal human voice pitch and natural playback speed.
+    Restore natural human voice pitch and normal 1x playback speed.
+    Because the ESP32 mic DMA slot mask captures at 8,000 samples/sec into a 16 kHz buffer,
+    audio arrives at 2x playback speed (Minion/chipmunk voice).
+    Upsamples 8k -> 16k so duration, tempo, and pitch are 100% natural.
     """
-    f0 = detect_pitch_f0(pcm16, sample_rate)
-    if f0 > 270.0:
+    if getattr(settings, "voice_hw_rate_8k", True):
         logger.info(
-            "Speech pitch is %.1f Hz (chipmunk/double speed detected) — restoring normal pitch (resampling 8k -> 16k)",
+            "Restoring normal 1x tempo and pitch (resampling 8k -> 16k, %d -> %d samples)",
+            len(pcm16), len(pcm16) * 2
+        )
+        corrected = resample_to_16k(pcm16, 8000)
+        return corrected, True
+
+    # Fallback to pitch-based gate if voice_hw_rate_8k is disabled
+    f0 = detect_pitch_f0(pcm16, sample_rate)
+    if f0 > 170.0:
+        logger.info(
+            "Speech pitch is %.1f Hz (> 170 Hz) — restoring normal pitch (resampling 8k -> 16k)",
             f0
         )
         corrected = resample_to_16k(pcm16, 8000)
