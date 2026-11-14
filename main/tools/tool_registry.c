@@ -9,6 +9,18 @@
 #include "tools/tool_cron.h"
 #include "tools/tool_gpio.h"
 #include "tools/tool_audio.h"
+#include "tools/tool_camera.h"
+#include "channels/telegram/telegram_bot.h"
+#include "wifi/wifi_manager.h"
+#include "esp_wifi.h"
+#include "esp_timer.h"
+#include "esp_spiffs.h"
+#include "esp_system.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#if CONFIG_SOC_TEMP_SENSOR_SUPPORTED
+#include "driver/temperature_sensor.h"
+#endif
 
 #include <string.h>
 #include "esp_log.h"
@@ -18,7 +30,7 @@
 
 static const char *TAG = "tools";
 
-#define MAX_TOOLS 64
+#define MAX_TOOLS 128
 
 static mimi_tool_t s_tools[MAX_TOOLS];
 static int s_tool_count = 0;
@@ -43,7 +55,11 @@ static void build_tools_json(void)
 {
     cJSON *arr = cJSON_CreateArray();
 
+    int visible_count = 0;
     for (int i = 0; i < s_tool_count; i++) {
+        if (s_tools[i].hidden) {
+            continue;
+        }
         cJSON *tool = cJSON_CreateObject();
         cJSON_AddStringToObject(tool, "name", s_tools[i].name);
         cJSON_AddStringToObject(tool, "description", s_tools[i].description);
@@ -54,13 +70,14 @@ static void build_tools_json(void)
         }
 
         cJSON_AddItemToArray(arr, tool);
+        visible_count++;
     }
 
     free(s_tools_json);
     s_tools_json = cJSON_PrintUnformatted(arr);
     cJSON_Delete(arr);
 
-    ESP_LOGI(TAG, "Tools JSON built (%d tools)", s_tool_count);
+    ESP_LOGI(TAG, "Tools JSON built (%d visible tools, %d total in registry)", visible_count, s_tool_count);
 }
 
 static esp_err_t oled_print_execute(const char *input_json, char *output, size_t output_size)
@@ -71,14 +88,179 @@ static esp_err_t oled_print_execute(const char *input_json, char *output, size_t
         return ESP_OK;
     }
     cJSON *text_item = cJSON_GetObjectItem(root, "text");
-    if (cJSON_IsString(text_item) && text_item->valuestring[0]) {
+    cJSON *emotion_item = cJSON_GetObjectItem(root, "emotion");
+    const char *emotion = cJSON_IsString(emotion_item) ? emotion_item->valuestring : NULL;
+
+    if (emotion && emotion[0]) {
+        if (strcasecmp(emotion, "happy") == 0) display_face_set_state(FACE_STATE_HAPPY);
+        else if (strcasecmp(emotion, "blink") == 0) display_face_trigger_blink();
+        else if (strcasecmp(emotion, "sleep") == 0) display_face_set_state(FACE_STATE_SLEEP);
+        else if (strcasecmp(emotion, "think") == 0) display_face_set_state(FACE_STATE_THINK);
+        else if (strcasecmp(emotion, "listen") == 0) display_face_set_state(FACE_STATE_LISTEN);
+        else if (strcasecmp(emotion, "confused") == 0) display_face_set_state(FACE_STATE_CONFUSED);
+        else if (strcasecmp(emotion, "idle") == 0) display_face_set_state(FACE_STATE_IDLE);
+        snprintf(output, output_size, "{\"status\": \"success\", \"emotion\": \"%s\"}", emotion);
+    } else if (cJSON_IsString(text_item) && text_item->valuestring[0]) {
         display_status_set(text_item->valuestring, "");
         snprintf(output, output_size, "{\"status\": \"success\", \"displayed\": \"%s\"}",
                  text_item->valuestring);
     } else {
-        snprintf(output, output_size, "{\"error\": \"Missing text parameter\"}");
+        snprintf(output, output_size, "{\"error\": \"Missing text or emotion parameter\"}");
     }
     cJSON_Delete(root);
+    return ESP_OK;
+}
+
+static esp_err_t tool_take_photo_execute(const char *input_json, char *output, size_t output_size)
+{
+    char caption_buf[128] = "📸 Snapshot from ESPET";
+    char chat_id_buf[64] = {0};
+
+    cJSON *root = cJSON_Parse(input_json);
+    if (root) {
+        cJSON *cap_item = cJSON_GetObjectItem(root, "caption");
+        if (cJSON_IsString(cap_item) && cap_item->valuestring[0]) {
+            snprintf(caption_buf, sizeof(caption_buf), "%s", cap_item->valuestring);
+        }
+        cJSON *cid_item = cJSON_GetObjectItem(root, "chat_id");
+        if (cJSON_IsString(cid_item) && cid_item->valuestring[0]) {
+            snprintf(chat_id_buf, sizeof(chat_id_buf), "%s", cid_item->valuestring);
+        }
+        cJSON_Delete(root);
+    }
+
+    /* Capture photo from OV2640 camera */
+    camera_fb_t *fb = tool_camera_take_picture();
+    if (!fb || !fb->buf || fb->len == 0) {
+        if (fb) tool_camera_return_picture(fb);
+        snprintf(output, output_size, "{\"error\": \"Camera capture failed or sensor busy\"}");
+        return ESP_OK;
+    }
+
+    esp_err_t err;
+    if (chat_id_buf[0] != '\0') {
+        err = telegram_send_photo(chat_id_buf, fb->buf, fb->len, caption_buf);
+    } else {
+        err = telegram_send_photo_to_last_chat(fb->buf, fb->len, caption_buf);
+    }
+
+    tool_camera_return_picture(fb);
+
+    if (err == ESP_OK) {
+        snprintf(output, output_size, "{\"status\": \"success\", \"message\": \"Photo captured successfully and displayed in chat.\", \"image_url\": \"/api/camera/last-photo\"}");
+    } else {
+        snprintf(output, output_size, "{\"status\": \"error\", \"message\": \"Photo captured (%u bytes) but upload failed (err=%d).\", \"code\": %d}",
+                 (unsigned)(fb ? fb->len : 0), (int)err, (int)err);
+    }
+    return ESP_OK;
+}
+
+static esp_err_t tool_get_device_status_execute(const char *input_json, char *output, size_t output_size)
+{
+    (void)input_json;
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        snprintf(output, output_size, "{\"error\": \"Memory allocation failed\"}");
+        return ESP_OK;
+    }
+
+    /* 1. WiFi Status */
+    cJSON *wifi = cJSON_CreateObject();
+    bool connected = wifi_manager_is_connected();
+    cJSON_AddBoolToObject(wifi, "connected", connected);
+    cJSON_AddStringToObject(wifi, "ip", wifi_manager_get_ip());
+    if (connected) {
+        wifi_ap_record_t ap_info;
+        if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+            cJSON_AddStringToObject(wifi, "ssid", (const char *)ap_info.ssid);
+            cJSON_AddNumberToObject(wifi, "rssi_dbm", ap_info.rssi);
+        }
+    }
+    cJSON_AddItemToObject(root, "wifi", wifi);
+
+    /* 2. Uptime */
+    int64_t uptime_sec = esp_timer_get_time() / 1000000LL;
+    int h = (int)(uptime_sec / 3600);
+    int m = (int)((uptime_sec % 3600) / 60);
+    int s = (int)(uptime_sec % 60);
+    char uptime_str[64];
+    snprintf(uptime_str, sizeof(uptime_str), "%dh %dm %ds", h, m, s);
+    cJSON_AddStringToObject(root, "uptime", uptime_str);
+    cJSON_AddNumberToObject(root, "uptime_seconds", (double)uptime_sec);
+
+    /* 3. Memory */
+    cJSON *mem = cJSON_CreateObject();
+    cJSON_AddNumberToObject(mem, "free_psram_bytes", (double)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    cJSON_AddNumberToObject(mem, "free_internal_dram_bytes", (double)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    cJSON_AddNumberToObject(mem, "free_total_heap_bytes", (double)esp_get_free_heap_size());
+    cJSON_AddItemToObject(root, "memory", mem);
+
+    /* 4. SPIFFS Storage */
+    size_t spiffs_total = 0, spiffs_used = 0;
+    if (esp_spiffs_info(NULL, &spiffs_total, &spiffs_used) == ESP_OK) {
+        cJSON *storage = cJSON_CreateObject();
+        cJSON_AddNumberToObject(storage, "total_bytes", (double)spiffs_total);
+        cJSON_AddNumberToObject(storage, "used_bytes", (double)spiffs_used);
+        cJSON_AddNumberToObject(storage, "free_bytes", (double)(spiffs_total > spiffs_used ? spiffs_total - spiffs_used : 0));
+        cJSON_AddItemToObject(root, "spiffs_storage", storage);
+    }
+
+    /* 5. CPU Temperature */
+#if CONFIG_SOC_TEMP_SENSOR_SUPPORTED
+    temperature_sensor_handle_t temp_handle = NULL;
+    temperature_sensor_config_t temp_config = TEMPERATURE_SENSOR_CONFIG_DEFAULT(10, 80);
+    if (temperature_sensor_install(&temp_config, &temp_handle) == ESP_OK) {
+        if (temperature_sensor_enable(temp_handle) == ESP_OK) {
+            float tsens_value = 0.0f;
+            if (temperature_sensor_get_celsius(temp_handle, &tsens_value) == ESP_OK) {
+                cJSON_AddNumberToObject(root, "cpu_temperature_celsius", (double)((int)(tsens_value * 10.0f)) / 10.0);
+            }
+            temperature_sensor_disable(temp_handle);
+        }
+        temperature_sensor_uninstall(temp_handle);
+    }
+#endif
+
+    char *json_str = cJSON_PrintUnformatted(root);
+    if (json_str) {
+        snprintf(output, output_size, "%s", json_str);
+        free(json_str);
+    } else {
+        snprintf(output, output_size, "{\"error\": \"Failed to serialize status JSON\"}");
+    }
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+static void delayed_restart_task(void *pvParameters)
+{
+    (void)pvParameters;
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    ESP_LOGI(TAG, "Rebooting device now...");
+    esp_restart();
+}
+
+static esp_err_t tool_restart_device_execute(const char *input_json, char *output, size_t output_size)
+{
+    char reason_buf[128] = "User requested restart";
+    cJSON *root = cJSON_Parse(input_json);
+    if (root) {
+        cJSON *reason_item = cJSON_GetObjectItem(root, "reason");
+        if (cJSON_IsString(reason_item) && reason_item->valuestring[0]) {
+            snprintf(reason_buf, sizeof(reason_buf), "%s", reason_item->valuestring);
+        }
+        cJSON_Delete(root);
+    }
+
+    ESP_LOGW(TAG, "Device restart requested: %s", reason_buf);
+
+    BaseType_t ret = xTaskCreate(delayed_restart_task, "delayed_restart", 2048, NULL, 5, NULL);
+    if (ret != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create delayed restart task, restarting immediately");
+        esp_restart();
+    }
+
+    snprintf(output, output_size, "{\"status\": \"success\", \"message\": \"Device is restarting in 1.5 seconds... Reason: %s\"}", reason_buf);
     return ESP_OK;
 }
 
@@ -207,14 +389,16 @@ esp_err_t tool_registry_init(void)
     };
     register_tool(&cr);
 
-    /* Register oled_print — display text on the status screen */
+    /* Register oled_print — display text or trigger facial emotion on OLED */
     mimi_tool_t op = {
         .name = "oled_print",
-        .description = "Show a short text message on the OLED display screen.",
+        .description = "Display text on OLED or set robot eye emotion: happy, blink, sleep, think, listen, confused, idle.",
         .input_schema_json =
             "{\"type\":\"object\","
-            "\"properties\":{\"text\":{\"type\":\"string\",\"description\":\"Text to display (max ~20 chars per line)\"}},"
-            "\"required\":[\"text\"]}",
+            "\"properties\":{"
+            "\"text\":{\"type\":\"string\",\"description\":\"Text to display (optional if emotion given)\"},"
+            "\"emotion\":{\"type\":\"string\",\"description\":\"Face emotion: happy, blink, sleep, think, listen, confused, idle\"}"
+            "}}",
         .execute = oled_print_execute,
     };
     register_tool(&op);
@@ -253,15 +437,58 @@ esp_err_t tool_registry_init(void)
             "\"properties\":{},"
             "\"required\":[]}",
         .execute = tool_gpio_read_all_execute,
+        .hidden = true, /* Diagnostic tool: available for serial REPL, hidden from LLM prompt */
     };
     register_tool(&ga);
 
 
-    /* Register Audio tools */
+    /* Register Audio diagnostic tools (available via serial REPL, hidden from LLM prompt) */
     tool_audio_init();
+    audio_play_tone_tool.hidden = true;
+    audio_record_test_tool.hidden = true;
+    audio_spktest_tool.hidden = true;
     register_tool(&audio_play_tone_tool);
     register_tool(&audio_record_test_tool);
     register_tool(&audio_spktest_tool);
+
+    /* Register take_photo */
+    mimi_tool_t tp = {
+        .name = "take_photo",
+        .description = "Capture a real-time photo with the device camera and send it to the user on Telegram. Call this when the user asks to take a photo, snap a picture, or show what you see.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{"
+            "\"caption\":{\"type\":\"string\",\"description\":\"Optional message or caption to accompany the photo\"},"
+            "\"chat_id\":{\"type\":\"string\",\"description\":\"Optional Telegram chat_id (uses current chat if omitted)\"}"
+            "},"
+            "\"required\":[]}",
+        .execute = tool_take_photo_execute,
+    };
+    register_tool(&tp);
+
+    /* Register get_device_status */
+    mimi_tool_t gds = {
+        .name = "get_device_status",
+        .description = "Get device diagnostic health vitals: WiFi connection status, SSID, signal strength (RSSI in dBm), IP address, uptime, free RAM/PSRAM, flash storage, and CPU temperature. Call this when user asks about device health, battery/power, signal, temperature, or status.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{},"
+            "\"required\":[]}",
+        .execute = tool_get_device_status_execute,
+    };
+    register_tool(&gds);
+
+    /* Register restart_device */
+    mimi_tool_t rd = {
+        .name = "restart_device",
+        .description = "Restart/reboot the ESP32-S3 microcontroller device. Performs a clean restart after a 1.5 second delay so the confirmation message is sent first. Use when user asks to reboot or restart the device.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{\"reason\":{\"type\":\"string\",\"description\":\"Optional reason for restarting\"}},"
+            "\"required\":[]}",
+        .execute = tool_restart_device_execute,
+    };
+    register_tool(&rd);
 
     build_tools_json();
 
@@ -417,9 +644,9 @@ esp_err_t tool_registry_fetch_remote_tools(void)
     backend_discovery_base_url(base, sizeof(base));
     ESP_LOGI(TAG, "Fetching remote tools from backend (%s/api/tools)...", base);
 
-    char *response_buf = heap_caps_calloc(1, 131072, MALLOC_CAP_SPIRAM);
+    char *response_buf = heap_caps_calloc(1, 262144, MALLOC_CAP_SPIRAM);
     if (!response_buf) {
-        response_buf = calloc(1, 131072);
+        response_buf = calloc(1, 262144);
     }
     if (!response_buf) {
         ESP_LOGE(TAG, "Failed to allocate buffer for remote tools");
@@ -429,7 +656,7 @@ esp_err_t tool_registry_fetch_remote_tools(void)
     http_resp_buf_t resp_ctx = {
         .buf = response_buf,
         .len = 0,
-        .max_len = 131072,
+        .max_len = 262144,
     };
 
     char auth_hdr[128];
@@ -489,6 +716,9 @@ esp_err_t tool_registry_fetch_remote_tools(void)
             cJSON *name = cJSON_GetObjectItem(t, "name");
             cJSON *desc = cJSON_GetObjectItem(t, "description");
             cJSON *params = cJSON_GetObjectItem(t, "parameters");
+            if (!params) {
+                params = cJSON_GetObjectItem(t, "input_schema");
+            }
 
             if (name && name->valuestring) {
                 char *schema_str = NULL;

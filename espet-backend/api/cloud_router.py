@@ -15,6 +15,8 @@ import asyncio
 import json
 import logging
 import time
+from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -39,6 +41,110 @@ _pending_record_start: dict[str, asyncio.Future] = {}
 _pending_record_stop: dict[str, asyncio.Future] = {}
 _pending_voice_listen: dict[str, asyncio.Future] = {}
 _voice_listen_state: dict[str, bool] = {}
+
+# ---------------------------------------------------------------------------
+# Web Chat clients and history storage (channel: cloud_link, chat_id: dashboard)
+# ---------------------------------------------------------------------------
+_web_chat_clients: set[WebSocket] = set()
+_HISTORY_PATH = Path("data/web_chat_history.json")
+
+
+def _load_chat_history() -> list[dict]:
+    try:
+        if _HISTORY_PATH.exists():
+            return json.loads(_HISTORY_PATH.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning("Failed to load chat history: %s", e)
+    return []
+
+
+def _save_chat_history(history: list[dict]) -> None:
+    try:
+        _HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _HISTORY_PATH.write_text(
+            json.dumps(history[-80:], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        logger.warning("Failed to save chat history: %s", e)
+
+
+_web_chat_history: list[dict] = _load_chat_history()
+
+
+def _notify_web_chat_device_status(online: bool, device_id: str = "") -> None:
+    if not _web_chat_clients:
+        return
+    frame = json.dumps({
+        "type": "device_status",
+        "online": online,
+        "device_id": device_id,
+        "devices": registry.connected_devices(),
+    })
+    for ws in list(_web_chat_clients):
+        try:
+            asyncio.create_task(ws.send_text(frame))
+        except Exception:
+            pass
+
+
+_last_photo_timestamp: float = 0.0
+_last_photo_consumed: bool = True
+
+
+def record_new_photo() -> None:
+    """Flag that a new camera photo has been captured/uploaded."""
+    global _last_photo_timestamp, _last_photo_consumed
+    _last_photo_timestamp = time.time()
+    _last_photo_consumed = False
+
+
+def pop_recent_photo_url() -> str | None:
+    """Consume and return the URL of a recently captured photo if available within 45s."""
+    global _last_photo_consumed
+    if not _last_photo_consumed and (time.time() - _last_photo_timestamp) < 45.0:
+        _last_photo_consumed = True
+        return f"/api/camera/last-photo?t={int(_last_photo_timestamp * 1000)}"
+    return None
+
+
+async def _broadcast_to_web_chat(chat_id: str, text: str, image: str | None = None) -> None:
+    if not _web_chat_clients:
+        return
+    if text == "⏳ Thinking...":
+        frame = json.dumps({"type": "status", "status": "thinking"})
+    else:
+        img_url = image or pop_recent_photo_url()
+        msg: dict[str, Any] = {
+            "id": f"{int(time.time() * 1000)}-agent",
+            "role": "agent",
+            "text": text,
+            "ts": int(time.time() * 1000),
+        }
+        if img_url:
+            msg["image"] = img_url
+
+        _web_chat_history.append(msg)
+        if len(_web_chat_history) > 80:
+            _web_chat_history.pop(0)
+        _save_chat_history(_web_chat_history)
+        frame = json.dumps({
+            "type": "response",
+            "content": text,
+            "message": msg,
+            "image": img_url,
+            "chat_id": chat_id,
+        })
+
+    dead = []
+    for ws in list(_web_chat_clients):
+        try:
+            await ws.send_text(frame)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        _web_chat_clients.discard(ws)
+
 
 
 def _build_gateway() -> TelegramGateway | None:
@@ -138,6 +244,7 @@ async def ws_device(websocket: WebSocket, key: str = Query("")):
     }))
     logger.info("Device %s connected (fw=%s) — %d device(s) online",
                 device_id, hello.get("fw", "?"), len(registry.connected_devices()))
+    _notify_web_chat_device_status(True, device_id)
 
     # --- frame loop -----------------------------------------------------------
     try:
@@ -153,24 +260,26 @@ async def ws_device(websocket: WebSocket, key: str = Query("")):
             ftype = frame.get("type")
 
             if ftype == "message_out":
-                gw = get_gateway()
-                if gw is None:
-                    await websocket.send_text(json.dumps(
-                        {"type": "error", "detail": "gateway not configured"}))
-                    continue
                 chat_id = str(frame.get("chat_id", ""))
                 text = str(frame.get("text", ""))
                 if not chat_id or not text:
                     await websocket.send_text(json.dumps(
                         {"type": "error", "detail": "message_out needs chat_id+text"}))
                     continue
+
+                if chat_id == "dashboard" or chat_id.startswith("ws_"):
+                    asyncio.create_task(_broadcast_to_web_chat(chat_id, text))
+                    continue
+
+                gw = get_gateway()
+                if gw is None:
+                    await websocket.send_text(json.dumps(
+                        {"type": "error", "detail": "gateway not configured"}))
+                    continue
                 # Fire-and-forget so the receive loop keeps reading frames
                 asyncio.create_task(_send_logged(gw, chat_id, text))
 
             elif ftype == "photo_out":
-                gw = get_gateway()
-                if gw is None:
-                    continue
                 import base64
                 chat_id = str(frame.get("chat_id", ""))
                 caption = str(frame.get("caption", ""))
@@ -180,7 +289,18 @@ async def ws_device(websocket: WebSocket, key: str = Query("")):
                     await websocket.send_text(json.dumps(
                         {"type": "error", "detail": "photo_out image_b64 invalid"}))
                     continue
-                asyncio.create_task(_photo_logged(gw, chat_id, image, caption))
+
+                last_photo_path = Path(__file__).parent.parent / "data" / "last_photo.jpg"
+                last_photo_path.parent.mkdir(parents=True, exist_ok=True)
+                last_photo_path.write_bytes(image)
+                record_new_photo()
+
+                gw = get_gateway()
+                if gw and chat_id and chat_id != "dashboard":
+                    asyncio.create_task(_photo_logged(gw, chat_id, image, caption))
+
+                if chat_id == "dashboard" or not gw:
+                    asyncio.create_task(_broadcast_to_web_chat(chat_id, caption or "📸 Photo captured"))
 
             elif ftype == "llm.request":
                 request_id = frame.get("request_id")
@@ -211,6 +331,8 @@ async def ws_device(websocket: WebSocket, key: str = Query("")):
                 fut = _pending_voice_listen.pop(device_id, None)
                 if fut and not fut.done():
                     fut.set_result(frame)
+            elif ftype == "camera_stream_status":
+                logger.info("Camera stream status from %s: %s", device_id, frame)
             elif ftype == "device_sync_report":
                 memory_md = frame.get("memory_md")
                 jobs = frame.get("jobs")
@@ -240,6 +362,122 @@ async def ws_device(websocket: WebSocket, key: str = Query("")):
         registry.mark_offline(device_id)
         logger.info("Device %s removed — %d device(s) online",
                     device_id, len(registry.connected_devices()))
+        _notify_web_chat_device_status(len(registry.connected_devices()) > 0)
+
+
+# ---------------------------------------------------------------------------
+# Web Chat WebSocket Relay endpoint
+# ---------------------------------------------------------------------------
+
+@router.websocket("/ws/chat")
+async def ws_chat(websocket: WebSocket):
+    await websocket.accept()
+    _web_chat_clients.add(websocket)
+    try:
+        online_devices = registry.connected_devices()
+        await websocket.send_text(json.dumps({
+            "type": "init",
+            "online": len(online_devices) > 0,
+            "devices": online_devices,
+            "history": _web_chat_history,
+        }))
+
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+
+            action = data.get("type")
+            if action == "clear":
+                _web_chat_history.clear()
+                _save_chat_history(_web_chat_history)
+                devs = registry.connected_devices()
+                if devs:
+                    dev_id = devs[0]
+                    _, dws = registry.get_connection(dev_id)
+                    if dws:
+                        try:
+                            await dws.send_text(json.dumps({
+                                "type": "message_in",
+                                "chat_id": "dashboard",
+                                "text": "/clear",
+                            }))
+                        except Exception:
+                            pass
+                await websocket.send_text(json.dumps({"type": "cleared"}))
+
+            elif action == "message":
+                text = str(data.get("content") or "").strip()
+                if not text:
+                    continue
+                user_msg = {
+                    "id": f"{int(time.time() * 1000)}-user",
+                    "role": "user",
+                    "text": text,
+                    "ts": int(time.time() * 1000),
+                }
+                _web_chat_history.append(user_msg)
+                if len(_web_chat_history) > 80:
+                    _web_chat_history.pop(0)
+                _save_chat_history(_web_chat_history)
+
+                # Broadcast user message to other open browser tabs
+                for ws in list(_web_chat_clients):
+                    if ws != websocket:
+                        try:
+                            await ws.send_text(json.dumps({
+                                "type": "message",
+                                "message": user_msg,
+                            }))
+                        except Exception:
+                            pass
+
+                # Forward to ESP32 device
+                devs = registry.connected_devices()
+                if not devs:
+                    sys_msg = {
+                        "id": f"{int(time.time() * 1000)}-sys",
+                        "role": "system",
+                        "text": "⚠️ ESP32 设备当前未连接。请确保设备已开机并已连接到 Wi-Fi。",
+                        "ts": int(time.time() * 1000),
+                    }
+                    await websocket.send_text(json.dumps({
+                        "type": "response",
+                        "content": sys_msg["text"],
+                        "message": sys_msg,
+                    }))
+                    continue
+
+                dev_id = devs[0]
+                _, dws = registry.get_connection(dev_id)
+                if dws is None:
+                    await websocket.send_text(json.dumps({
+                        "type": "response",
+                        "content": "⚠️ 设备连接异常断开。",
+                        "role": "system",
+                    }))
+                    continue
+
+                try:
+                    await dws.send_text(json.dumps({
+                        "type": "message_in",
+                        "chat_id": "dashboard",
+                        "text": text,
+                    }))
+                except Exception as e:
+                    logger.warning("Failed to forward chat to device %s: %s", dev_id, e)
+                    await websocket.send_text(json.dumps({
+                        "type": "response",
+                        "content": f"⚠️ 发送失败: {e}",
+                        "role": "system",
+                    }))
+    except WebSocketDisconnect:
+        pass
+    finally:
+        _web_chat_clients.discard(websocket)
+
 
 
 async def _send_logged(gateway, chat_id: str, text: str) -> None:

@@ -1,4 +1,5 @@
 #include "display_status.h"
+#include "display_face.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -193,13 +194,46 @@ static esp_err_t display_hw_init(void)
     s_hw_ready = true;
     ESP_LOGI(TAG, "OLED text display ready (SCL GPIO %d, SDA GPIO %d, addr 0x%02X)",
              MIMI_GPIO_OLED_SCL, MIMI_GPIO_OLED_SDA, s_found_addr);
+
+    /* Initialize expressive animated face engine with panel device and lock */
+    display_face_init(s_dev, s_lock);
     return ESP_OK;
+}
+
+static face_state_t map_status_to_face(const char *l1, const char *l2)
+{
+    if (!l1 || !l1[0]) return FACE_STATE_IDLE;
+    if (strcasecmp(l1, "Say Hey ESPET") == 0 || strcasecmp(l1, "idle") == 0) {
+        return FACE_STATE_IDLE;
+    }
+    if (strcasestr(l1, "Listening") || strcasestr(l1, "Say command")) {
+        return FACE_STATE_LISTEN;
+    }
+    if (strcasestr(l1, "Thinking") || strcasestr(l1, "Transcribing") || strcasestr(l1, "Msg received")) {
+        return FACE_STATE_THINK;
+    }
+    if (strcasestr(l1, "Replying") || strcasestr(l1, "Speaking")) {
+        return FACE_STATE_SPEAK;
+    }
+    if (strcasestr(l1, "Snapped") || strcasestr(l1, "Photo Sent") || strstr(l1, "Done:")) {
+        return FACE_STATE_HAPPY;
+    }
+    /* Fall back to raw text for setup, pairing, or diagnostics */
+    return FACE_STATE_TEXT;
 }
 
 static void display_status_output(const char *line1, const char *line2)
 {
     ESP_LOGI(TAG, "[%-22s] %s", line1 ? line1 : "", line2 ? line2 : "");
     if (display_hw_init() != ESP_OK || s_dev == NULL) return;
+
+    face_state_t target_face = map_status_to_face(line1, line2);
+    if (target_face != FACE_STATE_TEXT) {
+        display_face_set_state(target_face);
+        return;
+    }
+
+    display_face_set_state(FACE_STATE_TEXT);
 
     ssd1306_clear_screen(s_dev, 0x00);
     if (line1 && line1[0])
@@ -243,5 +277,5 @@ void display_status_set(const char *line1, const char *line2)
 
 void display_status_idle(void)
 {
-    display_status_set("Say Hey ESPET", "");
+    display_face_set_state(FACE_STATE_IDLE);
 }

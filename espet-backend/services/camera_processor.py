@@ -3,9 +3,18 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field
+from typing import Awaitable, Callable
 
 from config import settings
 from services.owner_face_service import owner_face_service
+
+OwnerWelcomeCallback = Callable[[str, str], Awaitable[bool]]
+_owner_welcome_callback: OwnerWelcomeCallback | None = None
+
+
+def set_owner_welcome_callback(callback: OwnerWelcomeCallback | None) -> None:
+    global _owner_welcome_callback
+    _owner_welcome_callback = callback
 
 
 @dataclass
@@ -28,11 +37,14 @@ class CameraStreamState:
     owner_similarity: float = 0.0
     owner_face_error: str | None = None
     owner_face_enrolled: bool = False
+    owner_welcome_last_ts: float = 0.0
     frame_event: asyncio.Condition = field(default_factory=asyncio.Condition)
 
     _last_frame_ts: float = 0.0
     _last_face_check_ts: float = 0.0
     _face_task: asyncio.Task | None = None
+    _owner_confirm_count: int = 0
+    _owner_return_pending: bool = False
 
     async def update_frame(self, jpeg: bytes) -> None:
         now = time.time()
@@ -69,12 +81,41 @@ class CameraStreamState:
             self.owner_face_enrolled = bool(result.get("enrolled"))
             self.owner_face_error = result.get("error")
             self.owner_similarity = float(result.get("best_similarity") or 0.0)
-            self.owner_detected = bool(result.get("owner_detected"))
-            if self.owner_detected:
-                self.owner_last_seen_ts = time.time()
+            detected = bool(result.get("owner_detected"))
+            now = time.time()
+            self.owner_detected = detected
+            if detected:
+                if self._owner_confirm_count == 0:
+                    self._owner_return_pending = (
+                        self.owner_last_seen_ts <= 0
+                        or now - self.owner_last_seen_ts >= settings.camera_owner_welcome_absence_s
+                    )
+                self._owner_confirm_count += 1
+                self.owner_last_seen_ts = now
+                await self._maybe_trigger_owner_welcome(now)
+            else:
+                self._owner_confirm_count = 0
+                self._owner_return_pending = False
         finally:
             async with self.frame_event:
                 self.frame_event.notify_all()
+
+    async def _maybe_trigger_owner_welcome(self, now: float) -> None:
+        if not settings.camera_owner_welcome_enabled:
+            return
+        if self._owner_confirm_count < max(1, settings.camera_owner_welcome_confirm_count):
+            return
+        if not self._owner_return_pending:
+            return
+        if now - self.owner_welcome_last_ts < settings.camera_owner_welcome_cooldown_s:
+            return
+        if not _owner_welcome_callback:
+            return
+        text = settings.camera_owner_welcome_text.strip() or "Hi owner, welcome back."
+        ok = await _owner_welcome_callback(self.device_id, text)
+        if ok:
+            self.owner_welcome_last_ts = now
+            self._owner_return_pending = False
 
     def snapshot(self, mode: str = "processed") -> bytes | None:
         if mode == "raw":
@@ -104,6 +145,7 @@ class CameraStreamState:
             "owner_similarity": round(self.owner_similarity, 3),
             "owner_face_enrolled": self.owner_face_enrolled,
             "owner_face_error": self.owner_face_error,
+            "owner_welcome_last_ts": self.owner_welcome_last_ts,
         }
 
 

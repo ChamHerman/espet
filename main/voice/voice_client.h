@@ -51,6 +51,12 @@ bool voice_client_is_listen_enabled(void);
 bool voice_client_speak(const char *text);
 
 /**
+ * @brief Speak text while showing explicit OLED lines instead of auto-splitting
+ *        the spoken text. Useful for event alerts like Owner Detected.
+ */
+bool voice_client_speak_with_display(const char *text, const char *line1, const char *line2);
+
+/**
  * @brief Structured STT result including wake word match status.
  */
 typedef struct {
@@ -70,6 +76,12 @@ bool voice_client_transcribe_full(const int16_t *pcm, size_t samples, voice_stt_
  * Returns heap-allocated string (caller frees), or NULL on failure.
  */
 char *voice_client_transcribe(const int16_t *pcm, size_t samples);
+
+/**
+ * @brief Multimodal vision query sending camera JPEG + optional query to backend (/api/camera/vision-query).
+ * Returns heap-allocated response string (caller frees), or NULL on failure.
+ */
+char *voice_client_vision_query(const uint8_t *jpeg_data, size_t jpeg_len, const char *query);
 
 #ifdef __cplusplus
 }

@@ -1,12 +1,21 @@
 #include "tools/tool_camera.h"
+#include "mimi_config.h"
+#include "sync/backend_discovery.h"
 #include "esp_log.h"
+#include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
+#include "esp_mac.h"
 #include "esp_timer.h"
+#include "esp_websocket_client.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
+#include <stdio.h>
 #include <string.h>
 
 static const char *TAG = "tool_camera";
+static SemaphoreHandle_t s_cam_mutex = NULL;
+static volatile bool s_video_running = false;
 
 // ESP32-S3 Camera Pins (as provided by user)
 #define CAM_PIN_PWDN    -1 // Not connected
@@ -28,6 +37,14 @@ static const char *TAG = "tool_camera";
 
 esp_err_t tool_camera_init(void)
 {
+    if (!s_cam_mutex) {
+        s_cam_mutex = xSemaphoreCreateBinary();
+        if (!s_cam_mutex) {
+            return ESP_ERR_NO_MEM;
+        }
+        xSemaphoreGive(s_cam_mutex);
+    }
+
     camera_config_t camera_config = {
         .pin_pwdn = CAM_PIN_PWDN,
         .pin_reset = CAM_PIN_RESET,
@@ -56,7 +73,7 @@ esp_err_t tool_camera_init(void)
         .jpeg_quality = 12,             // 0-63, lower is better quality
         .fb_count = 2,                  // Number of frame buffers
         .fb_location = CAMERA_FB_IN_PSRAM,
-        .grab_mode = CAMERA_GRAB_WHEN_EMPTY
+        .grab_mode = CAMERA_GRAB_LATEST
     };
 
     // Initialize the camera
@@ -78,13 +95,28 @@ esp_err_t tool_camera_init(void)
 
 camera_fb_t* tool_camera_take_picture(void)
 {
-    ESP_LOGI(TAG, "Taking picture...");
+    ESP_LOGI(TAG, "Taking picture (flushing stale frame)...");
+    if (s_cam_mutex && xSemaphoreTake(s_cam_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        ESP_LOGE(TAG, "Camera busy");
+        return NULL;
+    }
+
+    /* With CAMERA_GRAB_LATEST and fb_count=2, discard the pre-buffered frame
+     * so that the driver captures a brand new frame exposed right now. */
+    camera_fb_t *stale_fb = esp_camera_fb_get();
+    if (stale_fb) {
+        esp_camera_fb_return(stale_fb);
+    }
+
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) {
         ESP_LOGE(TAG, "Camera capture failed");
+        if (s_cam_mutex) {
+            xSemaphoreGive(s_cam_mutex);
+        }
         return NULL;
     }
-    ESP_LOGI(TAG, "Picture taken! Size: %zu bytes", fb->len);
+    ESP_LOGI(TAG, "Picture taken! Size: %zu bytes (fresh frame)", fb->len);
     return fb;
 }
 
@@ -93,6 +125,200 @@ void tool_camera_return_picture(camera_fb_t *fb)
     if (fb) {
         esp_camera_fb_return(fb);
     }
+    if (s_cam_mutex) {
+        xSemaphoreGive(s_cam_mutex);
+    }
+}
+
+/* -----------------------------------------------------------------------
+ * Live camera streaming: raw JPEG frames -> backend binary WebSocket.
+ * --------------------------------------------------------------------- */
+
+static volatile bool s_stream_running = false;
+static int s_stream_fps = MIMI_CAM_STREAM_FPS_DEFAULT;
+static TaskHandle_t s_stream_task = NULL;
+static StackType_t *s_stream_stack = NULL;
+static StaticTask_t *s_stream_tcb = NULL;
+
+static void build_camera_ws_url(char *url, size_t url_sz)
+{
+    char base[96];
+    char device_id[20];
+    uint8_t mac[6] = {0};
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    snprintf(device_id, sizeof(device_id), "ESP-%02X%02X%02X%02X%02X%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    backend_discovery_base_url(base, sizeof(base));
+    if (strncmp(base, "http://", 7) == 0) {
+        snprintf(url, url_sz, "ws://%s/api/camera/ws/device?key=%s&device_id=%s",
+                 base + 7, MIMI_BACKEND_API_KEY, device_id);
+    } else if (strncmp(base, "https://", 8) == 0) {
+        snprintf(url, url_sz, "wss://%s/api/camera/ws/device?key=%s&device_id=%s",
+                 base + 8, MIMI_BACKEND_API_KEY, device_id);
+    } else {
+        snprintf(url, url_sz, "ws://%s/api/camera/ws/device?key=%s&device_id=%s",
+                 base, MIMI_BACKEND_API_KEY, device_id);
+    }
+}
+
+static void camera_stream_task(void *arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG, "Camera stream task started");
+
+    while (s_stream_running) {
+        char url[192];
+        build_camera_ws_url(url, sizeof(url));
+
+        esp_websocket_client_config_t cfg = {
+            .uri = url,
+            .network_timeout_ms = 3000,
+            .buffer_size = 4096,
+            .task_stack = 4096,
+            .disable_auto_reconnect = true,
+            .crt_bundle_attach = esp_crt_bundle_attach,
+        };
+        esp_websocket_client_handle_t ws = esp_websocket_client_init(&cfg);
+        if (!ws || esp_websocket_client_start(ws) != ESP_OK) {
+            ESP_LOGW(TAG, "Camera stream WS connect failed; retrying");
+            if (ws) {
+                esp_websocket_client_destroy(ws);
+            }
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        int wait_ms = 0;
+        while (s_stream_running && !esp_websocket_client_is_connected(ws) && wait_ms < 3000) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            wait_ms += 100;
+        }
+        if (!s_stream_running || !esp_websocket_client_is_connected(ws)) {
+            ESP_LOGW(TAG, "Camera stream WS did not connect; retrying");
+            esp_websocket_client_stop(ws);
+            esp_websocket_client_destroy(ws);
+            if (s_stream_running) {
+                vTaskDelay(pdMS_TO_TICKS(1000));
+            }
+            continue;
+        }
+
+        ESP_LOGI(TAG, "Camera stream connected at %d fps", s_stream_fps);
+        int consecutive_send_failures = 0;
+
+        while (s_stream_running && esp_websocket_client_is_connected(ws)) {
+            TickType_t start = xTaskGetTickCount();
+            camera_fb_t *fb = NULL;
+            if (!s_cam_mutex || xSemaphoreTake(s_cam_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+                fb = esp_camera_fb_get();
+                if (fb) {
+                    int sent = esp_websocket_client_send_bin(ws, (const char *)fb->buf,
+                                                             (int)fb->len, pdMS_TO_TICKS(200));
+                    if (sent < 0) {
+                        consecutive_send_failures++;
+                        ESP_LOGW(TAG, "Camera stream frame send failed (%d); dropping frame",
+                                 consecutive_send_failures);
+                    } else {
+                        consecutive_send_failures = 0;
+                    }
+                    esp_camera_fb_return(fb);
+                }
+                if (s_cam_mutex) {
+                    xSemaphoreGive(s_cam_mutex);
+                }
+            }
+
+            if (consecutive_send_failures >= 3) {
+                ESP_LOGW(TAG, "Camera stream send stalled; reconnecting WS");
+                break;
+            }
+
+            int fps = s_stream_fps;
+            if (fps < 1) fps = 1;
+            if (fps > MIMI_CAM_STREAM_FPS_MAX) fps = MIMI_CAM_STREAM_FPS_MAX;
+            TickType_t frame_delay = pdMS_TO_TICKS(1000 / fps);
+            TickType_t elapsed = xTaskGetTickCount() - start;
+            if (elapsed < frame_delay) {
+                vTaskDelay(frame_delay - elapsed);
+            } else {
+                vTaskDelay(1);
+            }
+        }
+
+        esp_websocket_client_stop(ws);
+        esp_websocket_client_destroy(ws);
+        if (s_stream_running) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+    }
+
+    ESP_LOGI(TAG, "Camera stream stopped");
+    s_stream_running = false;
+    s_stream_task = NULL;
+    vTaskDelete(NULL);
+}
+
+esp_err_t tool_camera_stream_start(int fps)
+{
+    if (fps <= 0) {
+        fps = MIMI_CAM_STREAM_FPS_DEFAULT;
+    }
+    if (fps > MIMI_CAM_STREAM_FPS_MAX) {
+        fps = MIMI_CAM_STREAM_FPS_MAX;
+    }
+    if (s_stream_running) {
+        s_stream_fps = fps;
+        return ESP_OK;
+    }
+    if (s_video_running) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (!s_stream_task) {
+        free(s_stream_stack); s_stream_stack = NULL;
+        free(s_stream_tcb);   s_stream_tcb = NULL;
+    }
+
+    s_stream_fps = fps;
+    s_stream_running = true;
+    s_stream_stack = heap_caps_malloc(MIMI_CAM_STREAM_STACK * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+    s_stream_tcb = heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (s_stream_stack && s_stream_tcb) {
+        s_stream_task = xTaskCreateStaticPinnedToCore(camera_stream_task, "cam_stream",
+                                                      MIMI_CAM_STREAM_STACK, NULL, 5,
+                                                      s_stream_stack, s_stream_tcb,
+                                                      MIMI_CAM_STREAM_CORE);
+    }
+    if (!s_stream_task) {
+        free(s_stream_stack); s_stream_stack = NULL;
+        free(s_stream_tcb);   s_stream_tcb = NULL;
+        if (xTaskCreatePinnedToCore(camera_stream_task, "cam_stream", 3072, NULL, 5,
+                                    &s_stream_task, MIMI_CAM_STREAM_CORE) != pdPASS) {
+            s_stream_running = false;
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    return ESP_OK;
+}
+
+esp_err_t tool_camera_stream_stop(void)
+{
+    s_stream_running = false;
+    int64_t deadline = esp_timer_get_time() + 3000000;
+    while (s_stream_task != NULL && esp_timer_get_time() < deadline) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    if (!s_stream_task) {
+        free(s_stream_stack); s_stream_stack = NULL;
+        free(s_stream_tcb);   s_stream_tcb = NULL;
+        return ESP_OK;
+    }
+    return ESP_ERR_TIMEOUT;
+}
+
+bool tool_camera_stream_is_running(void)
+{
+    return s_stream_running;
 }
 
 /* -----------------------------------------------------------------------
@@ -114,7 +340,6 @@ void tool_camera_return_picture(camera_fb_t *fb)
 #define VID_MAX_FRAMES     300u                  /* ~30 s at VID_FPS */
 #define VID_AVI_MAX_BYTES  (VID_MAX_BYTES + 16u * VID_MAX_FRAMES + 1024u)
 
-static volatile bool s_video_running = false;
 static TaskHandle_t s_video_task = NULL;
 static StackType_t *s_video_stack = NULL;     /* PSRAM-allocated */
 static StaticTask_t *s_video_tcb = NULL;      /* internal RAM */
@@ -226,9 +451,18 @@ static void video_task(void *arg)
     while (s_video_running) {
         int64_t frame_start_us = esp_timer_get_time();
 
-        camera_fb_t *fb = esp_camera_fb_get();
+        camera_fb_t *fb = NULL;
+        if (s_cam_mutex && xSemaphoreTake(s_cam_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+            ESP_LOGW(TAG, "Camera busy during video frame");
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+        fb = esp_camera_fb_get();
         if (!fb) {
             ESP_LOGW(TAG, "Failed to capture video frame");
+            if (s_cam_mutex) {
+                xSemaphoreGive(s_cam_mutex);
+            }
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
@@ -253,6 +487,9 @@ static void video_task(void *arg)
         }
 
         esp_camera_fb_return(fb);
+        if (s_cam_mutex) {
+            xSemaphoreGive(s_cam_mutex);
+        }
 
         if (!s_video_running) {
             break;
@@ -278,6 +515,10 @@ void tool_camera_video_start(void)
     if (s_video_running || s_vid_buf) {
         ESP_LOGW(TAG, "Cannot start video: previous capture still running or not released");
         return;
+    }
+    if (s_stream_running) {
+        ESP_LOGW(TAG, "Stopping live stream before video capture");
+        tool_camera_stream_stop();
     }
 
     s_vid_buf = heap_caps_calloc(1, VID_AVI_MAX_BYTES, MALLOC_CAP_SPIRAM);

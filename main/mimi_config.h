@@ -169,6 +169,12 @@
 #define MIMI_WS_PORT 18789
 #define MIMI_WS_MAX_CLIENTS 4
 
+/* Camera live streaming (backend-demanded MJPEG relay) */
+#define MIMI_CAM_STREAM_FPS_DEFAULT 8
+#define MIMI_CAM_STREAM_FPS_MAX 15
+#define MIMI_CAM_STREAM_STACK 4096
+#define MIMI_CAM_STREAM_CORE 0
+
 /* Serial CLI */
 #define MIMI_CLI_STACK (4 * 1024)
 #define MIMI_CLI_PRIO 3

@@ -31,6 +31,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "cJSON.h"
+#include "esp_mac.h"
+#include "mbedtls/base64.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -180,12 +182,27 @@ typedef struct {
     size_t len;
     size_t cap;
     bool oom;
+    char oled_line1[17];
+    char oled_line2[17];
 } rx_buf_t;
 
 static esp_err_t rx_event_handler(esp_http_client_event_t *evt)
 {
     rx_buf_t *rx = (rx_buf_t *)evt->user_data;
-    if (evt->event_id != HTTP_EVENT_ON_DATA || rx == NULL || evt->data_len == 0) {
+    if (rx == NULL) {
+        return ESP_OK;
+    }
+    if (evt->event_id == HTTP_EVENT_ON_HEADER && evt->header_key && evt->header_value) {
+        if (strcasecmp(evt->header_key, "X-OLED-Line1") == 0) {
+            strncpy(rx->oled_line1, evt->header_value, sizeof(rx->oled_line1) - 1);
+            rx->oled_line1[sizeof(rx->oled_line1) - 1] = '\0';
+        } else if (strcasecmp(evt->header_key, "X-OLED-Line2") == 0) {
+            strncpy(rx->oled_line2, evt->header_value, sizeof(rx->oled_line2) - 1);
+            rx->oled_line2[sizeof(rx->oled_line2) - 1] = '\0';
+        }
+        return ESP_OK;
+    }
+    if (evt->event_id != HTTP_EVENT_ON_DATA || evt->data_len == 0) {
         return ESP_OK;
     }
     if (rx->len + evt->data_len > rx->cap) {
@@ -373,12 +390,154 @@ char *voice_client_transcribe(const int16_t *pcm, size_t samples)
     return ret;
 }
 
+char *voice_client_vision_query(const uint8_t *jpeg_data, size_t jpeg_len, const char *query)
+{
+    if (!jpeg_data || jpeg_len == 0) return NULL;
+
+    rx_buf_t *rx = heap_caps_calloc(1, sizeof(rx_buf_t), MALLOC_CAP_SPIRAM);
+    if (!rx) return NULL;
+    rx->cap = 16 * 1024;
+    rx->buf = heap_caps_calloc(1, rx->cap, MALLOC_CAP_SPIRAM);
+    if (!rx->buf) {
+        free(rx);
+        return NULL;
+    }
+
+    char url[160];
+    voice_backend_url(url, sizeof(url), "/api/camera/vision-query");
+
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = 40000,
+        .event_handler = rx_event_handler,
+        .user_data = rx,
+        .buffer_size = 4096,
+        .buffer_size_tx = 4096,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) {
+        free(rx->buf);
+        free(rx);
+        return NULL;
+    }
+
+    esp_http_client_set_header(client, "Authorization", "Bearer " MIMI_BACKEND_API_KEY);
+    esp_http_client_set_header(client, "Content-Type", "image/jpeg");
+
+    uint8_t mac[6] = {0};
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    char dev_id[32];
+    snprintf(dev_id, sizeof(dev_id), "ESP-%02X%02X%02X%02X%02X%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    esp_http_client_set_header(client, "X-Device-Id", dev_id);
+
+    /* If query provided, base64-encode it into X-Query-B64 header */
+    if (query && query[0] != '\0') {
+        size_t qlen = strlen(query);
+        size_t b64_max = ((qlen + 2) / 3) * 4 + 4;
+        char *b64_buf = (char *)malloc(b64_max);
+        if (b64_buf) {
+            size_t olen = 0;
+            if (mbedtls_base64_encode((unsigned char *)b64_buf, b64_max, &olen,
+                                      (const unsigned char *)query, qlen) == 0) {
+                b64_buf[olen] = '\0';
+                esp_http_client_set_header(client, "X-Query-B64", b64_buf);
+            }
+            free(b64_buf);
+        }
+    }
+
+    esp_http_client_set_post_field(client, (const char *)jpeg_data, (int)jpeg_len);
+
+    uint32_t t0 = (uint32_t)(esp_timer_get_time() / 1000);
+    esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+    uint32_t dt = (uint32_t)(esp_timer_get_time() / 1000) - t0;
+
+    char *reply = NULL;
+    if (err == ESP_OK && status == 200 && !rx->oom && rx->len > 0) {
+        rx->buf[rx->len < rx->cap - 1 ? rx->len : rx->cap - 1] = '\0';
+        cJSON *j = cJSON_Parse((const char *)rx->buf);
+        if (j) {
+            cJSON *rep_item = cJSON_GetObjectItem(j, "reply");
+            if (cJSON_IsString(rep_item) && rep_item->valuestring[0] != '\0') {
+                reply = strdup(rep_item->valuestring);
+            }
+            cJSON_Delete(j);
+        }
+        ESP_LOGI(TAG, "Vision query OK in %u ms (%u bytes img): '%.60s'",
+                 (unsigned)dt, (unsigned)jpeg_len, reply ? reply : "");
+    } else {
+        ESP_LOGE(TAG, "Vision query FAILED: err=%s status=%d len=%u (%u ms)",
+                 esp_err_to_name(err), status, (unsigned)rx->len, (unsigned)dt);
+        backend_discovery_invalidate();
+    }
+
+    free(rx->buf);
+    free(rx);
+    return reply;
+}
+
 /* -----------------------------------------------------------------------
  * TTS speak: text → WAV → speaker
  * --------------------------------------------------------------------- */
 
-static uint8_t *voice_tts_fetch(const char *text, size_t *out_len)
+static void word_wrap_oled(const char *text, char *l1, size_t l1_sz, char *l2, size_t l2_sz)
 {
+    if (l1 && l1_sz > 0) l1[0] = '\0';
+    if (l2 && l2_sz > 0) l2[0] = '\0';
+    if (!text || !*text || !l1 || !l2) return;
+
+    size_t tlen = strlen(text);
+    if (tlen < l1_sz) {
+        strncpy(l1, text, l1_sz - 1);
+        l1[l1_sz - 1] = '\0';
+        return;
+    }
+
+    /* Find last space before index 16 */
+    int split1 = 16;
+    while (split1 > 0 && text[split1] != ' ' && text[split1] != '\0') {
+        split1--;
+    }
+    if (split1 == 0) {
+        split1 = 16; /* No space found in first 16 chars, hard break */
+    }
+
+    int copy1 = split1 < (int)l1_sz ? split1 : (int)l1_sz - 1;
+    strncpy(l1, text, copy1);
+    l1[copy1] = '\0';
+
+    /* Advance past spaces for line 2 */
+    const char *p2 = text + split1;
+    while (*p2 == ' ') p2++;
+
+    if (*p2) {
+        int split2 = 16;
+        size_t rem = strlen(p2);
+        if (rem < (size_t)split2) {
+            split2 = (int)rem;
+        } else {
+            while (split2 > 0 && p2[split2] != ' ' && p2[split2] != '\0') {
+                split2--;
+            }
+            if (split2 == 0) split2 = 16;
+        }
+        int copy2 = split2 < (int)l2_sz ? split2 : (int)l2_sz - 1;
+        strncpy(l2, p2, copy2);
+        l2[copy2] = '\0';
+    }
+}
+
+static uint8_t *voice_tts_fetch(const char *text, size_t *out_len,
+                                char *out_l1, size_t out_l1_sz,
+                                char *out_l2, size_t out_l2_sz)
+{
+    if (out_l1 && out_l1_sz > 0) out_l1[0] = '\0';
+    if (out_l2 && out_l2_sz > 0) out_l2[0] = '\0';
+
     char *body = NULL;
     cJSON *j = cJSON_CreateObject();
     if (!j) return NULL;
@@ -388,9 +547,13 @@ static uint8_t *voice_tts_fetch(const char *text, size_t *out_len)
     if (!body) return NULL;
 
     rx_buf_t *rx = heap_caps_calloc(1, sizeof(rx_buf_t), MALLOC_CAP_SPIRAM);
+    if (!rx) {
+        free(body);
+        return NULL;
+    }
     rx->cap = VOICE_HTTP_RX_MAX;
     rx->buf = heap_caps_calloc(1, rx->cap, MALLOC_CAP_SPIRAM);
-    if (!rx || !rx->buf) {
+    if (!rx->buf) {
         free(body);
         free(rx);
         return NULL;
@@ -430,29 +593,53 @@ static uint8_t *voice_tts_fetch(const char *text, size_t *out_len)
     if (err == ESP_OK && status == 200 && !rx->oom && rx->len > 44) {
         *out_len = rx->len;
         wav = rx->buf;
-        ESP_LOGI(TAG, "TTS %u ms, %u bytes WAV", (unsigned)dt, (unsigned)rx->len);
+        rx->buf = NULL; /* Transfer buffer ownership to caller */
+        if (out_l1 && rx->oled_line1[0]) {
+            strncpy(out_l1, rx->oled_line1, out_l1_sz - 1);
+            out_l1[out_l1_sz - 1] = '\0';
+        }
+        if (out_l2 && rx->oled_line2[0]) {
+            strncpy(out_l2, rx->oled_line2, out_l2_sz - 1);
+            out_l2[out_l2_sz - 1] = '\0';
+        }
+        ESP_LOGI(TAG, "TTS %u ms, %u bytes WAV (OLED: '%s' / '%s')",
+                 (unsigned)dt, (unsigned)rx->len,
+                 out_l1 ? out_l1 : "", out_l2 ? out_l2 : "");
     } else {
         ESP_LOGE(TAG, "TTS FAILED: err=%s status=%d oom=%d len=%u (%u ms)",
                  esp_err_to_name(err), status, rx->oom, (unsigned)rx->len, (unsigned)dt);
         display_status_set("Voice err", "check backend");
         backend_discovery_invalidate();
-        free(rx->buf);
-        free(rx);
     }
+    if (rx->buf) {
+        free(rx->buf);
+    }
+    free(rx);
     return wav;
 }
 
-static void voice_speak_internal(const char *text)
+static void voice_speak_internal(const char *text, const char *display_l1, const char *display_l2)
 {
     tool_audio_speaker_session_begin();
     size_t wav_len = 0;
-    uint8_t *wav = voice_tts_fetch(text, &wav_len);
+    char fetched_l1[17] = {0};
+    char fetched_l2[17] = {0};
+    uint8_t *wav = voice_tts_fetch(text, &wav_len, fetched_l1, sizeof(fetched_l1), fetched_l2, sizeof(fetched_l2));
     if (!wav) {
         tool_audio_speaker_session_end();
         tool_audio_beep(BEEP_ERR_HZ, BEEP_MS * 2, BEEP_VOL);
         return;
     }
-    display_status_set("Speaking...", "");
+    if ((display_l1 && display_l1[0]) || (display_l2 && display_l2[0])) {
+        display_status_set(display_l1 ? display_l1 : "", display_l2 ? display_l2 : "");
+    } else if (fetched_l1[0] || fetched_l2[0]) {
+        display_status_set(fetched_l1, fetched_l2);
+    } else if (text && text[0]) {
+        char l1[17] = {0};
+        char l2[17] = {0};
+        word_wrap_oled(text, l1, sizeof(l1), l2, sizeof(l2));
+        display_status_set(l1, l2);
+    }
     esp_err_t perr = tool_audio_play_wav(wav, wav_len);
     free(wav);
     tool_audio_speaker_session_end();
@@ -928,6 +1115,11 @@ static void voice_task(void *arg)
 
 bool voice_client_speak(const char *text)
 {
+    return voice_client_speak_with_display(text, NULL, NULL);
+}
+
+bool voice_client_speak_with_display(const char *text, const char *line1, const char *line2)
+{
     if (!text || !*text) {
         tool_audio_clear_cache();
         s_busy = false;
@@ -936,7 +1128,7 @@ bool voice_client_speak(const char *text)
         return false;
     }
     s_busy = true;
-    voice_speak_internal(text);
+    voice_speak_internal(text, line1, line2);
     /* Echo guard: drop mic input for ECHO_GUARD_MS after playback. The amp
      * tail + room reverb outlive the WAV by hundreds of ms; without this the
      * VAD re-triggered 330 ms after TTS end and Whisper hallucinated the wake

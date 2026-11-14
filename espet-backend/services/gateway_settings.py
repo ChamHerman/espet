@@ -29,6 +29,7 @@ _KEYS = (
     "llm_api_key",
     "llm_base_url",
     "llm_model",
+    "vision_model",
 )
 
 
@@ -49,6 +50,7 @@ class GatewaySettings:
             "llm_api_key": getattr(settings, "llm_api_key", ""),
             "llm_base_url": getattr(settings, "llm_base_url", "https://api.openai.com/v1"),
             "llm_model": getattr(settings, "llm_model", ""),
+            "vision_model": getattr(settings, "vision_model", "sensenova/sensenova-6.8-flash-lite"),
         }
         try:
             if self.persist_path.exists():

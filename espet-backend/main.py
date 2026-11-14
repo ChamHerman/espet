@@ -24,6 +24,7 @@ from api.config_router import router as config_router
 from api.voice_router import router as voice_router
 from api.ui_router import router as ui_router
 from api.cloud_router import router as cloud_router
+from api.camera_router import router as camera_router
 from api.memory_router import router as memory_router
 from mcp.client import mcp_client_manager
 from config import settings
@@ -100,11 +101,14 @@ async def lifespan(app: FastAPI):
     # (falls back to .env); restart_gateway() no-ops when disabled.
     from api.cloud_router import restart_gateway
     restart_gateway()
+    from api.camera_router import start_owner_watch_loop, stop_owner_watch_loop
+    start_owner_watch_loop()
 
     yield  # App is running
 
     # Shutdown
     logger.info("Shutting down ESPET Backend Server...")
+    await stop_owner_watch_loop()
     from services.telegram_gateway import get_gateway as _get_gw, set_gateway as _set_gw
     _gw = _get_gw()
     if _gw:
@@ -164,6 +168,7 @@ app.include_router(auth_router)
 app.include_router(config_router)
 app.include_router(voice_router)
 app.include_router(cloud_router)
+app.include_router(camera_router)
 app.include_router(memory_router)
 
 # Alias /ws/device -> /api/cloud/ws/device for firmware compatibility

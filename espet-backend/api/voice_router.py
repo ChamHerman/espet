@@ -5,7 +5,6 @@ The ESP32 never runs AI models: it captures raw 16 kHz mono 16-bit PCM from
 the INMP441 and POSTs it here, and fetches WAV audio from here to play on the
 MAX98357A. All heavy lifting (Whisper inference, neural TTS) happens on this
 server.
-
 Endpoints (device-key auth):
     POST /api/voice/transcribe  raw PCM/WAV body  -> {"text": "..."}
     POST /api/voice/tts         {"text": "..."}   -> audio/wav (16 kHz mono 16-bit)
@@ -30,6 +29,7 @@ from pydantic import BaseModel
 
 from auth.device_auth import verify_device_key
 from config import settings
+from services.oled_summarizer import extract_oled_keywords
 
 router = APIRouter(prefix="/api/voice", tags=["voice"])
 logger = logging.getLogger("espet-backend.voice")
@@ -644,7 +644,15 @@ async def tts(req: TTSRequest):
         logger.exception("TTS failed")
         raise HTTPException(500, f"tts failed: {e}")
 
-    return Response(content=wav, media_type="audio/wav")
+    line1, line2 = extract_oled_keywords(req.text)
+    headers = {
+        "X-OLED-Line1": line1,
+        "X-OLED-Line2": line2,
+    }
+    logger.info("TTS OLED keywords: L1='%s', L2='%s' (for text: '%.40s...')",
+                line1, line2, req.text)
+
+    return Response(content=wav, media_type="audio/wav", headers=headers)
 
 
 @router.get("/last-capture-audio")

@@ -4,10 +4,10 @@
 
 import { Google } from "@lobehub/icons";
 import { AreaChart, DonutChart } from "@lobehub/charts";
-import { Button, Progress, Statistic } from "antd";
+import { Button, Progress, Space, Statistic, Tag } from "antd";
 import { createStyles } from "antd-style";
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { client } from "../api";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { client, OwnerFaceStatus, ownerFacePreviewUrl, uploadOwnerFace } from "../api";
 import { Icon, type IconName } from "../components/Icon";
 import { humanInterval, useApp } from "../store";
 import { Badge, Card, KV, useLayout } from "../ui";
@@ -74,6 +74,31 @@ const useS = createStyles(({ css }) => ({
     color: #a3a3a3;
     border: 1.5px dashed rgba(163,163,163, 0.5);
   `,
+  ownerCard: css`
+    display: grid;
+    grid-template-columns: 140px 1fr;
+    gap: 16px;
+    align-items: center;
+    @media (max-width: 640px) {
+      grid-template-columns: 1fr;
+    }
+  `,
+  ownerPreview: css`
+    width: 140px;
+    height: 140px;
+    border-radius: 16px;
+    object-fit: cover;
+    background: rgba(255, 255, 255, 0.035);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    display: grid;
+    place-items: center;
+    color: #737373;
+    overflow: hidden;
+    @media (max-width: 640px) {
+      width: 100%;
+      height: 180px;
+    }
+  `,
 }));
 
 /* monochrome chart palette (white → graphite ramp) */
@@ -99,6 +124,10 @@ function sampleHealth(total: number) {
   }
 }
 
+function latestDeviceId(devices: Awaited<ReturnType<typeof client.devices>> | null) {
+  return devices?.latest_device_id || devices?.devices?.[0]?.device_id || "espet_s3_01";
+}
+
 export function HomeView() {
   const { config, health, auth, refreshHealth, refreshAuth, toast, patchConfig } =
     useApp();
@@ -106,10 +135,22 @@ export function HomeView() {
   const { styles: s } = useS();
   const [polling, setPolling] = useState(false);
   const [series, setSeries] = useState<{ t: number; v: number }[]>([]);
+  const [deviceId, setDeviceId] = useState("espet_s3_01");
+  const [ownerFace, setOwnerFace] = useState<OwnerFaceStatus | null>(null);
+  const [ownerPreviewRev, setOwnerPreviewRev] = useState(Date.now());
+  const ownerFileRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     if (health) setSeries(sampleHealth(health.total_tools));
   }, [health]);
+
+  useEffect(() => {
+    client.devices().then((res) => setDeviceId(latestDeviceId(res))).catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
+    client.ownerFaceStatus(deviceId).then(setOwnerFace).catch(() => undefined);
+  }, [deviceId]);
 
   const go = (hash: string) => {
     location.hash = hash;
@@ -214,9 +255,16 @@ export function HomeView() {
         action: () => { window.location.href = "/cloud"; },
         icon: "bot",
       },
+      {
+        label: "Owner face enrolled",
+        done: !!ownerFace?.enrolled,
+        hint: "Upload one clear owner portrait for local Owner Detected alerts.",
+        action: () => ownerFileRef.current?.click(),
+        icon: "camera",
+      },
     ];
     return items;
-  }, [health, auth, config, loginWithGoogle]);
+  }, [health, auth, config, loginWithGoogle, ownerFace]);
 
   const doneCount = checklist.filter((c) => c.done).length;
 
@@ -240,6 +288,95 @@ export function HomeView() {
         <div style={{ color: "#a3a3a3" }}>
           Welcome to your ESPET Control Center — set your agent up in a few
           steps, or explore the menus above.
+        </div>
+      </Card>
+
+      <Card>
+        <div className={styles.cardHead}>
+          <div className={styles.cardTitle}>
+            <Icon name="camera" /> Owner Profile
+          </div>
+          <Badge tone={ownerFace?.enrolled ? "success" : "warning"}>
+            {ownerFace?.enrolled ? "Enrolled" : "Not Set"}
+          </Badge>
+        </div>
+        <div className={s.ownerCard}>
+          {ownerFace?.has_preview ? (
+            <img
+              className={s.ownerPreview}
+              src={ownerFacePreviewUrl(deviceId, ownerPreviewRev)}
+              alt="Owner face preview"
+            />
+          ) : (
+            <div className={s.ownerPreview}>
+              <Icon name="camera" size={34} />
+            </div>
+          )}
+          <div>
+            <div style={{ color: "#f5f5f5", fontWeight: 600, marginBottom: 6 }}>
+              Owner Face Recognition
+            </div>
+            <div style={{ color: "#a3a3a3", fontSize: 13, marginBottom: 12 }}>
+              Upload one clear front-facing owner photo. The backend stores a local face embedding and preview image; live camera matching stays on this computer.
+            </div>
+            <Space wrap>
+              <input
+                ref={ownerFileRef}
+                type="file"
+                accept="image/jpeg,image/png,image/webp"
+                style={{ display: "none" }}
+                onChange={async (e) => {
+                  const file = e.target.files?.[0];
+                  if (!file) return;
+                  try {
+                    const res = await uploadOwnerFace(deviceId, file);
+                    setOwnerFace(res);
+                    setOwnerPreviewRev(Date.now());
+                    toast("Owner face enrolled", "success");
+                  } catch (err) {
+                    toast(err instanceof Error ? err.message : "Owner face enrollment failed", "error");
+                  } finally {
+                    if (ownerFileRef.current) ownerFileRef.current.value = "";
+                  }
+                }}
+              />
+              <Button type="primary" onClick={() => ownerFileRef.current?.click()} icon={<Icon name="camera" size={14} />}>
+                Upload Owner Photo
+              </Button>
+              {ownerFace?.enrolled && (
+                <Button
+                  danger
+                  onClick={async () => {
+                    const res = await client.deleteOwnerFace(deviceId);
+                    setOwnerFace(res);
+                    setOwnerPreviewRev(Date.now());
+                    toast("Owner face removed", "info");
+                  }}
+                >
+                  Remove
+                </Button>
+              )}
+              <Button
+                onClick={async () => {
+                  const res = await client.testOwnerDetection(deviceId);
+                  if (res.detected && res.action_sent) {
+                    toast("Owner detected — welcome action sent", "success");
+                  } else if (!res.detected) {
+                    toast(res.error || "Owner not detected in test window", "error");
+                  } else {
+                    toast("Owner detected, but ESP32 cloud link is offline", "error");
+                  }
+                }}
+              >
+                Test Detection
+              </Button>
+              <Tag bordered={false}>Device <span className="espet-mono">{deviceId}</span></Tag>
+              <Tag bordered={false}>
+                Background Watch {ownerFace?.watch_enabled ? `On · ${ownerFace.watch_sample_s}s / ${ownerFace.watch_interval_s}s` : "Off"}
+              </Tag>
+              {ownerFace?.error && <Tag bordered={false} style={{ color: "#eda7a7" }}>Face AI Not Installed</Tag>}
+            </Space>
+          </div>
         </div>
       </Card>
 

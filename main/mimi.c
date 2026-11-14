@@ -37,56 +37,164 @@
 
 static const char *TAG = "mimi";
 
-extern char s_last_chat_id[64]; // Quick hack to get chat id for camera if needed, or we just rely on telegram_send_to_last_chat logic inside telegram_bot.c
-// But telegram_send_photo needs chat_id. Let's just expose a getter in telegram_bot.h ideally.
-// For now, we'll just log if chat_id isn't known, or we'll send a system event.
+extern char s_last_chat_id[64]; // Tracked by telegram_bot for camera sends
 
-static void on_white_button_short_press(void)
+static camera_fb_t *s_snap_fb = NULL;
+static volatile bool s_snap_in_flight = false;
+
+typedef struct {
+    camera_fb_t *fb;
+    uint32_t hold_ms;
+    size_t samples;
+    double rms;
+} snap_job_t;
+
+static void snap_process_task(void *arg)
 {
-    ESP_LOGI(TAG, "[WHITE BUTTON] Short Press: Capturing Image!");
-    camera_fb_t *fb = tool_camera_take_picture();
-    if (fb) {
-        ESP_LOGI(TAG, "Image Captured! Size: %zu. Sending to Telegram...", fb->len);
-        
-        esp_err_t err = telegram_send_photo_to_last_chat(fb->buf, fb->len, "What do you want to know about this picture?");
-        if (err == ESP_OK) {
-            ESP_LOGI(TAG, "Photo sent successfully!");
-        } else {
-            ESP_LOGE(TAG, "Failed to send photo: %d", err);
-        }
-        
-        tool_camera_return_picture(fb);
+    snap_job_t *job = (snap_job_t *)arg;
+    if (!job) {
+        s_snap_in_flight = false;
+        vTaskDelete(NULL);
+        return;
     }
+
+    camera_fb_t *fb = job->fb;
+    uint32_t hold_ms = job->hold_ms;
+    size_t samples = job->samples;
+    double rms = job->rms;
+    free(job);
+
+    ESP_LOGI(TAG, "[SNAP-TASK] Started: fb=%p len=%u hold=%u ms samples=%u rms=%.1f",
+             fb, (unsigned)(fb ? fb->len : 0), (unsigned)hold_ms, (unsigned)samples, rms);
+
+    if (!fb || !fb->buf || fb->len == 0) {
+        ESP_LOGE(TAG, "[SNAP-TASK] Invalid frame buffer");
+        if (fb) tool_camera_return_picture(fb);
+        s_snap_in_flight = false;
+        display_status_idle();
+        vTaskDelete(NULL);
+        return;
+    }
+
+    /* Check if user held long enough and actually spoke */
+    char *transcript = NULL;
+    if (hold_ms >= 400 && samples >= 4000 && rms > 200.0) {
+        display_status_set("Transcribing...", "");
+        const int16_t *pcm = tool_audio_get_last_capture(NULL, NULL);
+        if (pcm) {
+            ESP_LOGI(TAG, "[SNAP-TASK] Transcribing audio (%u samples)...", (unsigned)samples);
+            transcript = voice_client_transcribe(pcm, samples);
+        }
+    }
+
+    if (transcript && transcript[0] != '\0') {
+        ESP_LOGI(TAG, "📸 Multimodal query: '%s'", transcript);
+        display_status_set("Thinking...", transcript);
+    } else {
+        ESP_LOGI(TAG, "📸 Rule-based snap (hold %u ms, samples %u, rms %.1f)",
+                 (unsigned)hold_ms, (unsigned)samples, rms);
+        display_status_set("Sending...", "Photo");
+    }
+
+    /* Send image and optional voice query to the multimodal backend */
+    ESP_LOGI(TAG, "[SNAP-TASK] Sending vision query to backend (%u bytes img)...", (unsigned)fb->len);
+    char *reply = voice_client_vision_query(fb->buf, fb->len, transcript ? transcript : "");
+    if (reply && reply[0] != '\0') {
+        ESP_LOGI(TAG, "Vision response: '%s'", reply);
+        voice_client_speak(reply);
+        free(reply);
+    } else {
+        ESP_LOGW(TAG, "Vision query returned no reply or failed");
+        display_status_set("Photo Sent!", "");
+    }
+
+    if (transcript) {
+        free(transcript);
+    }
+
+    ESP_LOGI(TAG, "[SNAP-TASK] Returning camera buffer %p", fb);
+    tool_camera_return_picture(fb);
+    ESP_LOGI(TAG, "[SNAP-TASK] Camera buffer returned successfully");
+
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    display_status_idle();
+    s_snap_in_flight = false;
+    vTaskDelete(NULL);
 }
 
-static void on_white_button_long_press(bool is_starting)
+static void on_camera_button_down(void)
 {
-    if (is_starting) {
-        ESP_LOGI(TAG, "[WHITE BUTTON] Long Press: Starting Video Capture");
-        tool_camera_video_start();
-    } else {
-        ESP_LOGI(TAG, "[WHITE BUTTON] Long Press Released: Stopping Video Capture");
-        uint8_t *avi = NULL;
-        size_t avi_len = 0;
-        esp_err_t verr = tool_camera_video_stop_and_get(&avi, &avi_len);
-        if (verr != ESP_OK || !avi) {
-            ESP_LOGW(TAG, "Video capture produced nothing (err=%d)", verr);
-            return;
-        }
+    if (s_snap_in_flight) {
+        ESP_LOGW(TAG, "Camera snapshot already in flight, ignoring press");
+        return;
+    }
 
-        ESP_LOGI(TAG, "Video captured (%u bytes). Sending to Telegram...",
-                 (unsigned)avi_len);
-        esp_err_t err = telegram_send_video_to_last_chat(
-            avi, avi_len, "What do you want to know about this video?");
-        if (err == ESP_OK) {
-            ESP_LOGI(TAG, "Video sent successfully!");
-        } else if (err == ESP_ERR_INVALID_STATE) {
-            ESP_LOGW(TAG, "No Telegram chat known yet — send the bot a "
-                          "message once, then hold the button again");
-        } else {
-            ESP_LOGE(TAG, "Failed to send video: %d", err);
+    ESP_LOGI(TAG, "📸 [CAM BTN] Down: taking snapshot & starting voice capture...");
+    display_status_set("📸 Snapped!", "Hold to speak");
+
+    /* Return any previous unreturned buffer */
+    if (s_snap_fb) {
+        tool_camera_return_picture(s_snap_fb);
+        s_snap_fb = NULL;
+    }
+
+    s_snap_fb = tool_camera_take_picture();
+    if (!s_snap_fb) {
+        ESP_LOGE(TAG, "Camera capture failed on button down");
+        display_status_set("Cam Error", "Capture failed");
+        return;
+    }
+
+    /* Immediately start recording microphone */
+    tool_audio_manual_record_start();
+}
+
+static void on_camera_button_up(uint32_t hold_duration_ms)
+{
+    if (hold_duration_ms == 0) {
+        /* Cancelled or noise */
+        if (s_snap_fb) {
+            ESP_LOGW(TAG, "📸 [CAM BTN] Noise/cancelled press — returning camera buffer");
+            tool_camera_return_picture(s_snap_fb);
+            s_snap_fb = NULL;
         }
-        tool_camera_video_release();
+        display_status_idle();
+        return;
+    }
+
+    if (!s_snap_fb) {
+        ESP_LOGW(TAG, "Button released but no photo was captured");
+        return;
+    }
+
+    size_t samples = 0;
+    uint32_t rec_dur = 0;
+    double rms = 0.0;
+    tool_audio_manual_record_stop(&samples, &rec_dur, &rms);
+    ESP_LOGI(TAG, "🎙️ [CAM BTN] Up: hold %u ms, audio samples=%u dur=%u ms rms=%.1f",
+             (unsigned)hold_duration_ms, (unsigned)samples, (unsigned)rec_dur, rms);
+
+    snap_job_t *job = malloc(sizeof(snap_job_t));
+    if (!job) {
+        tool_camera_return_picture(s_snap_fb);
+        s_snap_fb = NULL;
+        return;
+    }
+    job->fb = s_snap_fb;
+    job->hold_ms = hold_duration_ms;
+    job->samples = samples;
+    job->rms = rms;
+
+    /* Transfer ownership of s_snap_fb to job */
+    s_snap_fb = NULL;
+    s_snap_in_flight = true;
+
+    if (xTaskCreate(snap_process_task, "snap_proc", 16384, job, 5, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create snap_process_task");
+        tool_camera_return_picture(job->fb);
+        free(job);
+        s_snap_in_flight = false;
+        display_status_idle();
     }
 }
 
@@ -290,6 +398,15 @@ void app_main(void)
     ESP_LOGI(TAG, "PSRAM free:    %d bytes",
              (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
+    esp_reset_reason_t rst = esp_reset_reason();
+    ESP_LOGI(TAG, "Hardware Reset Reason: %d (%s)", rst,
+             rst == ESP_RST_POWERON ? "Power-on" :
+             rst == ESP_RST_SW ? "Software reset" :
+             rst == ESP_RST_PANIC ? "Exception / Panic / Stack overflow" :
+             rst == ESP_RST_INT_WDT ? "Interrupt WDT" :
+             rst == ESP_RST_TASK_WDT ? "Task WDT" :
+             rst == ESP_RST_BROWNOUT ? "BROWNOUT (Power supply voltage drop!)" : "Other");
+
     /* Phase 1: Core infrastructure */
     ESP_ERROR_CHECK(init_nvs());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -307,7 +424,7 @@ void app_main(void)
     ESP_ERROR_CHECK(llm_proxy_init());
     ESP_ERROR_CHECK(tool_registry_init());
     ESP_ERROR_CHECK(tool_camera_init());
-    ESP_ERROR_CHECK(button_handler_init(on_white_button_short_press, on_white_button_long_press));
+    ESP_ERROR_CHECK(button_handler_init(on_camera_button_down, on_camera_button_up));
     ESP_ERROR_CHECK(cron_service_init());
     ESP_ERROR_CHECK(heartbeat_init());
     ESP_ERROR_CHECK(config_sync_init());

@@ -78,6 +78,23 @@ class Settings(BaseSettings):
     sqlite_db_path: str = "db/espet.db"
     rag_top_k: int = 3
     rag_threshold: float = 0.28
+
+    # --- Live camera streaming ---
+    camera_cv_enabled: bool = True
+    camera_cv_backend: str = "none"
+    camera_default_fps: int = 8
+    camera_face_interval_s: float = 1.0
+    camera_owner_match_threshold: float = 0.38
+    camera_owner_welcome_enabled: bool = True
+    camera_owner_welcome_text: str = "Hi owner, welcome back."
+    camera_owner_welcome_confirm_count: int = 2
+    camera_owner_welcome_absence_s: int = 600
+    camera_owner_welcome_cooldown_s: int = 1800
+    camera_owner_watch_enabled: bool = True
+    camera_owner_watch_interval_s: int = 60
+    camera_owner_watch_sample_s: int = 5
+    camera_owner_watch_fps: int = 2
+
     # --- Hybrid mode cloud gateway (Telegram & LLM relay for the device) ---
     # When enabled, the backend polls Telegram for the device (single poller)
     # and routes messages over the device's persistent WebSocket /ws/device.

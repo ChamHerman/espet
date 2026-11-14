@@ -1,15 +1,14 @@
-/* Chat — browser ⇄ device, direct to the ESP32 WebSocket gateway (port 18789).
-   The firmware routes inbound {"type":"message","content","chat_id"} into the
-   agent loop and echoes the final reply back as {"type":"response",...} at
-   mimi.c:143, so this is genuinely bidirectional with zero backend/firmware
-   changes. Transcript persists to localStorage (a backend relay + shared
-   history is the durable version — see .agent/NEXT_PLAN_BACKEND.MD). */
+/* Chat — Desktop console via the FastAPI Cloud Gateway (/api/cloud/ws/chat).
+   Routes inbound message to the ESP32 agent loop over persistent cloud_link
+   under session chat_id="dashboard", keeping it completely isolated from Telegram
+   conversations while sharing SOUL.md, USER.md, and MEMORY.md. */
 
 import { Markdown } from "@lobehub/ui";
 import {
   Alert,
   Avatar,
   Button,
+  Image,
   Input,
   Space,
   Spin,
@@ -17,13 +16,11 @@ import {
 } from "antd";
 import { createStyles } from "antd-style";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { deviceWsUrl, getDeviceAddr } from "../api";
 import { Icon } from "../components/Icon";
 import { StatusChip } from "../components/StatusChips";
 import { useApp } from "../store";
 
 const CHAT_KEY = "espet.chat.v1";
-const CHAT_ID = "dashboard";
 const LOAD_TIMEOUT_MS = 60000;
 const MAX_TURNS = 80;
 
@@ -32,6 +29,7 @@ interface ChatMsg {
   id: string;
   role: Role;
   text: string;
+  image?: string;
   ts: number;
 }
 
@@ -115,12 +113,18 @@ function load(): ChatMsg[] {
     return [];
   }
 }
+
 function save(msgs: ChatMsg[]) {
   try {
     localStorage.setItem(CHAT_KEY, JSON.stringify(msgs.slice(-MAX_TURNS)));
   } catch {
     /* quota — ignore */
   }
+}
+
+function getWsChatUrl(): string {
+  const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${proto}//${window.location.host}/api/cloud/ws/chat`;
 }
 
 export function ChatView() {
@@ -130,10 +134,12 @@ export function ChatView() {
   const [status, setStatus] = useState<"idle" | "connecting" | "open" | "closed">(
     "idle"
   );
+  const [deviceOnline, setDeviceOnline] = useState(false);
   const [pending, setPending] = useState(false);
   const [draft, setDraft] = useState("");
   const wsRef = useRef<WebSocket | null>(null);
   const timeoutRef = useRef<ReturnType<typeof setTimeout>>();
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout>>();
   const idRef = useRef(0);
   const pendingRef = useRef(false);
   const listRef = useRef<HTMLDivElement>(null);
@@ -153,50 +159,102 @@ export function ChatView() {
     });
   }, []);
 
-  const clearPending = () => {
+  const pushRaw = useCallback((m: ChatMsg) => {
+    setMsgs((prev) => {
+      if (prev.some((x) => x.id === m.id)) return prev;
+      const next = [...prev, m];
+      save(next);
+      return next.slice(-MAX_TURNS);
+    });
+  }, []);
+
+  const clearPending = useCallback(() => {
     setPending(false);
     if (timeoutRef.current) clearTimeout(timeoutRef.current);
-  };
+  }, []);
 
   const connect = useCallback(() => {
-    wsRef.current?.close();
-    const url = deviceWsUrl();
+    if (wsRef.current) {
+      try {
+        wsRef.current.close();
+      } catch {
+        /* ignore */
+      }
+    }
+    const url = getWsChatUrl();
     setStatus("connecting");
     let ws: WebSocket;
     try {
       ws = new WebSocket(url);
     } catch {
       setStatus("closed");
-      toast("Could not reach device gateway", "error");
+      toast("Could not reach cloud chat gateway", "error");
       return;
     }
     wsRef.current = ws;
-    ws.onopen = () => setStatus("open");
+
+    ws.onopen = () => {
+      setStatus("open");
+    };
+
     ws.onmessage = (ev) => {
       try {
         const data = JSON.parse(ev.data);
-        if (data.type === "response" && typeof data.content === "string") {
+        if (data.type === "init") {
+          setDeviceOnline(!!data.online);
+          if (Array.isArray(data.history) && data.history.length > 0) {
+            setMsgs(data.history);
+            save(data.history);
+          }
+        } else if (data.type === "device_status") {
+          setDeviceOnline(!!data.online);
+        } else if (data.type === "status" && data.status === "thinking") {
+          setPending(true);
+        } else if (data.type === "response") {
           clearPending();
-          push({ role: "agent", text: data.content });
+          if (data.message) {
+            pushRaw(data.message);
+          } else if (typeof data.content === "string") {
+            push({ role: data.role || "agent", text: data.content, image: data.image });
+          }
+        } else if (data.type === "message" && data.message) {
+          pushRaw(data.message);
+        } else if (data.type === "photo") {
+          clearPending();
+          push({ role: "agent", text: data.caption || "", image: data.image_url || data.image });
+        } else if (data.type === "cleared") {
+          setMsgs([]);
+          save([]);
         }
       } catch {
         clearPending();
-        push({ role: "agent", text: String(ev.data ?? "") });
       }
     };
+
     ws.onclose = () => {
       setStatus("closed");
       clearPending();
+      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = setTimeout(() => {
+        connect();
+      }, 3000);
     };
-    ws.onerror = () => setStatus("closed");
-  }, [push, toast]);
+
+    ws.onerror = () => {
+      setStatus("closed");
+    };
+  }, [clearPending, push, pushRaw, toast]);
 
   useEffect(() => {
+    connect();
     return () => {
-      wsRef.current?.close();
+      if (wsRef.current) {
+        wsRef.current.close();
+      }
       if (timeoutRef.current) clearTimeout(timeoutRef.current);
+      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
     };
-  }, []);
+  }, [connect]);
 
   useEffect(() => {
     pendingRef.current = pending;
@@ -207,10 +265,11 @@ export function ChatView() {
     if (!text) return;
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) {
-      toast("Device offline — connect first (top right)", "error");
+      toast("Gateway disconnected — connecting...", "warning");
+      connect();
       return;
     }
-    ws.send(JSON.stringify({ type: "message", content: text, chat_id: CHAT_ID }));
+    ws.send(JSON.stringify({ type: "message", content: text }));
     push({ role: "user", text });
     setDraft("");
     setPending(true);
@@ -230,9 +289,10 @@ export function ChatView() {
   const clearChat = () => {
     setMsgs([]);
     save([]);
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: "clear" }));
+    }
   };
-
-  const addr = getDeviceAddr();
 
   return (
     <div className={styles.wrap}>
@@ -242,30 +302,28 @@ export function ChatView() {
             <img src="/static/brand/espet_logo.jpg" alt="ESPET logo" width={40} height={40} />
           </div>
           <div>
-            <div style={{ fontWeight: 600 }}>ESPET · live chat</div>
+            <div style={{ fontWeight: 600 }}>ESPET · Desktop Console</div>
             <div style={{ fontSize: 12, color: "#737373" }} className="espet-mono">
-              {addr}
+              channel: cloud_link · session: dashboard
             </div>
           </div>
           <StatusChip
             tone={
-              status === "open"
-                ? "success"
-                : status === "connecting"
-                ? "warning"
-                : status === "closed"
+              status !== "open"
                 ? "danger"
-                : "neutral"
+                : deviceOnline
+                ? "success"
+                : "warning"
             }
-            pulse={status === "connecting"}
+            pulse={status === "connecting" || (status === "open" && !deviceOnline)}
           >
-            {status === "open"
-              ? "Connected"
-              : status === "connecting"
-              ? "Connecting…"
-              : status === "closed"
-              ? "Offline"
-              : "Not Connected"}
+            {status !== "open"
+              ? status === "connecting"
+                ? "Connecting…"
+                : "Gateway Offline"
+              : deviceOnline
+              ? "ESP32 Online"
+              : "ESP32 Offline (Gateway ready)"}
           </StatusChip>
         </div>
         <Space>
@@ -274,7 +332,7 @@ export function ChatView() {
               Clear
             </Button>
           )}
-          <Tooltip title="Open (or retry) the WebSocket to the device gateway">
+          <Tooltip title="Reconnect to cloud chat gateway">
             <Button
               size="small"
               type={status === "open" ? "default" : "primary"}
@@ -287,15 +345,23 @@ export function ChatView() {
         </Space>
       </div>
 
+      {status === "open" && !deviceOnline && (
+        <Alert
+          style={{ marginBottom: 8 }}
+          type="warning"
+          showIcon
+          message="ESP32 硬件设备未连接。本地网关已就绪，请为 ESP32 通电并确保其连上 Wi-Fi。"
+        />
+      )}
       {status !== "open" && (
         <Alert
           style={{ marginBottom: 8 }}
-          type={status === "connecting" ? "info" : "warning"}
+          type={status === "connecting" ? "info" : "error"}
           showIcon
           message={
             status === "connecting"
-              ? "Connecting to the device…"
-              : `Not connected. Make sure the device is on this network and its address is set in Device → Live-chat device address (currently ${addr}).`
+              ? "正在连接到本地云网关…"
+              : "与本地网关断开连接，正在尝试重新连接…"
           }
         />
       )}
@@ -303,8 +369,7 @@ export function ChatView() {
       <div className={styles.list} ref={listRef}>
         {msgs.length === 0 && (
           <div className={styles.system}>
-            Messages go straight to the agent loop on the device — try “hello” or
-            “what can you do?”.
+            桌面端主控台已就绪。消息将通过 Cloud Link 专属通道发送给 ESP32 Agent。
           </div>
         )}
         {msgs.map((m) =>
@@ -334,6 +399,22 @@ export function ChatView() {
                   m.role === "user" ? styles.userBubble : styles.agentBubble
                 )}
               >
+                {m.image && (
+                  <div style={{ marginBottom: m.text ? 10 : 0 }}>
+                    <Image
+                      src={m.image}
+                      alt="Captured photo"
+                      style={{
+                        maxHeight: 340,
+                        maxWidth: "100%",
+                        borderRadius: 12,
+                        objectFit: "contain",
+                        border: "1px solid rgba(255, 255, 255, 0.12)",
+                        background: "rgba(0, 0, 0, 0.35)",
+                      }}
+                    />
+                  </div>
+                )}
                 {m.role === "agent" ? (
                   <Markdown>{m.text}</Markdown>
                 ) : (
@@ -369,7 +450,7 @@ export function ChatView() {
         <Input.TextArea
           value={draft}
           autoSize={{ minRows: 1, maxRows: 5 }}
-          placeholder={status === "open" ? "Message ESPET…" : "Connect to the device first"}
+          placeholder={status === "open" ? (deviceOnline ? "Message ESPET…" : "ESP32 离线中，消息将在设备连上后重传…") : "连接中…"}
           disabled={status !== "open"}
           onChange={(e) => setDraft(e.target.value)}
           onPressEnter={(e) => {

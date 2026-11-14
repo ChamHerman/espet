@@ -3,6 +3,7 @@ idf_component_register(
         "mimi.c"
         "bus/message_bus.c"
         "display/display_status.c"
+        "display/display_face.c"
         "wifi/wifi_manager.c"
         "channels/telegram/telegram_bot.c"
         "channels/cloud_link/cloud_link.c"
@@ -38,8 +39,8 @@ idf_component_register(
     REQUIRES
         nvs_flash esp_wifi esp_netif esp_http_client esp_http_server
         esp_https_ota esp_event json spiffs console vfs app_update esp-tls
-        esp_timer esp_websocket_client esp_driver_gpio esp_driver_i2s driver esp32-camera
-        mdns ssd1306 wifi_provisioning bt protocomm
+        esp_timer esp_websocket_client esp_driver_gpio esp_driver_i2s esp_driver_tsens driver esp32-camera
+        mdns ssd1306 wifi_provisioning bt protocomm mbedtls
 )
 
 # Dynamically get the host laptop's IP address

@@ -11,6 +11,7 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include <time.h>
 #include <sys/time.h>
@@ -29,6 +30,7 @@
 #include "sync/backend_discovery.h"
 #include "sync/config_sync.h"
 #include "tools/tool_audio.h"
+#include "tools/tool_camera.h"
 #include "voice/voice_client.h"
 
 #include "channels/telegram/telegram_bot.h"
@@ -182,6 +184,25 @@ static void transcribe_task_fn(void *arg)
     vTaskDelete(NULL);
 }
 
+typedef struct {
+    char *text;
+    char *line1;
+    char *line2;
+} tts_say_req_t;
+
+static void tts_say_task_fn(void *arg)
+{
+    tts_say_req_t *req = (tts_say_req_t *)arg;
+    if (req) {
+        voice_client_speak_with_display(req->text, req->line1, req->line2);
+        free(req->text);
+        free(req->line1);
+        free(req->line2);
+        free(req);
+    }
+    vTaskDelete(NULL);
+}
+
 /* -------------------------------------------------- inbound frame handling */
 static void sync_bound_chat(const cJSON *root)
 {
@@ -291,6 +312,47 @@ static void handle_frame(char *json_str)
         snprintf(resp, sizeof(resp),
                  "{\"type\":\"voice_listen_status\",\"enabled\":%s,\"ok\":true}",
                  enable ? "true" : "false");
+        send_json(resp);
+    } else if (strcmp(type_str, "tts_say") == 0) {
+        const cJSON *text = cJSON_GetObjectItem(root, "text");
+        const cJSON *line1 = cJSON_GetObjectItem(root, "display_title");
+        const cJSON *line2 = cJSON_GetObjectItem(root, "display_body");
+        const char *s = cJSON_IsString(text) ? text->valuestring : "";
+        if (s[0] != '\0') {
+            tts_say_req_t *req = calloc(1, sizeof(tts_say_req_t));
+            if (req) {
+                req->text = strdup(s);
+                req->line1 = cJSON_IsString(line1) ? strdup(line1->valuestring) : NULL;
+                req->line2 = cJSON_IsString(line2) ? strdup(line2->valuestring) : NULL;
+                if (!req->text || xTaskCreate(tts_say_task_fn, "tts_say", 8192, req, 4, NULL) != pdPASS) {
+                    free(req->text);
+                    free(req->line1);
+                    free(req->line2);
+                    free(req);
+                    send_json("{\"type\":\"tts_say_status\",\"ok\":false,\"error\":\"task_fail\"}");
+                } else {
+                    send_json("{\"type\":\"tts_say_status\",\"ok\":true}");
+                }
+            }
+        }
+    } else if (strcmp(type_str, "camera_stream_start") == 0) {
+        const cJSON *fps_item = cJSON_GetObjectItem(root, "fps");
+        int fps = cJSON_IsNumber(fps_item) ? (int)fps_item->valuedouble : MIMI_CAM_STREAM_FPS_DEFAULT;
+        if (fps < 1) fps = 1;
+        if (fps > MIMI_CAM_STREAM_FPS_MAX) fps = MIMI_CAM_STREAM_FPS_MAX;
+        esp_err_t err = tool_camera_stream_start(fps);
+        char resp[160];
+        snprintf(resp, sizeof(resp),
+                 "{\"type\":\"camera_stream_status\",\"streaming\":%s,\"fps\":%d,\"ok\":%s}",
+                 tool_camera_stream_is_running() ? "true" : "false", fps,
+                 (err == ESP_OK) ? "true" : "false");
+        send_json(resp);
+    } else if (strcmp(type_str, "camera_stream_stop") == 0) {
+        esp_err_t err = tool_camera_stream_stop();
+        char resp[144];
+        snprintf(resp, sizeof(resp),
+                 "{\"type\":\"camera_stream_status\",\"streaming\":false,\"ok\":%s}",
+                 (err == ESP_OK) ? "true" : "false");
         send_json(resp);
     } else if (strcmp(type_str, "hello_ack") == 0) {
         ESP_LOGI(TAG, "cloud gateway accepted this device");

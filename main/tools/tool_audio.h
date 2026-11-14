@@ -70,6 +70,12 @@ esp_err_t tool_audio_init(void);
 bool tool_audio_is_busy(void);
 
 /**
+ * @brief True while speaker playback (sine tone, WAV, or TTS) is active.
+ *        Does NOT include microphone recording/listening.
+ */
+bool tool_audio_is_speaker_busy(void);
+
+/**
  * @brief Arm a capture into the internal PSRAM buffer (no worker task).
  *
  * The caller's task pumps tool_audio_rx_read() until it returns false or

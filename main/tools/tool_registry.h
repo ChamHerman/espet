@@ -2,12 +2,14 @@
 
 #include "esp_err.h"
 #include <stddef.h>
+#include <stdbool.h>
 
 typedef struct {
     const char *name;
     const char *description;
     const char *input_schema_json;  /* JSON Schema string for input */
     esp_err_t (*execute)(const char *input_json, char *output, size_t output_size);
+    bool hidden; /* if true, executable via CLI/direct call but not exposed in LLM prompt */
 } mimi_tool_t;
 
 /**

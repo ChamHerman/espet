@@ -48,3 +48,12 @@ esp_err_t tool_camera_video_stop_and_get(uint8_t **avi_out, size_t *avi_len);
  * @brief Free the AVI buffer returned by tool_camera_video_stop_and_get.
  */
 void tool_camera_video_release(void);
+
+/**
+ * @brief Start/stop live JPEG streaming to the FastAPI backend camera WebSocket.
+ *        Streaming is controlled by backend viewer reference-counts and shares
+ *        the camera mutex with still photos and video recording.
+ */
+esp_err_t tool_camera_stream_start(int fps);
+esp_err_t tool_camera_stream_stop(void);
+bool tool_camera_stream_is_running(void);

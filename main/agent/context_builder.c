@@ -37,6 +37,8 @@ esp_err_t context_build_system_prompt(char *buf, size_t size)
         "## Hardware & Environment\n"
         "- White LED: GPIO 42 (use gpio_write: state 1=ON, 0=OFF)\n"
         "- Green Button: GPIO 41 (use gpio_read: state 0=Pressed, 1=Released)\n"
+        "- Camera: On-board OV2640 camera (call take_photo when asked to take a picture, photo, snapshot, or see)\n"
+        "- Diagnostics: call get_device_status for WiFi, RSSI, IP, uptime, RAM, CPU temp\n"
         "- File paths: all SPIFFS operations must start with /spiffs/\n"
         "- Current Time: call get_current_time when current date or time is needed\n\n");
 

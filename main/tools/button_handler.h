@@ -5,15 +5,17 @@
 #include "mimi_config.h"
 #include <stdbool.h>
 
-#define GPIO_BTN_WHITE_SNAP  MIMI_GPIO_BTN_CAM   /* Camera Button (GPIO 41): short=snap to Telegram, hold=video */
+#define GPIO_BTN_WHITE_SNAP  MIMI_GPIO_BTN_CAM   /* Camera Button (GPIO 41): press down=snap & record, release=send */
 
-typedef void (*button_short_press_cb_t)(void);
-typedef void (*button_long_press_cb_t)(bool is_starting);
+typedef void (*button_press_down_cb_t)(void);
+typedef void (*button_press_up_cb_t)(uint32_t hold_duration_ms);
 
 /**
- * Initialize hardware button interrupt handlers for the camera button.
+ * Initialize hardware button interrupt handlers for the camera button (multimodal push-to-talk).
+ * down_cb is called immediately when button is pressed down (e.g. snap picture & start mic).
+ * up_cb is called when button is released with hold_duration_ms (e.g. stop mic & transcribe).
  */
-esp_err_t button_handler_init(button_short_press_cb_t short_cb, button_long_press_cb_t long_cb);
+esp_err_t button_handler_init(button_press_down_cb_t down_cb, button_press_up_cb_t up_cb);
 
 /**
  * Check current hardware state of push buttons.

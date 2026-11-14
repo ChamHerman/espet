@@ -23,6 +23,45 @@ export interface DeviceInfo {
   is_latest?: boolean;
 }
 
+export interface CameraStatus {
+  device_id: string;
+  streaming: boolean;
+  fps: number;
+  target_fps: number;
+  viewer_count: number;
+  frame_count: number;
+  frame_ts: number;
+  last_frame_age_ms: number;
+  inference_ms: number;
+  detections: { label?: string; confidence?: number; bbox?: number[] }[];
+  cv_backend: string;
+  mode: "raw" | "processed" | string;
+  has_frame: boolean;
+  owner_detected: boolean;
+  owner_last_seen_ts: number;
+  owner_similarity: number;
+  owner_face_enrolled: boolean;
+  owner_face_error?: string | null;
+  owner_welcome_last_ts: number;
+}
+
+export interface OwnerFaceStatus {
+  ok?: boolean;
+  device_id: string;
+  enabled: boolean;
+  installed: boolean;
+  enrolled: boolean;
+  enrolled_at?: number | null;
+  image_sha256?: string | null;
+  has_preview?: boolean;
+  threshold: number;
+  watch_enabled: boolean;
+  watch_interval_s: number;
+  watch_sample_s: number;
+  watch_fps: number;
+  error?: string | null;
+}
+
 
 export const API_KEY = "espet_secret_device_key_2026";
 
@@ -118,7 +157,58 @@ export const client = {
     api<{ ok: boolean; indexed: number; total_lines: number }>(`/api/memory/sync-from-md?device_id=${device_id}`, json("POST", {})),
   autoOrganizeMemory: (device_id = "espet_s3_01") =>
     api<{ ok: boolean; cleaned_actions: number; device_id: string }>(`/api/memory/auto-organize?device_id=${encodeURIComponent(device_id)}`, json("POST", {})),
+
+  cameraStatus: (device_id = "espet_s3_01") =>
+    api<CameraStatus>(`/api/camera/status?device_id=${encodeURIComponent(device_id)}`),
+  startCameraStream: (p: { device_id?: string; fps?: number }) =>
+    api<{ ok: boolean; device_id: string; fps: number; pushed: boolean }>("/api/camera/stream/start", json("POST", p)),
+  stopCameraStream: (device_id = "espet_s3_01") =>
+    api<{ ok: boolean; device_id: string; pushed: boolean }>("/api/camera/stream/stop", json("POST", { device_id })),
+  setCameraConfig: (p: { device_id?: string; mode?: "raw" | "processed"; cv_backend?: string }) =>
+    api<CameraStatus & { ok: boolean }>("/api/camera/config", json("PUT", p)),
+  ownerFaceStatus: (device_id = "espet_s3_01") =>
+    api<OwnerFaceStatus>(`/api/camera/owner-face/status?device_id=${encodeURIComponent(device_id)}`),
+  deleteOwnerFace: (device_id = "espet_s3_01") =>
+    api<OwnerFaceStatus & { deleted: boolean }>(`/api/camera/owner-face?device_id=${encodeURIComponent(device_id)}`, { method: "DELETE" }),
+  testOwnerDetection: (device_id = "espet_s3_01") =>
+    api<{ ok: boolean; device_id: string; detected: boolean; action_sent: boolean; error?: string; owner_similarity?: number }>("/api/camera/owner-face/test-detect", json("POST", { device_id })),
 };
+
+export async function uploadOwnerFace(device_id: string, file: File): Promise<OwnerFaceStatus> {
+  const form = new FormData();
+  form.append("file", file);
+  const res = await fetch(`/api/camera/owner-face?device_id=${encodeURIComponent(device_id)}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${API_KEY}` },
+    body: form,
+  });
+  if (!res.ok) {
+    let detail = res.statusText;
+    try {
+      const body = await res.json();
+      detail = body.detail || detail;
+    } catch {
+      /* non-JSON error body */
+    }
+    throw new Error(detail);
+  }
+  return res.json() as Promise<OwnerFaceStatus>;
+}
+
+export function cameraStreamUrl(device_id = "espet_s3_01", mode: "raw" | "processed" = "processed", fps = 8): string {
+  const q = new URLSearchParams({ device_id, mode, fps: String(fps), key: API_KEY });
+  return `/api/camera/stream?${q.toString()}`;
+}
+
+export function cameraSnapshotUrl(device_id = "espet_s3_01", mode: "raw" | "processed" = "processed"): string {
+  const q = new URLSearchParams({ device_id, mode, key: API_KEY, t: String(Date.now()) });
+  return `/api/camera/snapshot?${q.toString()}`;
+}
+
+export function ownerFacePreviewUrl(device_id = "espet_s3_01", rev = 0): string {
+  const q = new URLSearchParams({ device_id, key: API_KEY, t: String(rev || Date.now()) });
+  return `/api/camera/owner-face/preview?${q.toString()}`;
+}
 
 /* Device WebSocket gateway address for the direct-chat view (localStorage;
    the ESP32 gateway has no cross-origin gate, so the browser talks to it

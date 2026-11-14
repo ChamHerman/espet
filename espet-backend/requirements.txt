@@ -32,6 +32,12 @@ numpy>=1.26.0
 # Optional: Windows/Linux NVIDIA GPU acceleration (sub-200ms latency)
 # pip install nvidia-cublas-cu12 nvidia-cudnn-cu12
 
+# Optional local camera AI (Owner face enrollment/detection). Install on the
+# machine running the backend to enable Camera > Owner Detected.
+# insightface>=0.7.3
+# onnxruntime>=1.18.0
+# opencv-python-headless>=4.10.0
+
 # Utilities
 python-dotenv>=1.0.0
 python-multipart>=0.0.9

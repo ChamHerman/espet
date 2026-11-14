@@ -1,21 +1,41 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
+import time
 from typing import AsyncIterator
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile, WebSocket, WebSocketDisconnect
+import httpx
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import StreamingResponse
+from pathlib import Path
 
 from auth.device_auth import verify_device_key
 from config import settings
-from services.camera_processor import camera_processor
+from services.camera_processor import camera_processor, set_owner_welcome_callback
+from services.gateway_settings import gateway_settings
 from services.owner_face_service import owner_face_service
-from api.cloud_router import registry
+from services.telegram_gateway import get_gateway
+from api.cloud_router import registry, record_new_photo
 
 logger = logging.getLogger("espet-backend.camera")
 router = APIRouter(prefix="/api/camera", tags=["camera"])
+_owner_watch_task: asyncio.Task | None = None
+LAST_PHOTO_PATH = Path(__file__).parent.parent / "data" / "last_photo.jpg"
 
 
 def _check_query_key(key: str) -> None:
@@ -33,6 +53,73 @@ async def _send_camera_control(device_id: str, frame: dict) -> bool:
     except Exception as exc:
         logger.warning("Camera control push to %s failed: %r", did, exc)
         return False
+
+
+async def _send_tts_say(device_id: str, text: str) -> bool:
+    return await _send_camera_control(device_id, {
+        "type": "tts_say",
+        "text": text,
+        "display_title": "Owner Detected",
+        "display_body": "Welcome Back",
+    })
+
+
+set_owner_welcome_callback(_send_tts_say)
+
+
+async def _owner_watch_loop() -> None:
+    logger.info("Owner camera watch loop started")
+    try:
+        while True:
+            interval_s = max(10, int(settings.camera_owner_watch_interval_s))
+            if not settings.camera_owner_watch_enabled:
+                await asyncio.sleep(interval_s)
+                continue
+
+            devices = registry.connected_devices()
+            for device_id in devices:
+                face_status = owner_face_service.status(device_id)
+                if not face_status.get("enrolled") or face_status.get("error"):
+                    continue
+                st = await camera_processor.state(device_id)
+                if st.viewer_count > 0:
+                    continue
+
+                fps = max(1, min(int(settings.camera_owner_watch_fps), 5))
+                sample_s = max(2, min(int(settings.camera_owner_watch_sample_s), 15))
+                pushed = await _request_start(device_id, fps)
+                if not pushed:
+                    continue
+                logger.info("Owner watch sampling %s for %ds at %d fps", device_id, sample_s, fps)
+                await asyncio.sleep(sample_s)
+                st = await camera_processor.state(device_id)
+                if st.viewer_count == 0:
+                    st.streaming_requested = False
+                    await _send_camera_control(device_id, {"type": "camera_stream_stop"})
+
+            await asyncio.sleep(interval_s)
+    except asyncio.CancelledError:
+        logger.info("Owner camera watch loop stopped")
+        raise
+
+
+def start_owner_watch_loop() -> None:
+    global _owner_watch_task
+    if _owner_watch_task and not _owner_watch_task.done():
+        return
+    _owner_watch_task = asyncio.create_task(_owner_watch_loop())
+
+
+async def stop_owner_watch_loop() -> None:
+    global _owner_watch_task
+    if not _owner_watch_task:
+        return
+    _owner_watch_task.cancel()
+    try:
+        await _owner_watch_task
+    except asyncio.CancelledError:
+        pass
+    _owner_watch_task = None
 
 
 async def _request_start(device_id: str, fps: int) -> bool:
@@ -138,6 +225,22 @@ async def snapshot(device_id: str = Query("espet_s3_01"), mode: str = Query("pro
     return Response(content=frame, media_type="image/jpeg")
 
 
+@router.get("/last-photo")
+async def get_last_photo(t: str = Query("")):
+    """Return the most recently captured photo (JPEG)."""
+    if not LAST_PHOTO_PATH.exists():
+        raise HTTPException(status_code=404, detail="No photo captured yet")
+    return Response(
+        content=LAST_PHOTO_PATH.read_bytes(),
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
+
+
 @router.get("/status")
 async def status(device_id: str = Query("espet_s3_01"), _key: str = Depends(verify_device_key)):
     st = await camera_processor.state(device_id)
@@ -194,7 +297,7 @@ async def enroll_owner_face(
     if not data:
         raise HTTPException(status_code=400, detail="Owner photo is empty")
     try:
-        return {"ok": True, **owner_face_service.enroll(device_id, data)}
+        return {"ok": True, **owner_face_service.enroll(device_id, data, file.content_type or "image/jpeg")}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
@@ -211,3 +314,225 @@ async def delete_owner_face(device_id: str = Query("espet_s3_01"), _key: str = D
     st.owner_face_enrolled = False
     st.latest_detections = []
     return {"ok": True, "deleted": deleted, **owner_face_service.status(device_id)}
+
+
+@router.post("/owner-face/test-welcome")
+async def test_owner_welcome(payload: dict | None = None, device_id: str | None = Query(None), _key: str = Depends(verify_device_key)):
+    data = payload or {}
+    did = str(data.get("device_id") or device_id or "espet_s3_01")
+    return {
+        "ok": False,
+        "device_id": did,
+        "pushed": False,
+        "error": "direct_welcome_test_disabled_use_test_detect",
+    }
+
+
+@router.post("/owner-face/test-detect")
+async def test_owner_detection(payload: dict | None = None, device_id: str | None = Query(None), _key: str = Depends(verify_device_key)):
+    data = payload or {}
+    did = str(data.get("device_id") or device_id or "espet_s3_01")
+    face_status = owner_face_service.status(did)
+    if not face_status.get("enrolled"):
+        return {"ok": False, "device_id": did, "detected": False, "action_sent": False, "error": "owner_face_not_enrolled"}
+    if face_status.get("error"):
+        return {"ok": False, "device_id": did, "detected": False, "action_sent": False, "error": face_status.get("error")}
+
+    sample_s = max(2, min(int(data.get("sample_s") or settings.camera_owner_watch_sample_s), 15))
+    fps = max(1, min(int(data.get("fps") or settings.camera_owner_watch_fps), 5))
+    start_ts = time.time()
+    pushed = await _request_start(did, fps)
+    if not pushed:
+        return {"ok": False, "device_id": did, "detected": False, "action_sent": False, "error": "device_offline"}
+
+    detected = False
+    deadline = time.time() + sample_s
+    st = await camera_processor.state(did)
+    while time.time() < deadline:
+        st = await camera_processor.state(did)
+        if st.owner_detected and st.owner_last_seen_ts >= start_ts:
+            detected = True
+            break
+        async with st.frame_event:
+            try:
+                await asyncio.wait_for(st.frame_event.wait(), timeout=0.5)
+            except asyncio.TimeoutError:
+                pass
+
+    action_sent = False
+    if detected:
+        if st.owner_welcome_last_ts >= start_ts:
+            action_sent = True
+        else:
+            text = str(data.get("text") or settings.camera_owner_welcome_text or "Hi owner, welcome back.")
+            action_sent = await _send_tts_say(did, text)
+            if action_sent:
+                st.owner_welcome_last_ts = time.time()
+
+    st = await camera_processor.state(did)
+    if st.viewer_count == 0:
+        st.streaming_requested = False
+        await _send_camera_control(did, {"type": "camera_stream_stop"})
+
+    return {
+        "ok": detected and action_sent,
+        "device_id": did,
+        "detected": detected,
+        "action_sent": action_sent,
+        "sample_s": sample_s,
+        "fps": fps,
+        "owner_similarity": st.owner_similarity,
+        "owner_last_seen_ts": st.owner_last_seen_ts,
+    }
+
+
+@router.get("/owner-face/preview")
+async def owner_face_preview(device_id: str = Query("espet_s3_01"), key: str = Query("")):
+    _check_query_key(key)
+    preview = owner_face_service.preview(device_id)
+    if not preview:
+        raise HTTPException(status_code=404, detail="Owner face preview not found")
+    data, content_type = preview
+    return Response(content=data, media_type=content_type)
+
+
+@router.post("/vision-query")
+async def vision_query(
+    request: Request,
+    query: str = Query(""),
+    device_id: str = Header("", alias="X-Device-Id"),
+    _key: str = Depends(verify_device_key),
+):
+    """
+    Multimodal Vision Query from ESP32:
+    - Body: raw binary JPEG captured by OV2640 camera
+    - Query: optional voice transcription text (or passed via X-Query-B64 header)
+    - Device ID: ESP32 hardware device identifier
+    """
+    image_bytes = await request.body()
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="Empty image body")
+
+    # Persist the latest captured photo for web chat display
+    try:
+        LAST_PHOTO_PATH.parent.mkdir(parents=True, exist_ok=True)
+        LAST_PHOTO_PATH.write_bytes(image_bytes)
+        record_new_photo()
+    except Exception as e:
+        logger.warning("Failed to save last_photo.jpg: %r", e)
+
+    # Check X-Query-B64 header if query parameter is empty
+    b64_query = request.headers.get("x-query-b64", "").strip()
+    if b64_query and not query:
+        try:
+            query = base64.b64decode(b64_query).decode("utf-8", errors="ignore").strip()
+        except Exception:
+            pass
+
+    clean_query = (query or "").strip()
+
+    # Resolve bound Telegram chat
+    chat_id = None
+    if device_id:
+        chat_id = registry.primary_chat_for_device(device_id)
+    if not chat_id and registry.chat_to_device:
+        chat_id = next(iter(registry.chat_to_device.keys()))
+
+    gw = get_gateway()
+
+    # -------------------------------------------------------------
+    # 1. Rule-based / Snapshot Branch: Capture only or explicit snapshot
+    # -------------------------------------------------------------
+    if not clean_query or clean_query.startswith("📸") or "snapshot" in clean_query.lower():
+        rule_reply = "Photo captured successfully."
+        rule_caption = f"📸 [Photo Captured]\n{rule_reply}"
+        if gw and chat_id and chat_id != "dashboard":
+            try:
+                await gw.send_photo(chat_id, image_bytes, caption=rule_caption)
+                logger.info("Sent rule-based photo to Telegram chat %s", chat_id)
+            except Exception as e:
+                logger.warning("Failed to send rule-based photo to Telegram: %r", e)
+        return {
+            "ok": True,
+            "rule_based": True,
+            "reply": rule_reply,
+            "image_url": f"/api/camera/last-photo?t={int(time.time() * 1000)}",
+        }
+
+    # -------------------------------------------------------------
+    # 2. Capture & Ask Branch: Photo + User Voice Question
+    # -------------------------------------------------------------
+    user_caption = f"👤 You asked:\n\"{clean_query}\""
+    if gw and chat_id:
+        try:
+            await gw.send_photo(chat_id, image_bytes, caption=user_caption)
+            logger.info("Sent user question photo to Telegram chat %s: %s", chat_id, clean_query)
+        except Exception as e:
+            logger.warning("Failed to send question photo to Telegram: %r", e)
+
+    # Call Vision LLM
+    cfg = gateway_settings.llm_config()
+    snap = gateway_settings.get()
+    vision_model = snap.get("vision_model") or "sensenova/sensenova-6.8-flash-lite"
+    api_key = cfg.get("api_key")
+    base_url = (cfg.get("base_url") or "https://api.xkiro.com/v1").rstrip("/")
+
+    img_b64 = base64.b64encode(image_bytes).decode("ascii")
+    payload = {
+        "model": vision_model,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are ESPET, a helpful and friendly embodied personal AI companion. "
+                    "You are seeing what the user is showing you through their device camera. "
+                    "Answer their question concisely and naturally in the language of their question (e.g., Chinese if asked in Chinese, English if asked in English). "
+                    "Keep answers concise (1 to 3 sentences) suitable for text-to-speech."
+                ),
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": clean_query},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+                ],
+            },
+        ],
+        "max_tokens": 512,
+    }
+
+    ai_reply = "I'm sorry, I could not analyze the image right now."
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                f"{base_url}/chat/completions",
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    "User-Agent": "ESPET-Backend/1.0",
+                },
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                choices = data.get("choices", [])
+                if choices and "message" in choices[0]:
+                    ai_reply = choices[0]["message"].get("content", "").strip()
+                    logger.info("Vision LLM (%s) reply: %s", vision_model, ai_reply)
+            else:
+                logger.error("Vision LLM failed: HTTP %d %s", resp.status_code, resp.text)
+    except Exception as exc:
+        logger.error("Vision LLM call exception: %r", exc)
+
+    # Send AI reply to Telegram
+    if gw and chat_id:
+        try:
+            await gw.send_message(chat_id, f"🤖 ESPET: {ai_reply}")
+        except Exception as e:
+            logger.warning("Failed to send AI reply to Telegram: %r", e)
+
+    return {
+        "ok": True,
+        "rule_based": False,
+        "reply": ai_reply,
+    }

@@ -386,3 +386,285 @@ CUSTOM_TOOLS["memory_search"] = {
     "executor": execute_memory_search
 }
 
+# ---------------------------------------------------------------------------
+# Additional Google REST Custom Tools (Inbox, Search, Calendar Delete, Drive Read)
+# ---------------------------------------------------------------------------
+
+async def execute_gmail_check_inbox(arguments: dict) -> dict:
+    """Check the latest emails in the user's Gmail inbox."""
+    creds = await token_store.get_valid_credentials()
+    if not creds:
+        return {"error": "No Google OAuth credentials found. Please authenticate via dashboard."}
+
+    limit = arguments.get("limit", 5)
+    try:
+        limit = max(1, min(int(limit), 10))
+    except (ValueError, TypeError):
+        limit = 5
+
+    unread_only = arguments.get("unread_only", False)
+    query = "in:inbox is:unread" if unread_only else "in:inbox"
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages",
+            headers={"Authorization": f"Bearer {creds.token}"},
+            params={"maxResults": str(limit), "q": query}
+        )
+        if resp.status_code != 200:
+            return {"error": f"Failed to list Gmail messages: {resp.text}"}
+
+        messages = resp.json().get("messages", [])
+        if not messages:
+            msg = "Your Gmail inbox has no unread messages." if unread_only else "Your Gmail inbox is empty."
+            return {"result": msg}
+
+        lines = [f"Found {len(messages)} {'unread ' if unread_only else ''}message(s) in inbox:"]
+        for m in messages:
+            detail = await client.get(
+                f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{m['id']}",
+                headers={"Authorization": f"Bearer {creds.token}"},
+                params={"format": "metadata", "metadataHeaders": ["From", "Subject", "Date"]}
+            )
+            if detail.status_code == 200:
+                d = detail.json()
+                headers = {h["name"]: h["value"] for h in d.get("payload", {}).get("headers", [])}
+                sender = headers.get("From", "Unknown Sender")
+                subject = headers.get("Subject", "(No Subject)")
+                snippet = d.get("snippet", "")
+                lines.append(f"- From: {sender} | Subject: {subject}\n  Preview: {snippet}")
+
+        return {"result": "\n".join(lines)}
+
+async def execute_gmail_search_emails(arguments: dict) -> dict:
+    """Search emails in Gmail using keywords, subject, or sender."""
+    creds = await token_store.get_valid_credentials()
+    if not creds:
+        return {"error": "No Google OAuth credentials found."}
+
+    query = (
+        arguments.get("query")
+        or arguments.get("search")
+        or arguments.get("keyword")
+        or ""
+    )
+    query = str(query).strip()
+    if not query:
+        return {"error": "Parameter 'query' is required to search emails (e.g. 'invoice', 'from:dr.wong')."}
+
+    limit = arguments.get("limit", 5)
+    try:
+        limit = max(1, min(int(limit), 10))
+    except (ValueError, TypeError):
+        limit = 5
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages",
+            headers={"Authorization": f"Bearer {creds.token}"},
+            params={"maxResults": str(limit), "q": query}
+        )
+        if resp.status_code != 200:
+            return {"error": f"Failed to search emails: {resp.text}"}
+
+        messages = resp.json().get("messages", [])
+        if not messages:
+            return {"result": f"No emails found matching query '{query}'."}
+
+        lines = [f"Found {len(messages)} email(s) matching '{query}':"]
+        for m in messages:
+            detail = await client.get(
+                f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{m['id']}",
+                headers={"Authorization": f"Bearer {creds.token}"},
+                params={"format": "metadata", "metadataHeaders": ["From", "Subject", "Date"]}
+            )
+            if detail.status_code == 200:
+                d = detail.json()
+                headers = {h["name"]: h["value"] for h in d.get("payload", {}).get("headers", [])}
+                sender = headers.get("From", "Unknown")
+                subject = headers.get("Subject", "(No Subject)")
+                snippet = d.get("snippet", "")
+                lines.append(f"- [ID: {m['id']}] From: {sender} | Subject: {subject}\n  Snippet: {snippet}")
+
+        return {"result": "\n".join(lines)}
+
+async def execute_delete_event(arguments: dict) -> dict:
+    """Delete an event from Google Calendar by title/keyword or event ID."""
+    creds = await token_store.get_valid_credentials()
+    if not creds:
+        return {"error": "No Google OAuth credentials found."}
+
+    event_id = str(arguments.get("event_id") or arguments.get("eventId") or "").strip()
+    summary = str(arguments.get("summary") or arguments.get("title") or arguments.get("name") or "").strip()
+
+    async with httpx.AsyncClient() as client:
+        # If no explicit event_id, find upcoming event matching title
+        if not event_id and summary:
+            list_resp = await client.get(
+                "https://www.googleapis.com/calendar/v3/calendars/primary/events",
+                headers={"Authorization": f"Bearer {creds.token}"},
+                params={"q": summary, "maxResults": "5", "singleEvents": "true"}
+            )
+            if list_resp.status_code == 200:
+                items = list_resp.json().get("items", [])
+                if items:
+                    event_id = items[0]["id"]
+                    summary = items[0].get("summary", summary)
+
+        if not event_id:
+            return {"error": "Please provide the 'event_id' or 'title' of the event to delete."}
+
+        del_resp = await client.delete(
+            f"https://www.googleapis.com/calendar/v3/calendars/primary/events/{event_id}",
+            headers={"Authorization": f"Bearer {creds.token}"}
+        )
+        if del_resp.status_code in (200, 204):
+            return {"result": f"Event '{summary or event_id}' deleted successfully from Google Calendar."}
+        else:
+            return {"error": f"Failed to delete event: {del_resp.text}"}
+
+async def execute_read_drive_file(arguments: dict) -> dict:
+    """Read the content of a file or Google Doc in Google Drive."""
+    creds = await token_store.get_valid_credentials()
+    if not creds:
+        return {"error": "No Google OAuth credentials found."}
+
+    file_id = str(arguments.get("file_id") or arguments.get("fileId") or "").strip()
+    file_name = str(arguments.get("name") or arguments.get("title") or arguments.get("filename") or "").strip()
+
+    async with httpx.AsyncClient() as client:
+        # If no file_id provided, search file by name
+        if not file_id and file_name:
+            q = f"name contains '{file_name}' and trashed = false"
+            s_resp = await client.get(
+                "https://www.googleapis.com/drive/v3/files",
+                headers={"Authorization": f"Bearer {creds.token}"},
+                params={"q": q, "pageSize": "3", "fields": "files(id,name,mimeType)"}
+            )
+            if s_resp.status_code == 200:
+                files = s_resp.json().get("files", [])
+                if files:
+                    file_id = files[0]["id"]
+                    file_name = files[0]["name"]
+
+        if not file_id:
+            return {"error": "Please provide 'file_id' or 'name' of the Google Drive file to read."}
+
+        # Fetch metadata to check MIME type
+        meta_resp = await client.get(
+            f"https://www.googleapis.com/drive/v3/files/{file_id}",
+            headers={"Authorization": f"Bearer {creds.token}"},
+            params={"fields": "id,name,mimeType"}
+        )
+        if meta_resp.status_code != 200:
+            return {"error": f"Failed to access Drive file {file_id}: {meta_resp.text}"}
+
+        meta = meta_resp.json()
+        mime_type = meta.get("mimeType", "")
+        fname = meta.get("name", file_id)
+
+        # Export Google Docs as plain text, or download text/code media
+        if "application/vnd.google-apps.document" in mime_type:
+            exp_resp = await client.get(
+                f"https://www.googleapis.com/drive/v3/files/{file_id}/export",
+                headers={"Authorization": f"Bearer {creds.token}"},
+                params={"mimeType": "text/plain"}
+            )
+            content = exp_resp.text if exp_resp.status_code == 200 else f"Error exporting Doc: {exp_resp.text}"
+        else:
+            dl_resp = await client.get(
+                f"https://www.googleapis.com/drive/v3/files/{file_id}",
+                headers={"Authorization": f"Bearer {creds.token}"},
+                params={"alt": "media"}
+            )
+            content = dl_resp.text if dl_resp.status_code == 200 else f"Error reading file: {dl_resp.text}"
+
+        # Truncate content to safe size for LLM context (max ~3500 chars)
+        if len(content) > 3500:
+            content = content[:3500] + "\n\n...[Content truncated for length]..."
+
+        return {"result": f"Content of '{fname}':\n\n{content}"}
+
+CUSTOM_TOOLS["gmail_check_inbox"] = {
+    "description": (
+        "Check the user's Gmail inbox for recent messages. Returns the sender, "
+        "subject, date, and a preview snippet for each email."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "limit": {
+                "type": "integer",
+                "description": "Number of recent emails to return (default: 5, max: 10)"
+            },
+            "unread_only": {
+                "type": "boolean",
+                "description": "If true, only returns unread emails (default: false)"
+            }
+        }
+    },
+    "server": "custom-backend",
+    "executor": execute_gmail_check_inbox
+}
+
+CUSTOM_TOOLS["gmail_search_emails"] = {
+    "description": (
+        "Search emails in Gmail using keywords, subject, or sender (e.g. 'invoice', 'from:boss@company.com')."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Search query or keyword"
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Max results to return (default: 5)"
+            }
+        },
+        "required": ["query"]
+    },
+    "server": "custom-backend",
+    "executor": execute_gmail_search_emails
+}
+
+CUSTOM_TOOLS["delete_event"] = {
+    "description": "Delete an event from Google Calendar by title/summary or event ID.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "title": {
+                "type": "string",
+                "description": "Title or summary of the event to delete"
+            },
+            "event_id": {
+                "type": "string",
+                "description": "Optional specific Google Calendar event ID"
+            }
+        }
+    },
+    "server": "custom-backend",
+    "executor": execute_delete_event
+}
+
+CUSTOM_TOOLS["read_drive_file"] = {
+    "description": "Read the text content of a file or Google Doc from Google Drive by name or file ID.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "File name or title to search and read"
+            },
+            "file_id": {
+                "type": "string",
+                "description": "Optional specific Google Drive file ID"
+            }
+        }
+    },
+    "server": "custom-backend",
+    "executor": execute_read_drive_file
+}
+
+

@@ -5,6 +5,7 @@
 #include "wifi/wifi_manager.h"
 #if MIMI_CLOUD_LINK_ENABLE
 #include "channels/cloud_link/cloud_link.h"
+#include "voice/voice_client.h"
 #endif
 
 #include <string.h>
@@ -779,10 +780,19 @@ esp_err_t telegram_send_photo(const char *chat_id, const uint8_t *jpeg_data, siz
 
 esp_err_t telegram_send_photo_to_last_chat(const uint8_t *jpeg_data, size_t jpeg_len, const char *caption)
 {
-    if (s_last_chat_id[0] != '\0') {
+    if (!jpeg_data || jpeg_len == 0) return ESP_ERR_INVALID_ARG;
+#if MIMI_CLOUD_LINK_ENABLE
+    /* In hybrid mode or without token, route to backend */
+    char *reply = voice_client_vision_query(jpeg_data, jpeg_len, caption ? caption : "");
+    if (reply) {
+        free(reply);
+        return ESP_OK;
+    }
+#endif
+    if (s_last_chat_id[0] != '\0' && s_bot_token[0] != '\0') {
         return telegram_send_photo(s_last_chat_id, jpeg_data, jpeg_len, caption);
     }
-    ESP_LOGW(TAG, "Skipping Telegram photo send: no active Telegram chat ID yet");
+    ESP_LOGW(TAG, "Skipping Telegram photo send: no active Telegram chat ID or bot token");
     return ESP_ERR_INVALID_STATE;
 }
 

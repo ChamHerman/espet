@@ -168,6 +168,7 @@ rendered content, it's Outfit.* Body `15px / 1.55`. No other fonts.
   label: `<Switch />{" "}<span style={{ marginLeft: 8 }}>Label</span>` (or a
   flex row with gap, as `rowItem` does).
 - **SectionRail**: see §4.
+- **Chat media / photo bubbles**: Images rendered inside message bubbles via antd `<Image />` with `maxHeight: 340`, `borderRadius: 12`, hairline border `rgba(255,255,255,0.12)`, and dark well background `rgba(0,0,0,0.35)`; native lightbox preview with zoom/rotate controls on click.
 - **StatusChips**: `StatusDock` (bottom-right) + `StatusChips` (mobile top bar)
   + `StatusChip`/`SectionDirtyChip` primitives. Nothing status-related in the
   nav.

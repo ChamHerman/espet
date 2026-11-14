@@ -23,6 +23,9 @@ class OwnerFaceService:
     def _path(self, device_id: str) -> Path:
         return self.data_dir / f"{self._safe_device_id(device_id)}.json"
 
+    def _preview_path(self, device_id: str) -> Path:
+        return self.data_dir / f"{self._safe_device_id(device_id)}.preview"
+
     def _ensure_model(self) -> None:
         if self._app is not None:
             return
@@ -87,11 +90,16 @@ class OwnerFaceService:
             "enrolled": enrolled is not None,
             "enrolled_at": enrolled.get("enrolled_at") if enrolled else None,
             "image_sha256": enrolled.get("image_sha256") if enrolled else None,
+            "has_preview": self._preview_path(device_id).exists(),
             "threshold": settings.camera_owner_match_threshold,
+            "watch_enabled": settings.camera_owner_watch_enabled,
+            "watch_interval_s": settings.camera_owner_watch_interval_s,
+            "watch_sample_s": settings.camera_owner_watch_sample_s,
+            "watch_fps": settings.camera_owner_watch_fps,
             "error": dep_error,
         }
 
-    def enroll(self, device_id: str, image_bytes: bytes) -> dict:
+    def enroll(self, device_id: str, image_bytes: bytes, content_type: str = "image/jpeg") -> dict:
         with self._lock:
             faces = self._faces(image_bytes)
             if len(faces) != 1:
@@ -104,20 +112,36 @@ class OwnerFaceService:
                 "device_id": device_id,
                 "enrolled_at": time.time(),
                 "image_sha256": hashlib.sha256(image_bytes).hexdigest(),
+                "content_type": content_type if content_type.startswith("image/") else "image/jpeg",
                 "embedding": [float(x) for x in embedding.tolist()],
             }
             self.data_dir.mkdir(parents=True, exist_ok=True)
             tmp = self._path(device_id).with_suffix(".tmp")
             tmp.write_text(json.dumps(payload), encoding="utf-8")
             tmp.replace(self._path(device_id))
+            preview_tmp = self._preview_path(device_id).with_suffix(".tmp")
+            preview_tmp.write_bytes(image_bytes)
+            preview_tmp.replace(self._preview_path(device_id))
             return self.status(device_id)
 
     def delete(self, device_id: str) -> bool:
         path = self._path(device_id)
+        preview_path = self._preview_path(device_id)
+        deleted = False
         if path.exists():
             path.unlink()
-            return True
-        return False
+            deleted = True
+        if preview_path.exists():
+            preview_path.unlink()
+            deleted = True
+        return deleted
+
+    def preview(self, device_id: str) -> tuple[bytes, str] | None:
+        path = self._preview_path(device_id)
+        enrolled = self._load(device_id)
+        if not path.exists() or not enrolled:
+            return None
+        return path.read_bytes(), str(enrolled.get("content_type") or "image/jpeg")
 
     def detect_owner(self, device_id: str, image_bytes: bytes) -> dict:
         start = time.time()

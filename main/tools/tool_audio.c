@@ -831,6 +831,11 @@ bool tool_audio_is_busy(void)
     return s_recording || s_playing;
 }
 
+bool tool_audio_is_speaker_busy(void)
+{
+    return s_playing || s_speaker_busy;
+}
+
 
 /* Start capturing into s_pcm_buf WITHOUT a worker task: the caller's task
  * pumps tool_audio_rx_read() itself (the wake listener loop already exists,
@@ -944,8 +949,12 @@ esp_err_t tool_audio_manual_record_start(void)
     if (!s_i2s_initialized) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (s_recording || s_playing) {
+    if (s_playing) {
         return ESP_ERR_INVALID_STATE;
+    }
+    /* If background VAD/capture was active, disarm it so manual button record takes priority */
+    if (s_recording) {
+        tool_audio_capture_disarm();
     }
 
     tool_audio_clear_cache();
