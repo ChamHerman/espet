@@ -197,10 +197,10 @@
 
     <!-- Step 2: Configure Wi-Fi -->
     <div class="step" id="step-wifi" style="opacity: 0.5; pointer-events: none;">
-      <div class="step-title">2. Select & Enter Hotspot Details</div>
-      <input type="text" id="ssid" placeholder="Hotspot SSID (e.g. My Phone Hotspot)">
+      <div class="step-title">2. Select & Enter Wi-Fi Details</div>
+      <input type="text" id="ssid" placeholder="Wi-Fi SSID (e.g. My Phone Hotspot)">
       <div class="pw-wrap">
-        <input type="password" id="password" placeholder="Hotspot Password">
+        <input type="password" id="password" placeholder="Wi-Fi Password">
         <button type="button" class="pw-toggle" id="btn-toggle-pw" aria-label="Show password" aria-pressed="false">
           <svg class="icon-eye" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/>
@@ -209,7 +209,7 @@
           </svg>
         </button>
       </div>
-      <button id="btn-provision">Connect Hotspot</button>
+      <button id="btn-provision">Connect Wi-Fi</button>
       <button class="btn-secondary" id="btn-scan">Scan 2.4 GHz Networks</button>
       <div id="scan-results" style="margin-top: 8px;"></div>
     </div>
@@ -318,7 +318,7 @@
       const password = document.getElementById('password').value;
 
       if (!ssid) {
-        log('Please enter Hotspot SSID', 'error');
+        log('Please enter Wi-Fi SSID', 'error');
         return;
       }
 

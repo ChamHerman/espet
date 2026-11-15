@@ -301,12 +301,12 @@ outbound dispatch task → agent_loop_start → backend_discovery_start (last)
 
 ### 3.6 Connectivity & onboarding
 
-`wifi/wifi_manager.c` (credential store + retry/backoff), `onboard/wifi_onboard_ble.c`
+`wifi/wifi_manager.c` (credential store + retry/backoff) and `onboard/wifi_onboard_ble.c`
 (BLE Wi-Fi provisioning via Apache NimBLE and Protocomm with Security 0 plain text;
 allows personal hotspot onboarding without app via Web Bluetooth, releases BT RAM
-on completion; if Bluetooth is disabled in `sdkconfig`, this entry point falls
-back to SoftAP captive portal onboarding), and `onboard/wifi_onboard.c` (legacy
-captive portal fallback).
+on completion; mandatory onboarding mechanism for the device — always entered
+whenever Wi-Fi is disconnected or unconfigured). Legacy SoftAP captive portal has
+been completely retired.
 `ota/` for firmware updates.
 ---
 
@@ -1350,3 +1350,4 @@ Append-only session log. Newest first. One line per change:
 - 2026-11-15 — Added local tools for camera snapshot, device health vitals, and clean delayed restart: implemented and registered `take_photo` (captures OV2640 frame and transmits to Telegram chat), `get_device_status` (gathers WiFi SSID/RSSI, IP address, uptime, free DRAM/PSRAM, SPIFFS flash usage, and on-chip CPU temperature via esp_driver_tsens), and `restart_device` (initiates delayed 1.5s background reboot allowing the ReAct loop to complete and deliver confirmation message to user); reinforced hardware camera capability in `context_builder.c` system prompt to prevent base LLM refusal responses (files: main/CMakeLists.txt, main/tools/tool_registry.c, main/agent/context_builder.c, .agent/SYSTEM_OVERVIEW.md).
 - 2026-11-15 — Added captured photo rendering to Web Chat console: updated `Chat.tsx` to render incoming photo attachments directly inside chat bubbles using Ant Design `<Image />` with native lightbox zoom/preview, updated `cloud_router.py` to auto-associate recent camera snapshots with outbound web console messages, implemented public `/api/camera/last-photo` endpoint in `camera_router.py` with automatic JPEG file persistence, and refreshed tool response in `tool_registry.c` (files: espet-backend/src/views/Chat.tsx, espet-backend/api/cloud_router.py, espet-backend/api/camera_router.py, main/tools/tool_registry.c, DESIGN.MD, .agent/SYSTEM_OVERVIEW.md).
 - 2026-11-15 — Implemented OLED Key Word Reasoning for Spoken Responses: created `espet-backend/services/oled_summarizer.py` extracting 2 punchy lines (strictly <= 16 chars each) matching SSD1306 128x64 monospace limits, delivered via `X-OLED-Line1` and `X-OLED-Line2` HTTP headers in `POST /api/voice/tts` without added latency; updated `voice_client.c` in firmware to capture headers in `rx_event_handler` and display key words via `display_status_set` while speaking the full sentence over TTS; added clean on-device word-wrapping fallback (files: espet-backend/services/oled_summarizer.py, espet-backend/api/voice_router.py, espet-backend/tests/test_oled_summarizer.py, espet-backend/scripts/test_oled_tts.py, main/voice/voice_client.c, docs/superpowers/specs/2026-11-15-oled-keyword-reasoning-design.md, .agent/SYSTEM_OVERVIEW.md).
+- 2026-11-15 — Enforced unconditional BLE Provisioning mode for Wi-Fi onboarding: removed SoftAP captive-portal fallback and `#if CONFIG_BT_ENABLED` branching in `wifi_onboard_ble.c`, added compile-time check `#if !CONFIG_BT_ENABLED #error ...`, retired `wifi_onboard.c` from `main/CMakeLists.txt`, updated `docs/ble_prov.html` and `espet-backend/static/ble_prov.html` labels for better Wi-Fi onboarding familiarity, and added Bluetooth NimBLE defaults to `sdkconfig.defaults`; device now strictly and always enters BLE Provisioning mode whenever Wi-Fi is disconnected (files: main/onboard/wifi_onboard_ble.c, main/CMakeLists.txt, sdkconfig.defaults, docs/ble_prov.html, espet-backend/static/ble_prov.html, .agent/SYSTEM_OVERVIEW.md).
