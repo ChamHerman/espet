@@ -176,6 +176,9 @@ class TelegramGateway:
                            chat_id, resp.status_code, resp.text)
         return ok
 
+    # Alias to prevent method name confusion
+    send_message = send_text
+
     async def send_photo(self, chat_id: str | int, image: bytes,
                          caption: str = "") -> bool:
         files = {"photo": ("capture.jpg", image, "image/jpeg")}

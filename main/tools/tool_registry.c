@@ -264,6 +264,34 @@ static esp_err_t tool_restart_device_execute(const char *input_json, char *outpu
     return ESP_OK;
 }
 
+static void delayed_forget_wifi_task(void *pvParameters)
+{
+    (void)pvParameters;
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    ESP_LOGW(TAG, "Forgetting Wi-Fi credentials and triggering BLE provisioning...");
+    wifi_manager_clear_credentials();
+    wifi_manager_trigger_ble_prov();
+    vTaskDelete(NULL);
+}
+
+static esp_err_t tool_forget_wifi_execute(const char *input_json, char *output, size_t output_size)
+{
+    (void)input_json;
+    ESP_LOGW(TAG, "forget_wifi tool invoked");
+    display_status_set("WiFi Reset", "Entering BLE...");
+
+    BaseType_t ret = xTaskCreate(delayed_forget_wifi_task, "forget_wifi_task", 4096, NULL, 5, NULL);
+    if (ret != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create delayed forget_wifi task, executing immediately");
+        wifi_manager_clear_credentials();
+        wifi_manager_trigger_ble_prov();
+    }
+
+    snprintf(output, output_size,
+             "{\"status\": \"success\", \"message\": \"Wi-Fi credentials have been erased from NVS. The device is restarting into BLE Provisioning mode in 1.5 seconds. Please inform the user that Wi-Fi has been forgotten and to reconnect via BLE setup.\"}");
+    return ESP_OK;
+}
+
 esp_err_t tool_registry_init(void)
 {
     s_tool_count = 0;
@@ -489,6 +517,18 @@ esp_err_t tool_registry_init(void)
         .execute = tool_restart_device_execute,
     };
     register_tool(&rd);
+
+    /* Register forget_wifi */
+    mimi_tool_t fw = {
+        .name = "forget_wifi",
+        .description = "Forget/reset the stored Wi-Fi credentials from NVS and restart the device into BLE Provisioning mode. Call this whenever the user asks to forget Wi-Fi, reset Wi-Fi, clear Wi-Fi password, or reconfigure Wi-Fi setup.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{},"
+            "\"required\":[]}",
+        .execute = tool_forget_wifi_execute,
+    };
+    register_tool(&fw);
 
     build_tools_json();
 

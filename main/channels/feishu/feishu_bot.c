@@ -1,5 +1,8 @@
 #include "feishu_bot.h"
 #include "mimi_config.h"
+
+#if MIMI_FEISHU_ENABLE
+
 #include "bus/message_bus.h"
 #include "proxy/http_proxy.h"
 
@@ -989,3 +992,6 @@ esp_err_t feishu_set_credentials(const char *app_id, const char *app_secret)
     ESP_LOGI(TAG, "Feishu credentials saved");
     return ESP_OK;
 }
+
+#endif /* MIMI_FEISHU_ENABLE */
+

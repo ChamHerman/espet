@@ -2,7 +2,9 @@
 #include "mimi_config.h"
 #include "wifi/wifi_manager.h"
 #include "channels/telegram/telegram_bot.h"
+#if MIMI_FEISHU_ENABLE
 #include "channels/feishu/feishu_bot.h"
+#endif
 #include "llm/llm_proxy.h"
 #include "memory/memory_store.h"
 #include "memory/session_mgr.h"
@@ -88,6 +90,7 @@ static int cmd_set_tg_token(int argc, char **argv)
     return 0;
 }
 
+#if MIMI_FEISHU_ENABLE
 /* --- set_feishu_creds command --- */
 static struct {
     struct arg_str *app_id;
@@ -128,6 +131,7 @@ static int cmd_feishu_send(int argc, char **argv)
     printf("feishu_send status: %s\n", esp_err_to_name(err));
     return (err == ESP_OK) ? 0 : 1;
 }
+#endif
 
 /* --- set_api_key command --- */
 static struct {
@@ -860,6 +864,7 @@ esp_err_t serial_cli_init(void)
     };
     esp_console_cmd_register(&tg_token_cmd);
 
+#if MIMI_FEISHU_ENABLE
     /* set_feishu_creds */
     feishu_creds_args.app_id = arg_str1(NULL, NULL, "<app_id>", "Feishu App ID");
     feishu_creds_args.app_secret = arg_str1(NULL, NULL, "<app_secret>", "Feishu App Secret");
@@ -883,6 +888,7 @@ esp_err_t serial_cli_init(void)
         .argtable = &feishu_send_args,
     };
     esp_console_cmd_register(&feishu_send_cmd);
+#endif
 
     /* set_api_key */
     api_key_args.key = arg_str1(NULL, NULL, "<key>", "LLM API key");

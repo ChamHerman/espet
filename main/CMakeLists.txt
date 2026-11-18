@@ -32,7 +32,6 @@ idf_component_register(
         "tools/button_handler.c"
         "voice/voice_client.c"
         "skills/skill_loader.c"
-        "onboard/wifi_onboard.c"
         "onboard/wifi_onboard_ble.c"
     INCLUDE_DIRS
         "."

@@ -70,10 +70,10 @@ export function DeviceView() {
       tone: "default" as const,
     },
     {
-      name: "Feishu / Lark",
-      meta: "App credentials stored on the device (NVS). Replies can be routed to Feishu chats.",
-      badge: "On device",
-      tone: "success" as const,
+      name: "Feishu / Lark (Archived)",
+      meta: "Disabled by default via sdkconfig (CONFIG_ESPET_ENABLE_FEISHU=n). Enable via firmware config if needed.",
+      badge: "Archived",
+      tone: "default" as const,
     },
     {
       name: "Google (Gmail · Calendar · Drive)",
