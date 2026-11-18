@@ -200,28 +200,8 @@ static void on_camera_button_up(uint32_t hold_duration_ms)
     }
 }
 
-static void on_camera_button_long_press(void)
-{
-    ESP_LOGW(TAG, "🔘 [CAM BTN] 5s long press detected: switching to BLE Provisioning mode");
-    if (s_snap_fb) {
-        ESP_LOGI(TAG, "📸 [CAM BTN] Discarding pending camera buffer");
-        tool_camera_return_picture(s_snap_fb);
-        s_snap_fb = NULL;
-    }
-
-    size_t samples = 0;
-    uint32_t rec_dur = 0;
-    double rms = 0.0;
-    tool_audio_manual_record_stop(&samples, &rec_dur, &rms);
-    ESP_LOGI(TAG, "🎙️ [CAM BTN] Discarded manual voice record (%u samples)", (unsigned)samples);
-    s_snap_in_flight = false;
-
-    display_status_set("WiFi Setup (BLE)", "Starting BLE...");
-    wifi_manager_trigger_ble_prov();
-}
-
 /* GPIO 41 camera button: short press = snapshot to Telegram,
- * hold >= 600 ms = video capture start/stop, hold >= 5000 ms = Wi-Fi BLE provisioning. */
+ * hold >= 400 ms = multimodal push-to-talk voice query. */
 
 static esp_err_t init_nvs(void)
 {
@@ -451,7 +431,7 @@ void app_main(void)
     ESP_ERROR_CHECK(llm_proxy_init());
     ESP_ERROR_CHECK(tool_registry_init());
     ESP_ERROR_CHECK(tool_camera_init());
-    ESP_ERROR_CHECK(button_handler_init(on_camera_button_down, on_camera_button_up, on_camera_button_long_press));
+    ESP_ERROR_CHECK(button_handler_init(on_camera_button_down, on_camera_button_up));
     ESP_ERROR_CHECK(cron_service_init());
     ESP_ERROR_CHECK(heartbeat_init());
     ESP_ERROR_CHECK(config_sync_init());

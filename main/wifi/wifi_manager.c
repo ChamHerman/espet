@@ -369,7 +369,8 @@ void wifi_manager_trigger_ble_prov(void)
 {
     s_ble_prov_requested = true;
     display_status_set("WiFi Setup (BLE)", "Starting BLE...");
-    ESP_LOGW(TAG, "Rebooting into BLE onboarding mode...");
+    ESP_LOGW(TAG, "Stopping Wi-Fi and rebooting into BLE onboarding mode...");
+    wifi_manager_stop();
     vTaskDelay(pdMS_TO_TICKS(500));
     esp_restart();
 }
