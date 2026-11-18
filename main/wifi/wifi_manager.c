@@ -12,6 +12,7 @@
 #include "esp_attr.h"
 #include "esp_system.h"
 #include "esp_netif_sntp.h"
+#include "esp_timer.h"
 
 static const char *TAG = "wifi";
 
@@ -22,6 +23,15 @@ static bool s_connected = false;
 static bool s_reconnect_enabled = true;
 static RTC_DATA_ATTR bool s_ble_prov_requested = false;
 static bool s_runtime_connected = false;
+static esp_timer_handle_t s_reconnect_timer = NULL;
+
+static void on_reconnect_timer(void *arg)
+{
+    if (s_reconnect_enabled) {
+        ESP_LOGI(TAG, "Reconnecting to Wi-Fi...");
+        esp_wifi_connect();
+    }
+}
 
 static const char *wifi_reason_to_str(wifi_err_reason_t reason)
 {
@@ -59,9 +69,13 @@ static void event_handler(void *arg, esp_event_base_t event_base,
             }
             ESP_LOGW(TAG, "Disconnected, retry %d/%d in %" PRIu32 "ms",
                      s_retry_count + 1, MIMI_WIFI_MAX_RETRY, delay_ms);
-            vTaskDelay(pdMS_TO_TICKS(delay_ms));
-            esp_wifi_connect();
             s_retry_count++;
+            if (s_reconnect_timer) {
+                esp_timer_stop(s_reconnect_timer);
+                esp_timer_start_once(s_reconnect_timer, (uint64_t)delay_ms * 1000);
+            } else {
+                esp_wifi_connect();
+            }
         } else {
             ESP_LOGE(TAG, "Failed to connect after %d retries", MIMI_WIFI_MAX_RETRY);
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
@@ -73,6 +87,9 @@ static void event_handler(void *arg, esp_event_base_t event_base,
             }
         }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        if (s_reconnect_timer) {
+            esp_timer_stop(s_reconnect_timer);
+        }
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         snprintf(s_ip_str, sizeof(s_ip_str), IPSTR, IP2STR(&event->ip_info.ip));
         ESP_LOGI(TAG, "Connected! IP: %s", s_ip_str);
@@ -118,6 +135,17 @@ esp_err_t wifi_manager_init(void)
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
+    esp_timer_create_args_t timer_args = {
+        .callback = on_reconnect_timer,
+        .arg = NULL,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "wifi_reconn",
+    };
+    esp_err_t timer_err = esp_timer_create(&timer_args, &s_reconnect_timer);
+    if (timer_err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to create reconnect timer: %s", esp_err_to_name(timer_err));
+    }
+
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL, NULL));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
@@ -129,7 +157,15 @@ esp_err_t wifi_manager_init(void)
 
 esp_err_t wifi_manager_start(void)
 {
-    wifi_config_t wifi_cfg = {0};
+    wifi_config_t wifi_cfg = {
+        .sta = {
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+            .pmf_cfg = {
+                .capable = true,
+                .required = false,
+            },
+        },
+    };
     bool found = false;
 
     /* Build-time secrets take highest priority (if set) */
@@ -306,6 +342,9 @@ bool wifi_manager_has_credentials(void)
 esp_err_t wifi_manager_stop(void)
 {
     s_reconnect_enabled = false;
+    if (s_reconnect_timer) {
+        esp_timer_stop(s_reconnect_timer);
+    }
     esp_wifi_disconnect();
     esp_wifi_stop();
     s_connected = false;
@@ -320,6 +359,9 @@ void wifi_manager_set_reconnect_enabled(bool enabled)
     s_reconnect_enabled = enabled;
     if (!enabled) {
         s_retry_count = 0;
+        if (s_reconnect_timer) {
+            esp_timer_stop(s_reconnect_timer);
+        }
     }
 }
 
