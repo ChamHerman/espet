@@ -1,0 +1,12 @@
+menu "ESPET Configuration"
+
+    config ESPET_ENABLE_FEISHU
+        bool "Enable Feishu / Lark Bot Channel"
+        default n
+        help
+            Enables Feishu / Lark messaging channel on the ESP32.
+            Disabled by default to save SRAM, task stacks, and network sockets.
+            When disabled, all Feishu tasks, credentials, and CLI commands
+            are compiled out completely.
+
+endmenu
