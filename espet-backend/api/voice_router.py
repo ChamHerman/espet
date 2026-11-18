@@ -14,6 +14,7 @@ TTS:  edge-tts (Microsoft Edge neural voices, free, no API key) + ffmpeg
       to convert MP3 -> 16 kHz mono 16-bit WAV the I2S TX path can stream.
 """
 
+import asyncio
 import logging
 import math
 import os
@@ -29,7 +30,7 @@ from pydantic import BaseModel
 
 from auth.device_auth import verify_device_key
 from config import settings
-from services.oled_summarizer import extract_oled_keywords
+from services.oled_summarizer import extract_oled_keywords, extract_oled_keywords_llm
 
 router = APIRouter(prefix="/api/voice", tags=["voice"])
 logger = logging.getLogger("espet-backend.voice")
@@ -637,19 +638,21 @@ async def tts(req: TTSRequest):
 
     voice = req.voice or settings.voice_tts_voice
     try:
-        wav = await _tts_to_wav(text, voice)
+        wav, (line1, line2) = await asyncio.gather(
+            _tts_to_wav(text, voice),
+            extract_oled_keywords_llm(req.text),
+        )
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception("TTS failed")
+        logger.exception("TTS/OLED distillation failed")
         raise HTTPException(500, f"tts failed: {e}")
 
-    line1, line2 = extract_oled_keywords(req.text)
     headers = {
         "X-OLED-Line1": line1,
         "X-OLED-Line2": line2,
     }
-    logger.info("TTS OLED keywords: L1='%s', L2='%s' (for text: '%.40s...')",
+    logger.info("TTS OLED keywords (LLM): L1='%s', L2='%s' (for text: '%.40s...')",
                 line1, line2, req.text)
 
     return Response(content=wav, media_type="audio/wav", headers=headers)

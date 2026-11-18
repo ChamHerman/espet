@@ -390,8 +390,11 @@ char *voice_client_transcribe(const int16_t *pcm, size_t samples)
     return ret;
 }
 
-char *voice_client_vision_query(const uint8_t *jpeg_data, size_t jpeg_len, const char *query)
+char *voice_client_vision_query_full(const uint8_t *jpeg_data, size_t jpeg_len, const char *query,
+                                     char *out_l1, size_t l1_sz, char *out_l2, size_t l2_sz)
 {
+    if (out_l1 && l1_sz > 0) out_l1[0] = '\0';
+    if (out_l2 && l2_sz > 0) out_l2[0] = '\0';
     if (!jpeg_data || jpeg_len == 0) return NULL;
 
     rx_buf_t *rx = heap_caps_calloc(1, sizeof(rx_buf_t), MALLOC_CAP_SPIRAM);
@@ -465,10 +468,25 @@ char *voice_client_vision_query(const uint8_t *jpeg_data, size_t jpeg_len, const
             if (cJSON_IsString(rep_item) && rep_item->valuestring[0] != '\0') {
                 reply = strdup(rep_item->valuestring);
             }
+            if (out_l1 && l1_sz > 0) {
+                cJSON *l1_item = cJSON_GetObjectItem(j, "oled_l1");
+                if (cJSON_IsString(l1_item) && l1_item->valuestring[0] != '\0') {
+                    strncpy(out_l1, l1_item->valuestring, l1_sz - 1);
+                    out_l1[l1_sz - 1] = '\0';
+                }
+            }
+            if (out_l2 && l2_sz > 0) {
+                cJSON *l2_item = cJSON_GetObjectItem(j, "oled_l2");
+                if (cJSON_IsString(l2_item) && l2_item->valuestring[0] != '\0') {
+                    strncpy(out_l2, l2_item->valuestring, l2_sz - 1);
+                    out_l2[l2_sz - 1] = '\0';
+                }
+            }
             cJSON_Delete(j);
         }
-        ESP_LOGI(TAG, "Vision query OK in %u ms (%u bytes img): '%.60s'",
-                 (unsigned)dt, (unsigned)jpeg_len, reply ? reply : "");
+        ESP_LOGI(TAG, "Vision query OK in %u ms (%u bytes img): '%.60s' (OLED: '%s' / '%s')",
+                 (unsigned)dt, (unsigned)jpeg_len, reply ? reply : "",
+                 out_l1 ? out_l1 : "", out_l2 ? out_l2 : "");
     } else {
         ESP_LOGE(TAG, "Vision query FAILED: err=%s status=%d len=%u (%u ms)",
                  esp_err_to_name(err), status, (unsigned)rx->len, (unsigned)dt);
@@ -478,6 +496,11 @@ char *voice_client_vision_query(const uint8_t *jpeg_data, size_t jpeg_len, const
     free(rx->buf);
     free(rx);
     return reply;
+}
+
+char *voice_client_vision_query(const uint8_t *jpeg_data, size_t jpeg_len, const char *query)
+{
+    return voice_client_vision_query_full(jpeg_data, jpeg_len, query, NULL, 0, NULL, 0);
 }
 
 /* -----------------------------------------------------------------------

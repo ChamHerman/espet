@@ -100,10 +100,15 @@ static void snap_process_task(void *arg)
 
     /* Send image and optional voice query to the multimodal backend */
     ESP_LOGI(TAG, "[SNAP-TASK] Sending vision query to backend (%u bytes img)...", (unsigned)fb->len);
-    char *reply = voice_client_vision_query(fb->buf, fb->len, transcript ? transcript : "");
+    char oled_l1[17] = {0};
+    char oled_l2[17] = {0};
+    char *reply = voice_client_vision_query_full(fb->buf, fb->len, transcript ? transcript : "",
+                                                 oled_l1, sizeof(oled_l1),
+                                                 oled_l2, sizeof(oled_l2));
     if (reply && reply[0] != '\0') {
-        ESP_LOGI(TAG, "Vision response: '%s'", reply);
-        voice_client_speak(reply);
+        ESP_LOGI(TAG, "Vision response: '%s' (OLED: '%s' / '%s')",
+                 reply, oled_l1, oled_l2);
+        voice_client_speak_with_display(reply, oled_l1[0] ? oled_l1 : NULL, oled_l2[0] ? oled_l2 : NULL);
         free(reply);
     } else {
         ESP_LOGW(TAG, "Vision query returned no reply or failed");
