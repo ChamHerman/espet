@@ -1,5 +1,12 @@
 import unittest
-from services.oled_summarizer import extract_oled_keywords, MAX_LINE_CHARS
+from unittest.mock import patch, AsyncMock
+from services.oled_summarizer import (
+    extract_oled_keywords,
+    extract_oled_keywords_llm,
+    _sanitize_oled_line,
+    MAX_LINE_CHARS,
+)
+from services.telegram_gateway import TelegramGateway
 
 class TestOledSummarizer(unittest.TestCase):
     def test_empty_and_short(self):
@@ -61,6 +68,46 @@ class TestOledSummarizer(unittest.TestCase):
         words_l1 = l1.split()
         for w in words_l1:
             self.assertTrue(w in text or w.capitalize() in text or w.lower() in text.lower())
+
+    def test_sanitize_oled_line(self):
+        self.assertEqual(_sanitize_oled_line(""), "")
+        self.assertEqual(_sanitize_oled_line("**Hello World!**"), "Hello World!")
+        # Exceeds 16 chars
+        res = _sanitize_oled_line("Supercalifragilisticexpialidocious")
+        self.assertLessEqual(len(res), 16)
+        self.assertEqual(res, "Supercalifragili")
+        # Non-ASCII unicode gets stripped/normalized
+        res_unicode = _sanitize_oled_line("你好世界 Hello")
+        self.assertEqual(res_unicode, "Hello")
+
+    def test_telegram_gateway_alias(self):
+        gw = TelegramGateway(registry=None, bot_token="fake:token")
+        self.assertTrue(hasattr(gw, "send_message"))
+        self.assertEqual(gw.send_message, gw.send_text)
+
+    async def _run_llm_summarizer(self):
+        import httpx
+        mock_resp = httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "Seeing Pale Wall\nHand In Front"}}]},
+            request=httpx.Request("POST", "https://api.test.com/v1/chat/completions"),
+        )
+
+        with patch("services.gateway_settings.gateway_settings.llm_config", return_value={
+            "api_key": "test_key",
+            "base_url": "https://api.test.com/v1",
+            "model": "test-model"
+        }):
+            with patch("httpx.AsyncClient.post", return_value=mock_resp):
+                l1, l2 = await extract_oled_keywords_llm("I see a blurry view of a pale wall with your hand.")
+                self.assertEqual(l1, "Seeing Pale Wall")
+                self.assertEqual(l2, "Hand In Front")
+                self.assertLessEqual(len(l1), 16)
+                self.assertLessEqual(len(l2), 16)
+
+    def test_extract_oled_keywords_llm(self):
+        import asyncio
+        asyncio.run(self._run_llm_summarizer())
 
 if __name__ == "__main__":
     unittest.main()

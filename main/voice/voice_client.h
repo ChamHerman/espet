@@ -83,6 +83,12 @@ char *voice_client_transcribe(const int16_t *pcm, size_t samples);
  */
 char *voice_client_vision_query(const uint8_t *jpeg_data, size_t jpeg_len, const char *query);
 
+/**
+ * @brief Multimodal vision query returning both full reply and OLED distilled lines.
+ */
+char *voice_client_vision_query_full(const uint8_t *jpeg_data, size_t jpeg_len, const char *query,
+                                     char *out_l1, size_t l1_sz, char *out_l2, size_t l2_sz);
+
 #ifdef __cplusplus
 }
 #endif

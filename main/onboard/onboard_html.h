@@ -1,5 +1,7 @@
 #pragma once
 
+#include "mimi_config.h"
+
 static const char ONBOARD_HTML[] =
 "<!DOCTYPE html><html><head>"
 "<meta charset='utf-8'>"
@@ -70,6 +72,7 @@ static const char ONBOARD_HTML[] =
 "<input id='tg_token' placeholder='123456:ABC-DEF...'>"
 "</div></div>"
 
+#if MIMI_FEISHU_ENABLE
 /* Feishu section */
 "<div class='card collapsed' id='sec-feishu'>"
 "<div class='card-hdr' onclick='toggle(this)'>Feishu</div>"
@@ -79,6 +82,7 @@ static const char ONBOARD_HTML[] =
 "<label>App Secret</label>"
 "<input id='feishu_app_secret' type='password' placeholder='App Secret'>"
 "</div></div>"
+#endif
 
 /* Proxy section */
 "<div class='card collapsed' id='sec-proxy'>"
@@ -135,9 +139,12 @@ static const char ONBOARD_HTML[] =
 
 "function save(){"
 "var fields=['ssid','password','api_key','model','provider','tg_token',"
-"'feishu_app_id','feishu_app_secret','proxy_host','proxy_port','proxy_type','search_key','tavily_key'];"
+#if MIMI_FEISHU_ENABLE
+"'feishu_app_id','feishu_app_secret',"
+#endif
+"'proxy_host','proxy_port','proxy_type','search_key','tavily_key'];"
 "var data={};"
-"fields.forEach(f=>{data[f]=document.getElementById(f).value.trim()});"
+"fields.forEach(f=>{var el=document.getElementById(f);if(el)data[f]=el.value.trim()});"
 "document.getElementById('status').style.display='block';"
 "fetch('/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})"
 ".then(()=>{document.getElementById('status').textContent='Saved! Restarting...';})"

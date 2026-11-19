@@ -14,7 +14,9 @@
 #include "wifi/wifi_manager.h"
 #include "channels/telegram/telegram_bot.h"
 #include "channels/cloud_link/cloud_link.h"
+#if MIMI_FEISHU_ENABLE
 #include "channels/feishu/feishu_bot.h"
+#endif
 #include "llm/llm_proxy.h"
 #include "agent/agent_loop.h"
 #include "memory/memory_store.h"
@@ -98,10 +100,15 @@ static void snap_process_task(void *arg)
 
     /* Send image and optional voice query to the multimodal backend */
     ESP_LOGI(TAG, "[SNAP-TASK] Sending vision query to backend (%u bytes img)...", (unsigned)fb->len);
-    char *reply = voice_client_vision_query(fb->buf, fb->len, transcript ? transcript : "");
+    char oled_l1[17] = {0};
+    char oled_l2[17] = {0};
+    char *reply = voice_client_vision_query_full(fb->buf, fb->len, transcript ? transcript : "",
+                                                 oled_l1, sizeof(oled_l1),
+                                                 oled_l2, sizeof(oled_l2));
     if (reply && reply[0] != '\0') {
-        ESP_LOGI(TAG, "Vision response: '%s'", reply);
-        voice_client_speak(reply);
+        ESP_LOGI(TAG, "Vision response: '%s' (OLED: '%s' / '%s')",
+                 reply, oled_l1, oled_l2);
+        voice_client_speak_with_display(reply, oled_l1[0] ? oled_l1 : NULL, oled_l2[0] ? oled_l2 : NULL);
         free(reply);
     } else {
         ESP_LOGW(TAG, "Vision query returned no reply or failed");
@@ -199,7 +206,7 @@ static void on_camera_button_up(uint32_t hold_duration_ms)
 }
 
 /* GPIO 41 camera button: short press = snapshot to Telegram,
- * hold >= 600 ms = video capture start/stop. */
+ * hold >= 400 ms = multimodal push-to-talk voice query. */
 
 static esp_err_t init_nvs(void)
 {
@@ -340,16 +347,19 @@ static void outbound_dispatch_task(void *arg)
                     }
                 }
             }
-#else
-        } else if (strcmp(msg.channel, MIMI_CHAN_FEISHU) == 0) {
+        }
 #endif
+#if MIMI_FEISHU_ENABLE
+        else if (strcmp(msg.channel, MIMI_CHAN_FEISHU) == 0) {
             esp_err_t send_err = feishu_send_message(msg.chat_id, msg.content);
             if (send_err != ESP_OK) {
                 ESP_LOGE(TAG, "Feishu send failed for %s: %s", msg.chat_id, esp_err_to_name(send_err));
             } else {
                 ESP_LOGI(TAG, "Feishu send success for %s (%d bytes)", msg.chat_id, (int)strlen(msg.content));
             }
-        } else if (strcmp(msg.channel, MIMI_CHAN_WEBSOCKET) == 0) {
+        }
+#endif
+        else if (strcmp(msg.channel, MIMI_CHAN_WEBSOCKET) == 0) {
             esp_err_t ws_err = ws_server_send(msg.chat_id, msg.content);
             if (ws_err != ESP_OK) {
                 ESP_LOGW(TAG, "WS send failed for %s: %s", msg.chat_id, esp_err_to_name(ws_err));
@@ -420,7 +430,9 @@ void app_main(void)
     ESP_ERROR_CHECK(wifi_manager_init());
     ESP_ERROR_CHECK(http_proxy_init());
     ESP_ERROR_CHECK(telegram_bot_init());
+#if MIMI_FEISHU_ENABLE
     ESP_ERROR_CHECK(feishu_bot_init());
+#endif
     ESP_ERROR_CHECK(llm_proxy_init());
     ESP_ERROR_CHECK(tool_registry_init());
     ESP_ERROR_CHECK(tool_camera_init());
@@ -445,8 +457,6 @@ void app_main(void)
     esp_err_t wifi_err = wifi_manager_start();
     bool wifi_ok = false;
     if (wifi_err == ESP_OK) {
-        ESP_LOGI(TAG, "Scanning nearby APs on boot...");
-        wifi_manager_scan_and_print();
         ESP_LOGI(TAG, "Waiting for WiFi connection...");
         if (wifi_manager_wait_connected(30000) == ESP_OK) {
             wifi_ok = true;
@@ -484,7 +494,9 @@ void app_main(void)
 #else
         ESP_ERROR_CHECK(telegram_bot_start());
 #endif
+#if MIMI_FEISHU_ENABLE
         ESP_ERROR_CHECK(feishu_bot_start());
+#endif
         cron_service_start();
         heartbeat_start();
         ESP_ERROR_CHECK(ws_server_start());

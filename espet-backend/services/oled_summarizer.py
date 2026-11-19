@@ -11,9 +11,16 @@ into two punchy, meaningful lines (<= 16 chars each) so important keywords
 are visible without word-splitting or truncation.
 """
 
+import logging
 import re
 import unicodedata
 from typing import Tuple
+
+import httpx
+
+from services.gateway_settings import gateway_settings
+
+logger = logging.getLogger("espet-backend.oled")
 
 MAX_LINE_CHARS = 16
 
@@ -244,3 +251,105 @@ def extract_oled_keywords(text: str) -> Tuple[str, str]:
         l1 = cleaned[:MAX_LINE_CHARS].strip()
 
     return (l1[:MAX_LINE_CHARS], l2[:MAX_LINE_CHARS])
+
+
+def _sanitize_oled_line(s: str) -> str:
+    """Ensure string is strictly ASCII and <= MAX_LINE_CHARS (16)."""
+    if not s:
+        return ""
+    # Strip markdown formatting
+    s = re.sub(r"[*`_#]", "", s)
+    # Convert unicode to ASCII (e.g. accents -> ASCII, drops non-ASCII)
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+    s = s.replace("\r", " ").replace("\n", " ").strip()
+    return s[:MAX_LINE_CHARS].strip()
+
+
+async def extract_oled_keywords_llm(text: str) -> Tuple[str, str]:
+    """
+    Distills conversational text into exactly two lines (<= 16 ASCII chars each)
+    using the configured fast LLM.
+    Strictly outputs English or Romanized Pinyin to match SSD1306 ASCII font.
+    """
+    if not text or not text.strip():
+        return ("", "")
+
+    cleaned_input = text.strip()
+
+    cfg = gateway_settings.llm_config()
+    api_key = cfg.get("api_key")
+    base_url = (cfg.get("base_url") or "https://api.xkiro.com/v1").rstrip("/")
+    model = cfg.get("model") or "sensenova/sensenova-6.8-flash-lite"
+
+    if not api_key:
+        logger.warning("No LLM api_key configured for OLED distillation; falling back to extract_oled_keywords")
+        return extract_oled_keywords(cleaned_input)
+
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are an OLED display formatter for a physical 128x64 SSD1306 screen with an 8x16 ASCII font.\n"
+                    "Given any assistant response, produce EXACTLY 2 short lines (strictly <= 16 ASCII characters per line) "
+                    "summarizing the key action or answer.\n"
+                    "Rules:\n"
+                    "1. Exactly 2 lines separated by a single newline.\n"
+                    "2. Each line must be <= 16 characters.\n"
+                    "3. ASCII characters only (English or Romanized Pinyin). No Chinese characters, emojis, or punctuation symbols like quotes.\n"
+                    "4. Output only the 2 lines, nothing else.\n\n"
+                    "Example 1:\n"
+                    "Input: I have turned on the status LED on GPIO 42.\n"
+                    "Output:\n"
+                    "Status LED\n"
+                    "State: ON\n\n"
+                    "Example 2:\n"
+                    "Input: 好的，我现在为您查询吉隆坡的天气。今天有小雨，气温28度。\n"
+                    "Output:\n"
+                    "Kuala Lumpur\n"
+                    "28C Light Rain\n\n"
+                    "Example 3:\n"
+                    "Input: I see a blurry view of a pale surface with a hand in front.\n"
+                    "Output:\n"
+                    "Seeing Pale Wall\n"
+                    "Hand In Front"
+                ),
+            },
+            {
+                "role": "user",
+                "content": cleaned_input[:600],
+            },
+        ],
+        "max_tokens": 40,
+        "temperature": 0.1,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                f"{base_url}/chat/completions",
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    "User-Agent": "ESPET-Backend/1.0",
+                },
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                choices = data.get("choices", [])
+                if choices and "message" in choices[0]:
+                    content = choices[0]["message"].get("content", "").strip()
+                    lines = [l.strip() for l in content.splitlines() if l.strip()]
+                    l1 = _sanitize_oled_line(lines[0]) if len(lines) > 0 else ""
+                    l2 = _sanitize_oled_line(lines[1]) if len(lines) > 1 else ""
+                    logger.info("LLM OLED distillation: L1='%s', L2='%s' (from '%.40s...')",
+                                l1, l2, cleaned_input)
+                    return (l1, l2)
+            else:
+                logger.error("LLM OLED distillation failed: HTTP %d %s", resp.status_code, resp.text)
+    except Exception as exc:
+        logger.error("LLM OLED distillation exception: %r", exc)
+
+    return extract_oled_keywords(cleaned_input)

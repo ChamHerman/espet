@@ -1,6 +1,9 @@
 #pragma once
 
 #include "esp_err.h"
+#include "mimi_config.h"
+
+#if MIMI_FEISHU_ENABLE
 
 /**
  * Initialize the Feishu bot (load credentials from NVS / build-time).
@@ -8,8 +11,7 @@
 esp_err_t feishu_bot_init(void);
 
 /**
- * Start the Feishu webhook HTTP server for receiving events.
- * Listens on MIMI_FEISHU_WEBHOOK_PORT.
+ * Start the Feishu WebSocket connection for receiving events.
  */
 esp_err_t feishu_bot_start(void);
 
@@ -34,3 +36,23 @@ esp_err_t feishu_reply_message(const char *message_id, const char *text);
  * @param app_secret Feishu App Secret
  */
 esp_err_t feishu_set_credentials(const char *app_id, const char *app_secret);
+
+#else
+
+/* Inline no-op / disabled stubs when Feishu channel is compiled out */
+static inline esp_err_t feishu_bot_init(void) { return ESP_OK; }
+static inline esp_err_t feishu_bot_start(void) { return ESP_OK; }
+static inline esp_err_t feishu_send_message(const char *chat_id, const char *text) {
+    (void)chat_id; (void)text;
+    return ESP_ERR_NOT_SUPPORTED;
+}
+static inline esp_err_t feishu_reply_message(const char *message_id, const char *text) {
+    (void)message_id; (void)text;
+    return ESP_ERR_NOT_SUPPORTED;
+}
+static inline esp_err_t feishu_set_credentials(const char *app_id, const char *app_secret) {
+    (void)app_id; (void)app_secret;
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+#endif

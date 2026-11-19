@@ -37,11 +37,23 @@
 #ifndef MIMI_SECRET_SEARCH_KEY
 #define MIMI_SECRET_SEARCH_KEY ""
 #endif
+
+/* Feishu Channel Enable Flag: controlled via Kconfig / sdkconfig */
+#ifndef MIMI_FEISHU_ENABLE
+#if defined(CONFIG_ESPET_ENABLE_FEISHU) && CONFIG_ESPET_ENABLE_FEISHU
+#define MIMI_FEISHU_ENABLE 1
+#else
+#define MIMI_FEISHU_ENABLE 0
+#endif
+#endif
+
+#if MIMI_FEISHU_ENABLE
 #ifndef MIMI_SECRET_FEISHU_APP_ID
 #define MIMI_SECRET_FEISHU_APP_ID ""
 #endif
 #ifndef MIMI_SECRET_FEISHU_APP_SECRET
 #define MIMI_SECRET_FEISHU_APP_SECRET ""
+#endif
 #endif
 #ifndef MIMI_SECRET_TAVILY_KEY
 #define MIMI_SECRET_TAVILY_KEY ""
@@ -61,7 +73,8 @@
 #define MIMI_TG_CARD_SHOW_MS 3000
 #define MIMI_TG_CARD_BODY_SCALE 3
 
-/* Feishu Bot */
+/* Feishu Bot (Archived - enabled only when CONFIG_ESPET_ENABLE_FEISHU=y) */
+#if MIMI_FEISHU_ENABLE
 #define MIMI_FEISHU_MAX_MSG_LEN 4096
 #define MIMI_FEISHU_POLL_STACK (12 * 1024)
 #define MIMI_FEISHU_POLL_PRIO 5
@@ -69,6 +82,7 @@
 #define MIMI_FEISHU_WEBHOOK_PORT 18790
 #define MIMI_FEISHU_WEBHOOK_PATH "/feishu/events"
 #define MIMI_FEISHU_WEBHOOK_MAX_BODY (16 * 1024)
+#endif
 
 /* Agent Loop */
 #define MIMI_AGENT_STACK (24 * 1024)
@@ -183,7 +197,9 @@
 /* NVS Namespaces */
 #define MIMI_NVS_WIFI "wifi_config"
 #define MIMI_NVS_TG "tg_config"
+#if MIMI_FEISHU_ENABLE
 #define MIMI_NVS_FEISHU "feishu_config"
+#endif
 #define MIMI_NVS_LLM "llm_config"
 #define MIMI_NVS_PROXY "proxy_config"
 #define MIMI_NVS_SEARCH "search_config"
@@ -192,8 +208,10 @@
 #define MIMI_NVS_KEY_SSID "ssid"
 #define MIMI_NVS_KEY_PASS "password"
 #define MIMI_NVS_KEY_TG_TOKEN "bot_token"
+#if MIMI_FEISHU_ENABLE
 #define MIMI_NVS_KEY_FEISHU_APP_ID "app_id"
 #define MIMI_NVS_KEY_FEISHU_APP_SECRET "app_secret"
+#endif
 #define MIMI_NVS_KEY_API_KEY "api_key"
 #define MIMI_NVS_KEY_TAVILY_KEY "tavily_key"
 #define MIMI_NVS_KEY_MODEL "model"

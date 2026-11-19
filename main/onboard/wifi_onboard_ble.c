@@ -1,7 +1,9 @@
 #include "wifi_onboard_ble.h"
 #include "sdkconfig.h"
 
-#if CONFIG_BT_ENABLED
+#if !CONFIG_BT_ENABLED
+#error "CONFIG_BT_ENABLED must be enabled in sdkconfig. BLE Wi-Fi provisioning is mandatory for onboarding."
+#endif
 
 #include "wifi/wifi_manager.h"
 #include "display/display_status.h"
@@ -125,20 +127,3 @@ esp_err_t wifi_onboard_ble_start(void)
 
     return ESP_OK;
 }
-
-#else
-
-#include "onboard/wifi_onboard.h"
-#include "display/display_status.h"
-#include "esp_log.h"
-
-static const char *TAG = "onboard_ble";
-
-esp_err_t wifi_onboard_ble_start(void)
-{
-    ESP_LOGW(TAG, "BLE provisioning unavailable because CONFIG_BT_ENABLED is disabled; using SoftAP onboarding");
-    display_status_set("WiFi Setup (AP)", "ESPET");
-    return wifi_onboard_start(WIFI_ONBOARD_MODE_CAPTIVE);
-}
-
-#endif
