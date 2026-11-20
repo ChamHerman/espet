@@ -659,14 +659,16 @@ static void voice_speak_internal(const char *text, const char *display_l1, const
         return;
     }
     if ((display_l1 && display_l1[0]) || (display_l2 && display_l2[0])) {
-        display_status_set(display_l1 ? display_l1 : "", display_l2 ? display_l2 : "");
-    } else if (fetched_l1[0] || fetched_l2[0]) {
-        display_status_set(fetched_l1, fetched_l2);
-    } else if (text && text[0]) {
-        char l1[17] = {0};
-        char l2[17] = {0};
-        word_wrap_oled(text, l1, sizeof(l1), l2, sizeof(l2));
-        display_status_set(l1, l2);
+        display_status_set_text_timed(display_l1 ? display_l1 : "", display_l2 ? display_l2 : "", 8000);
+    } else if (!display_status_is_held()) {
+        if (fetched_l1[0] || fetched_l2[0]) {
+            display_status_set_text_timed(fetched_l1, fetched_l2, 8000);
+        } else if (text && text[0]) {
+            char l1[17] = {0};
+            char l2[17] = {0};
+            word_wrap_oled(text, l1, sizeof(l1), l2, sizeof(l2));
+            display_status_set_text_timed(l1, l2, 8000);
+        }
     }
     esp_err_t perr = tool_audio_play_wav(wav, wav_len);
     free(wav);
@@ -674,6 +676,8 @@ static void voice_speak_internal(const char *text, const char *display_l1, const
     if (perr != ESP_OK) {
         ESP_LOGE(TAG, "WAV playback failed: %s", esp_err_to_name(perr));
     }
+    /* Extend hold for 5 seconds after speech completes (Speech Duration + 5s buffer) */
+    display_status_extend_hold(5000);
 }
 
 /* -----------------------------------------------------------------------

@@ -175,6 +175,123 @@ static cJSON *build_tool_results(const llm_response_t *resp,
   return content;
 }
 
+static void word_wrap_oled_local(const char *text, char *l1, size_t l1_sz, char *l2, size_t l2_sz) {
+  if (l1 && l1_sz > 0) l1[0] = '\0';
+  if (l2 && l2_sz > 0) l2[0] = '\0';
+  if (!text || !*text || !l1 || !l2) return;
+
+  while (*text == ' ' || *text == '\t' || *text == '\n' || *text == '\r') text++;
+
+  size_t tlen = strlen(text);
+  if (tlen < l1_sz) {
+    strncpy(l1, text, l1_sz - 1);
+    l1[l1_sz - 1] = '\0';
+    return;
+  }
+
+  int split1 = 16;
+  while (split1 > 0 && text[split1] != ' ' && text[split1] != '\0') {
+    split1--;
+  }
+  if (split1 == 0) split1 = 16;
+
+  int copy1 = split1 < (int)l1_sz ? split1 : (int)l1_sz - 1;
+  strncpy(l1, text, copy1);
+  l1[copy1] = '\0';
+
+  const char *p2 = text + split1;
+  while (*p2 == ' ' || *p2 == '\t' || *p2 == '\n' || *p2 == '\r') p2++;
+
+  if (*p2) {
+    int split2 = 16;
+    size_t rem = strlen(p2);
+    if (rem < (size_t)split2) {
+      split2 = (int)rem;
+    } else {
+      while (split2 > 0 && p2[split2] != ' ' && p2[split2] != '\0') {
+        split2--;
+      }
+      if (split2 == 0) split2 = 16;
+    }
+    int copy2 = split2 < (int)l2_sz ? split2 : (int)l2_sz - 1;
+    strncpy(l2, p2, copy2);
+    l2[copy2] = '\0';
+  }
+}
+
+static bool extract_and_strip_oled_tag(char *text, char *out_l1, size_t l1_sz, char *out_l2, size_t l2_sz) {
+  if (out_l1 && l1_sz > 0) out_l1[0] = '\0';
+  if (out_l2 && l2_sz > 0) out_l2[0] = '\0';
+  if (!text || !*text) return false;
+
+  char *tag_start = strcasestr(text, "[OLED:");
+  bool colon_format = true;
+  if (!tag_start) {
+    tag_start = strcasestr(text, "[OLED]");
+    colon_format = false;
+  }
+  if (!tag_start) return false;
+
+  char *tag_end = strchr(tag_start, ']');
+  if (!tag_end) return false;
+
+  char raw_tag[128] = {0};
+  size_t tag_len = (size_t)(tag_end - tag_start + 1);
+  if (tag_len >= sizeof(raw_tag)) tag_len = sizeof(raw_tag) - 1;
+  strncpy(raw_tag, tag_start, tag_len);
+  raw_tag[tag_len] = '\0';
+
+  char *content = colon_format ? (raw_tag + 6) : (raw_tag + 6);
+  while (*content == ' ' || *content == '\t') content++;
+
+  char *delim = strchr(content, '|');
+  if (!delim) delim = strchr(content, '\n');
+  if (!delim) delim = strchr(content, ';');
+
+  if (delim) {
+    *delim = '\0';
+    char *p1 = content;
+    char *p2 = delim + 1;
+
+    char *close_bracket = strchr(p2, ']');
+    if (close_bracket) *close_bracket = '\0';
+
+    while (*p1 == ' ' || *p1 == '\t') p1++;
+    char *end1 = p1 + strlen(p1) - 1;
+    while (end1 > p1 && (*end1 == ' ' || *end1 == '\t' || *end1 == '\r' || *end1 == '\n')) {
+      *end1 = '\0';
+      end1--;
+    }
+
+    while (*p2 == ' ' || *p2 == '\t' || *p2 == '\r' || *p2 == '\n') p2++;
+    char *end2 = p2 + strlen(p2) - 1;
+    while (end2 > p2 && (*end2 == ' ' || *end2 == '\t' || *end2 == '\r' || *end2 == '\n')) {
+      *end2 = '\0';
+      end2--;
+    }
+
+    if (out_l1 && l1_sz > 0) {
+      strncpy(out_l1, p1, l1_sz - 1);
+      out_l1[l1_sz - 1] = '\0';
+    }
+    if (out_l2 && l2_sz > 0) {
+      strncpy(out_l2, p2, l2_sz - 1);
+      out_l2[l2_sz - 1] = '\0';
+    }
+  } else {
+    char *close_bracket = strchr(content, ']');
+    if (close_bracket) *close_bracket = '\0';
+    while (*content == ' ' || *content == '\t') content++;
+    word_wrap_oled_local(content, out_l1, l1_sz, out_l2, l2_sz);
+  }
+
+  char *after = tag_end + 1;
+  while (*after == ' ' || *after == '\t' || *after == '\r' || *after == '\n') after++;
+  memmove(tag_start, after, strlen(after) + 1);
+
+  return true;
+}
+
 static void agent_loop_task(void *arg) {
   ESP_LOGI(TAG, "Agent loop started on core %d", xPortGetCoreID());
 
@@ -306,7 +423,19 @@ static void agent_loop_task(void *arg) {
 
     /* 5. Send response */
     if (final_text && final_text[0]) {
-      /* Save to session (only user text + final assistant text) */
+      /* Extract OLED summary tag and update screen immediately with timed hold */
+      char oled_l1[17] = {0};
+      char oled_l2[17] = {0};
+      if (extract_and_strip_oled_tag(final_text, oled_l1, sizeof(oled_l1), oled_l2, sizeof(oled_l2))) {
+        ESP_LOGI(TAG, "OLED summary tag parsed: '%s' / '%s'", oled_l1, oled_l2);
+        display_status_set_text_timed(oled_l1, oled_l2, 8000);
+      } else {
+        word_wrap_oled_local(final_text, oled_l1, sizeof(oled_l1), oled_l2, sizeof(oled_l2));
+        ESP_LOGI(TAG, "OLED fallback wrap: '%s' / '%s'", oled_l1, oled_l2);
+        display_status_set_text_timed(oled_l1, oled_l2, 8000);
+      }
+
+      /* Save to session (only user text + clean assistant text) */
       esp_err_t save_user = session_append(msg.chat_id, "user", msg.content);
       esp_err_t save_asst =
           session_append(msg.chat_id, "assistant", final_text);
@@ -323,7 +452,6 @@ static void agent_loop_task(void *arg) {
       strncpy(out.channel, msg.channel, sizeof(out.channel) - 1);
       strncpy(out.chat_id, msg.chat_id, sizeof(out.chat_id) - 1);
       out.content = final_text; /* transfer ownership */
-      display_status_set("Replying...", out.channel);
       ESP_LOGI(TAG, "Queue final response to %s:%s (%d bytes)", out.channel,
                out.chat_id, (int)strlen(final_text));
       if (message_bus_push_outbound(&out) != ESP_OK) {
@@ -340,8 +468,10 @@ static void agent_loop_task(void *arg) {
       strncpy(out.chat_id, msg.chat_id, sizeof(out.chat_id) - 1);
       if (iteration > 0 && tool_output && (strstr(tool_output, "success") || strstr(tool_output, "displayed") || strstr(tool_output, "HIGH") || strstr(tool_output, "LOW"))) {
         out.content = strdup("Executed tool successfully.");
+        display_status_set_text_timed("Action Executed", "Success", 8000);
       } else {
         out.content = strdup("Sorry, I encountered an error.");
+        display_status_set_text_timed("Agent Error", "Please try again", 8000);
       }
       if (out.content) {
         if (message_bus_push_outbound(&out) != ESP_OK) {

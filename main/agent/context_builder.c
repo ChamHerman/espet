@@ -40,7 +40,15 @@ esp_err_t context_build_system_prompt(char *buf, size_t size)
         "- Camera: On-board OV2640 camera (call take_photo when asked to take a picture, photo, snapshot, or see)\n"
         "- Diagnostics: call get_device_status for WiFi, RSSI, IP, uptime, RAM, CPU temp\n"
         "- File paths: all SPIFFS operations must start with /spiffs/\n"
-        "- Current Time: call get_current_time when current date or time is needed\n\n");
+        "- Current Time: call get_current_time when current date or time is needed\n\n"
+        "## OLED Display Format Rule\n"
+        "Every final conversational response MUST begin with an OLED summary tag in this exact format:\n"
+        "[OLED: Line 1 | Line 2]\n"
+        "Followed immediately by your natural conversational response.\n"
+        "Rules:\n"
+        "1. Line 1 and Line 2 must each be <= 16 ASCII characters (English or Romanized Pinyin only).\n"
+        "2. Distill the most important action, status, or key answer into those two lines.\n"
+        "3. Example: [OLED: Status LED | State: ON] I have turned on the status LED for you.\n\n");
 
     /* Bootstrap files */
     off = append_file(buf, size, off, MIMI_SOUL_FILE, "Personality & Behavior");

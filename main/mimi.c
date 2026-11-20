@@ -369,6 +369,10 @@ static void outbound_dispatch_task(void *arg)
             /* Voice pipeline output: bridge to Telegram chat so user sees output
              * while speaker is unavailable/untested, and speak through MAX98357A speaker. */
             if (strcmp(msg.chat_id, "voice") == 0) {
+                /* Audio-First: speak through MAX98357A speaker immediately without waiting for Telegram HTTP roundtrip */
+                if (msg.content) {
+                    voice_client_speak(msg.content);
+                }
                 size_t prefix_len = strlen("🤖 ESPET: ");
                 size_t content_len = msg.content ? strlen(msg.content) : 0;
                 char *tlg_msg = (char *)malloc(prefix_len + content_len + 1);
@@ -378,9 +382,6 @@ static void outbound_dispatch_task(void *arg)
                     free(tlg_msg);
                 } else if (msg.content) {
                     telegram_send_to_last_chat(msg.content);
-                }
-                if (msg.content) {
-                    voice_client_speak(msg.content);
                 }
             }
         } else {
