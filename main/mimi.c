@@ -159,7 +159,12 @@ static void on_camera_button_down(void)
 static void on_camera_button_up(uint32_t hold_duration_ms)
 {
     if (hold_duration_ms == 0) {
-        /* Cancelled or noise */
+        /* Cancelled or noise — always stop audio recording so s_recording is not leaked! */
+        size_t dummy_samples = 0;
+        uint32_t dummy_dur = 0;
+        double dummy_rms = 0.0;
+        tool_audio_manual_record_stop(&dummy_samples, &dummy_dur, &dummy_rms);
+
         if (s_snap_fb) {
             ESP_LOGW(TAG, "📸 [CAM BTN] Noise/cancelled press — returning camera buffer");
             tool_camera_return_picture(s_snap_fb);
@@ -171,6 +176,11 @@ static void on_camera_button_up(uint32_t hold_duration_ms)
 
     if (!s_snap_fb) {
         ESP_LOGW(TAG, "Button released but no photo was captured");
+        size_t dummy_samples = 0;
+        uint32_t dummy_dur = 0;
+        double dummy_rms = 0.0;
+        tool_audio_manual_record_stop(&dummy_samples, &dummy_dur, &dummy_rms);
+        display_status_idle();
         return;
     }
 

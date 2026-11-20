@@ -6,6 +6,7 @@
 #include "memory/session_mgr.h"
 #include "mimi_config.h"
 #include "tools/tool_registry.h"
+#include "voice/voice_client.h"
 
 
 #include "cJSON.h"
@@ -360,6 +361,11 @@ static void agent_loop_task(void *arg) {
     bool sent_working_status = false;
 
     while (iteration < MIMI_AGENT_MAX_TOOL_ITER) {
+      if (voice_client_is_abort_requested()) {
+        ESP_LOGW(TAG, "[AGENT] Turn aborted by user interruption before iteration %d", iteration + 1);
+        break;
+      }
+
       /* Send "working" indicator before each API call */
 #if MIMI_AGENT_SEND_WORKING_STATUS
       if (!sent_working_status && msg.chat_id[0] != '\0' && strcmp(msg.channel, MIMI_CHAN_SYSTEM) != 0) {
@@ -385,6 +391,12 @@ static void agent_loop_task(void *arg) {
       if (err != ESP_OK) {
         ESP_LOGE(TAG, "LLM call failed: %s", esp_err_to_name(err));
         display_status_set("LLM error", "");
+        break;
+      }
+
+      if (voice_client_is_abort_requested()) {
+        ESP_LOGW(TAG, "[AGENT] Turn aborted by user interruption after LLM call");
+        llm_response_free(&resp);
         break;
       }
 
@@ -417,9 +429,22 @@ static void agent_loop_task(void *arg) {
 
       llm_response_free(&resp);
       iteration++;
+
+      if (voice_client_is_abort_requested()) {
+        ESP_LOGW(TAG, "[AGENT] Turn aborted by user interruption after tool execution");
+        break;
+      }
     }
 
     cJSON_Delete(messages);
+
+    if (voice_client_is_abort_requested()) {
+      ESP_LOGW(TAG, "[AGENT] In-flight turn aborted by user interruption — discarding response");
+      free(final_text);
+      voice_client_clear_abort();
+      free(msg.content);
+      continue;
+    }
 
     /* 5. Send response */
     if (final_text && final_text[0]) {

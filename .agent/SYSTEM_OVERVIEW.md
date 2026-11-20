@@ -215,8 +215,10 @@ outbound dispatch task → agent_loop_start → backend_discovery_start (last)
    - tool exists locally → executed on-chip (`tool_gpio`, `tool_audio`,
      `tool_camera` (`take_photo`), `get_device_status`, `restart_device`, `tool_files`, `tool_cron`, `tool_get_time`, `tool_web_search`)
    - otherwise → `POST /api/mcp/execute` to the backend (`tool_registry.c`)
-4. **Loop**: the tool result is fed back as a new LLM message. Max 10 iterations /
+4. **Loop & Voice Interruption**: the tool result is fed back as a new LLM message. Max 10 iterations /
    4 tool calls per request. Safety: GPIO writes go through `gpio_policy.c`.
+   If a voice barge-in interrupt is detected (`voice_client_is_abort_requested()`), the loop breaks immediately,
+   discards in-flight tool outputs and obsolete TTS, and handles the new incoming command without lag.
 
 ### 3.3 Memory system (`memory/` & `espet-backend/services/`)
 
@@ -612,37 +614,41 @@ hallucinated wake words:
   (450 ms) for the ack echo to decay, then opens the command window.
 Agent replies are routed via `voice_client_speak()` → `POST /api/voice/tts` → MAX98357A speaker.
 
-**Half-Duplex Turn-Taking, Paused Mic & Echo Guard**:
-Once a command is queued to the LLM agent, the voice client enters `s_busy = true`:
-- The microphone listening and VAD tasks are completely paused while the LLM thinks,
-  runs tools, and speaks its reply. This prevents self-triggering from the speaker,
-  eliminates Wi-Fi socket contention during tool use, and avoids wasting CPU/STT on ambient noise.
+**Decoupled VAD Listening, Echo Guard & Voice Interruption (Barge-In)**:
+VAD microphone listening is decoupled from the agent's thinking and tool-execution state (`s_busy`):
+- The VAD wake listener remains **active** while the LLM thinks, runs tools, captures camera snapshots,
+  or executes multi-step ReAct iterations. This eliminates wake-word deaf spots during camera captures or tool turns.
+- Listening is **only** suspended when audio is actively being played through the speaker (`tool_audio_is_speaker_busy()`),
+  when a microphone recording is in progress (`tool_audio_is_busy()`), or during the post-playback echo guard (`mic_guard_active()`, 700 ms).
+- **Voice Interruption / Barge-In**: If the user utters the wake word ("Hey ESPET") while the agent loop is running tools or generating LLM responses, the wake detector signals `voice_client_request_abort()`. The in-flight ReAct loop detects the abort, immediately breaks execution, drops pending tools/obsolete TTS output, and seamlessly processes the new incoming voice command.
 - After playback, `voice_client_speak()` arms a **700 ms echo guard** (`ECHO_GUARD_MS`): VAD is
   skipped and the ring/DMA are flushed until the amp tail + room reverb decay. Without it the
-  VAD re-triggered ~330 ms after TTS end and Whisper hallucinated the wake word from the tail
-  (endless self-wake loop — field log 2026-10-09).
+  VAD re-triggered ~330 ms after TTS end and Whisper hallucinated the wake word from the tail.
+- Guard timers: Thinking watchdog auto-clears stuck thinking flags at 35 s, and a 32 s audio recording safety watchdog disarms hung recording states.
 
 ```
 [LISTEN ] voice_wake task monitors mic stream via energy VAD (32 ms frames, adaptive threshold,
           floor-tracked: max(420, 1.33×ambient), cap 14000; 3 consecutive frames to trigger)
+          (Remains active during agent thinking & tool execution!)
 [CAPTURE] Speech detected → arm capture with 250 ms pre-roll from ring buffer
           Captures until 700 ms silence (adaptive cutoff ≈1.25×ambient) or 1.5 s utterance cap
 [VERIFY ] POST /api/voice/transcribe ──▶ backend faster-whisper (neutral prompt)
           ├─ rms < voice_min_rms ──▶ skip STT, no wake
           ├─ Wake not matched ──▶ silent ignore, flush ring, resume listening
           ├─ Wake matched but confidence gate rejects (logp/nsp) ──▶ no wake
+          ├─ If agent already thinking (s_busy): barge-in interrupt triggered! ──▶ voice_client_request_abort()
           ├─ One-shot command ("Hey Expert what's the weather") ──▶ push to agent bus
-          │                                                       (mic enters s_busy pause)
           └─ Wake only ("Hey Expert") ──▶ play "Yes?" ack ──▶ ACK_SETTLE_MS (450 ms) ──▶ record follow-up command
               (if no command/only wake word heard, ignore & clear cache, do not queue to agent)
-[ THINK ] Agent ReAct loop executes tools & LLM API (mic is PAUSED)
+[ THINK ] Agent ReAct loop executes tools & LLM API (mic remains LISTENING; aborts on barge-in)
 [ SPEAK ] voice_client_speak(): POST /api/voice/tts {"text"}
-          ──▶ backend edge-tts + ffmpeg ──▶ 16 kHz WAV ──▶ MAX98357A 🔊
+          ──▶ backend edge-tts + ffmpeg ──▶ 16 kHz WAV ──▶ MAX98357A 🔊 (mic PAUSED during speaker output)
           ──▶ playback done ──▶ ECHO_GUARD_MS (700 ms) ──▶ tool_audio_clear_cache() (DMA+ring) ──▶ s_busy = false ──▶ resume LISTEN!
 ```
 
-Echo control: the listener pauses while anything plays/records (`tool_audio_is_busy`, `s_busy`)
-or the post-playback echo guard is active, so the device never wakes on its own voice.
+Echo control: the listener pauses while the speaker is active (`tool_audio_is_speaker_busy()`),
+during manual/active recording (`tool_audio_is_busy()`), or while the post-playback echo guard is active,
+so the device never wakes on its own voice.
 Configurable in `espet-backend/config.py` / `.env`: `voice_wake_words` (default: `"expert,hey expert,hi expert,espet,hey espet,mimi,hey mimi,hi mimi,ok mimi,hi esp,米米,咪咪,小米"`),
 `voice_stt_model` (default `base`), `voice_stt_device` (default `auto` — CUDA with CPU fallback),
 `voice_stt_beam_size` (default `1` — greedy fast decoding), `voice_stt_compute_type` (default `auto`),
@@ -1389,3 +1395,4 @@ Append-only session log. Newest first. One line per change:
 - 2026-11-19 — Fixed live camera streaming write timeout and WebSocket stability over WAN/TLS: increased frame send timeout in tool_camera.c from 200ms to 1500ms (pdMS_TO_TICKS(1500)) preventing esp_transport_poll_write(0) and connection aborts when streaming 30-50KB JPEG frames over cellular hotspot / WAN; boosted camera WebSocket task_stack to 8192 bytes and buffer_size to 16384 bytes for mbedTLS TLS handling; added sent <= 0 failure handling with 100ms yield and 1500ms reconnect backoff (files: main/tools/tool_camera.c, .agent/SYSTEM_OVERVIEW.md).
 - 2026-11-20 — Implemented ultra-low latency single-pass OLED summary architecture and audio-first dispatch: (1) Added prompt instructions in `context_builder.c` and `spiffs_data/config/SOUL.md` for the main agent model to output `[OLED: Line 1 | Line 2]` directly in its response, dropping distillation latency to 0ms and eliminating secondary LLM API roundtrips. (2) Implemented `extract_and_strip_oled_tag` on Core 1 in `agent_loop.c` to immediately display the 2-line summary on the 128x64 OLED upon LLM completion (<5ms visual feedback) and clean the tag in-place before saving to session history and outbound dispatch. (3) Added timed text hold and extend APIs in `display_status.{c,h}` keeping summary text visible throughout audio playback plus a 5-second buffer (min 8s total) before smoothly returning to the animated living eyes face. (4) Reordered outbound dispatch in `mimi.c` for voice system messages to speak audio immediately without waiting for Telegram network latency. (5) Removed blocking secondary LLM summarizer from espet-backend `/api/voice/tts` in `voice_router.py`, speeding up TTS synthesis by 1.5–3.0s (files: main/agent/context_builder.c, spiffs_data/config/SOUL.md, main/agent/agent_loop.c, main/display/display_status.h, main/display/display_status.c, main/voice/voice_client.c, main/mimi.c, espet-backend/api/voice_router.py, .agent/SYSTEM_OVERVIEW.md).
 - 2026-11-20 — Decoupled action logs, added 3-factor salience rubric, conflict-resolving upsert, working memory distillation, and context-aware RAG priming: (1) Decoupled tool action traces from vector RAG: created lightweight `action_logs` table (7-day rolling TTL) in `memory_db.py` for raw execution traces, purged noisy actions from `vec_memories` via `rag_service.delete_noisy_actions`, and restricted semantic event promotion strictly to high-salience mutations (emails sent, calendar events created) in `cloud_router.py`. (2) 3-Factor Salience Rubric & Conflict Resolution: upgraded `MemoryOrganizer` prompt with durability (>30 days), actionability, and user relevance criteria, and implemented `upsert_memory_with_conflict_resolution` in `rag_service.py` to update modified facts in-place and skip duplicates. (3) Context-Aware RAG Retrieval & Attention Priming: added pronoun/entity resolution from prior turns before vector queries in `cloud_router.py`, formatted retrieved facts into a prominent `## Established User Context (Priority: Follow Strictly)` banner, and maintained sub-15ms roundtrip latency. (4) Bounded Memory Distillation & Agent Tools: added `distill_working_memory` ensuring on-device SPIFFS `MEMORY.md` stays strictly <= 3 KB, exposed `GET /api/memory/actions` and `POST /api/memory/distill` endpoints in `memory_router.py`, and added `memory_update` and `memory_forget` MCP tools to `custom_tools.py` with full unit test coverage (files: espet-backend/services/memory_db.py, espet-backend/services/rag_service.py, espet-backend/services/memory_organizer.py, espet-backend/api/cloud_router.py, espet-backend/api/memory_router.py, espet-backend/api/custom_tools.py, espet-backend/tests/test_memory_system.py, espet-backend/tests/test_rag_service.py, .agent/SYSTEM_OVERVIEW.md).
+- 2026-11-20 — Fixed mic + camera concurrency lockout and implemented voice interruption / barge-in: decoupled VAD wake listener from agent thinking state (`s_busy`) in `voice_client.c` so listening remains active during tool execution and camera snapshots; added voice interruption APIs to abort in-flight LLM/tool turns and skip obsolete TTS; fixed manual recording state leak in `mimi.c` on glitch pulses in `on_camera_button_up(0)`; resolved INMP441 L/R auto-switch latch in `tool_audio.c`; added 35s thinking watchdog and 32s recording watchdog (files: main/agent/agent_loop.c, main/mimi.c, main/tools/tool_audio.c, main/voice/voice_client.c, main/voice/voice_client.h, docs/plans/p2011_fix_mic_camera_tradeoff_plan.md, .agent/SYSTEM_OVERVIEW.md).
