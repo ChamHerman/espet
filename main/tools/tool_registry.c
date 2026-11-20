@@ -28,6 +28,7 @@
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
+#include "esp_mac.h"
 #include "cJSON.h"
 
 static const char *TAG = "tools";
@@ -610,6 +611,12 @@ static esp_err_t tool_remote_execute(const char *name, const char *input_json,
     char auth_hdr[128];
     snprintf(auth_hdr, sizeof(auth_hdr), "Bearer %s", MIMI_BACKEND_API_KEY);
 
+    uint8_t mac[6] = {0};
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    char dev_id_hdr[32];
+    snprintf(dev_id_hdr, sizeof(dev_id_hdr), "ESP-%02X%02X%02X%02X%02X%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
     char url[256];
     char base[96];
     backend_discovery_base_url(base, sizeof(base));
@@ -627,6 +634,7 @@ static esp_err_t tool_remote_execute(const char *name, const char *input_json,
     esp_http_client_set_method(client, HTTP_METHOD_POST);
     esp_http_client_set_header(client, "Content-Type", "application/json");
     esp_http_client_set_header(client, "Authorization", auth_hdr);
+    esp_http_client_set_header(client, "X-Device-Id", dev_id_hdr);
     esp_http_client_set_post_field(client, post_data, strlen(post_data));
 
     esp_err_t err = esp_http_client_perform(client);

@@ -185,9 +185,28 @@ def restart_gateway() -> dict:
     return {"running": gw is not None}
 async def notify_device_sync(device_id: str) -> bool:
     """
-    Sends sync_now frame to connected device WebSocket.
-    Returns True if sent, False if offline.
+    Sends sync_now frame to connected device WebSocket and broadcasts
+    config_updated event to all active web dashboard clients.
+    Returns True if sent to device, False if device is offline.
     """
+    # 1. Broadcast config_updated frame to all connected Web UI clients
+    try:
+        cfg = store.get_config(device_id)
+        versions = cfg.get("versions", {})
+        update_msg = json.dumps({
+            "type": "config_updated",
+            "device_id": device_id,
+            "versions": versions
+        })
+        for client_ws in list(_web_chat_clients):
+            try:
+                await client_ws.send_text(update_msg)
+            except Exception:
+                _web_chat_clients.discard(client_ws)
+    except Exception as e:
+        logger.warning("Failed to broadcast config_updated: %s", e)
+
+    # 2. Push sync_now frame to connected physical device
     with registry._lock:
         ws = registry.connections.get(device_id)
     if ws:

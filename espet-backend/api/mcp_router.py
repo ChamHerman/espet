@@ -13,13 +13,14 @@ No tool-specific logic lives here — it's pure routing.
 import logging
 import time
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel, Field
 
 from auth.device_auth import verify_device_key
 from mcp.client import mcp_client_manager
 from api.custom_tools import CUSTOM_TOOLS
 from api.mcp_normalizer import normalize_arguments, auto_recover_arguments
+from api.cloud_router import registry
 
 router = APIRouter(prefix="/api", tags=["mcp"])
 logger = logging.getLogger("espet-backend.api.mcp")
@@ -128,6 +129,7 @@ async def reconnect_mcp(_key: str = Depends(verify_device_key)):
 )
 async def execute_tool(
     request: MCPExecuteRequest,
+    x_device_id: str | None = Header(None, alias="X-Device-Id"),
     _key: str = Depends(verify_device_key),
 ) -> MCPExecuteResponse:
     """
@@ -143,8 +145,11 @@ async def execute_tool(
     """
     _check_rate_limit()
 
+    did = x_device_id or request.arguments.get("device_id") or registry.get_latest_device_id()
+    request.arguments["device_id"] = did
+
     logger.info(
-        f"Tool execution request: {request.tool_name} "
+        f"Tool execution request for {did}: {request.tool_name} "
         f"(args: {list(request.arguments.keys())})"
     )
 

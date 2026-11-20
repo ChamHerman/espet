@@ -99,6 +99,10 @@ export const client = {
     api<{ ok: boolean; device_id: string; pushed: boolean }>("/api/config/sync-now", json("POST", { device_id })),
   config: (device_id?: string) =>
     api<ConfigBundle>(`/api/config${device_id ? `?device_id=${encodeURIComponent(device_id)}` : ""}`),
+  configVersion: (device_id?: string) =>
+    api<{ versions: Record<string, number>; device: Record<string, unknown> }>(
+      `/api/config/version${device_id ? `?device_id=${encodeURIComponent(device_id)}` : ""}`
+    ),
   health: () => api<Health>("/health"),
   auth: () => api<AuthStatus>("/auth/status"),
   tools: () => api<{ tools: McpTool[] }>("/api/tools"),

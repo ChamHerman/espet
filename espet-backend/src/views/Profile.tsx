@@ -4,7 +4,7 @@
    preview). Switching tabs converts in both directions. */
 
 import { Button, Input, Select, Space, Tabs, Tooltip, Typography } from "antd";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { client } from "../api";
 import { Icon } from "../components/Icon";
 import { SectionDirtyChip } from "../components/StatusChips";
@@ -67,7 +67,7 @@ export function buildUserMd(f: UserFields): string {
 const norm = (s: string) => s.trim().replace(/\s+/g, " ");
 
 export function ProfileView() {
-  const { config, patchConfig, setDirty, toast, selectedDeviceId } = useApp();
+  const { config, patchConfig, setDirty, toast, selectedDeviceId, dirty: storeDirty } = useApp();
   const { styles } = useLayout();
   const server = useMemo(
     () => (config ? parseUserMd(config.user_md) : null),
@@ -76,6 +76,13 @@ export function ProfileView() {
   const [draft, setDraft] = useState<UserFields | null>(server);
   const [tab, setTab] = useState<"fields" | "markdown">("fields");
   const [raw, setRaw] = useState(() => (config ? config.user_md : ""));
+
+  useEffect(() => {
+    if (config?.user_md && !storeDirty?.profile) {
+      setDraft(parseUserMd(config.user_md));
+      setRaw(config.user_md);
+    }
+  }, [config?.user_md, storeDirty?.profile]);
   if (!config || !server || !draft) return null;
 
   const detectedTz = useMemo(() => {

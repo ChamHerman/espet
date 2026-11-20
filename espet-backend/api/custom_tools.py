@@ -862,12 +862,45 @@ PERSONALITY_PRESETS = {
         "- Passionate about hardware, robotics, and embedded systems\n\n"
         "Values:\n"
         "- Technical accuracy and rigorous verification\n"
-        "- Clarity of explanation and logical deduction\n"
-        "- Patience and structured problem solving\n\n"
+        "- Encouraging intellectual curiosity\n"
+        "- Practical hardware experiments\n\n"
         "Behavior Rules:\n"
-        "- **First-Principles Reasoning**: Break down technical queries clearly and highlight the underlying mechanics.\n"
-        "- **Concise Precision**: Answer questions directly with high technical clarity.\n"
+        "- **First-Principles Reasoning**: Break down technical queries clearly, highlighting physical mechanisms, GPIO interactions, and logic flows.\n"
+        "- **Concise Mentorship**: Provide crisp explanations with concrete parameters, pin numbers, and code examples without fluff.\n"
     ),
+    "minimalist": (
+        "I am ESPET, an ultra-terse embedded action engine running on ESP32-S3.\n\n"
+        "Personality:\n"
+        "- Pure efficiency, zero fluff\n"
+        "- Maximum information density\n"
+        "- Cold, fast, mechanical precision\n\n"
+        "Values:\n"
+        "- Speed of execution\n"
+        "- Strict brevity\n"
+        "- Direct tool results\n\n"
+        "Behavior Rules:\n"
+        "- **Hard Brevity Limit**: Responses MUST be 1 to 2 sentences maximum, or bare facts/data.\n"
+        "- **Zero Banter**: No greetings, no polite sign-offs, no conversational filler. Execute tool immediately and report raw status.\n"
+    ),
+}
+
+PRESET_ALIASES = {
+    "default": "default",
+    "balanced": "default",
+    "robotic_pet": "robotic_pet",
+    "pet": "robotic_pet",
+    "companion": "robotic_pet",
+    "playful": "robotic_pet",
+    "butler": "butler",
+    "formal": "butler",
+    "executive": "butler",
+    "scholar": "scholar",
+    "tutor": "scholar",
+    "stem": "scholar",
+    "minimalist": "minimalist",
+    "minimal": "minimalist",
+    "terse": "minimalist",
+    "cyber": "minimalist",
 }
 
 async def execute_update_personality(arguments: dict) -> dict:
@@ -878,7 +911,8 @@ async def execute_update_personality(arguments: dict) -> dict:
     persona_name = arguments.get("persona_name") or arguments.get("name") or ""
     full_content = arguments.get("full_content") or arguments.get("content") or ""
 
-    preset_key = preset.strip().lower().replace(" ", "_") if preset else ""
+    raw_key = preset.strip().lower().replace(" ", "_") if preset else ""
+    preset_key = PRESET_ALIASES.get(raw_key, raw_key)
     if preset_key in PERSONALITY_PRESETS:
         new_content = PERSONALITY_PRESETS[preset_key]
     elif full_content and full_content.strip():
@@ -1151,7 +1185,7 @@ async def execute_manage_device_settings(arguments: dict) -> dict:
 CUSTOM_TOOLS["update_personality"] = {
     "description": (
         "Update or customize ESPET's personality, tone, behavior rules, persona name, or apply a preset "
-        "(presets available: 'default', 'robotic_pet', 'butler', 'scholar'). Use whenever the user asks you "
+        "(presets available: 'default', 'robotic_pet', 'butler', 'scholar', 'minimalist'). Use whenever the user asks you "
         "to change your personality, tone, speaking style, or persona name."
     ),
     "input_schema": {
@@ -1159,7 +1193,7 @@ CUSTOM_TOOLS["update_personality"] = {
         "properties": {
             "preset": {
                 "type": "string",
-                "enum": ["default", "robotic_pet", "butler", "scholar"],
+                "enum": ["default", "robotic_pet", "butler", "scholar", "minimalist"],
                 "description": "Optional personality preset name to apply"
             },
             "persona_name": {
