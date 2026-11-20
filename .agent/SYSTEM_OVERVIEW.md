@@ -218,16 +218,37 @@ outbound dispatch task → agent_loop_start → backend_discovery_start (last)
 4. **Loop**: the tool result is fed back as a new LLM message. Max 10 iterations /
    4 tool calls per request. Safety: GPIO writes go through `gpio_policy.c`.
 
-### 3.3 Memory system (`memory/`)
+### 3.3 Memory system (`memory/` & `espet-backend/services/`)
 
-| File (SPIFFS) | Written by | Read by | Purpose |
+ESPET employs a hierarchical 3-tier memory lifecycle balancing device flash limits against long-term semantic persistence:
+
+1. **Tier 1: On-Device Hot Working Scratchpad (`/spiffs/memory/MEMORY.md`)**:
+   - Strictly bounded (< 3 KB) Markdown file stored on SPIFFS flash.
+   - Read directly into the Core 1 agent loop system prompt on every turn (fast, offline-capable, zero network latency).
+   - Contains high-priority user profile bullets, enduring preferences, and active goals.
+   - Refreshed from the backend via automated distillation (`distill_working_memory`).
+   - Session history is ring-buffered per chat in `/spiffs/sessions/tg_<chat_id>.jsonl` (last 20 messages).
+
+2. **Tier 2: Lightweight Execution Action Audit Log (`action_logs` table)**:
+   - Dedicated SQLite table storing raw tool invocations (`gpio_write`, `read_file`, `take_photo`, etc.) with 7-day rolling TTL (`purge_expired_actions`).
+   - **Completely decoupled from vector RAG**: raw tool execution traces never enter `vec_memories`, preventing vector database bloat and semantic pollution.
+   - Only significant external real-world state mutations (e.g. emails sent, calendar events created) are promoted to semantic event memory.
+
+3. **Tier 3: Deep Semantic Vector Memory (SQLite-Vec `vec_memories`)**:
+   - Uses `fastembed` (BAAI/bge-small-en-v1.5, 384 dimensions) with sqlite-vec cosine distance.
+   - **3-Factor Salience Rubric**: Autonomous background extraction (`MemoryOrganizer`) evaluates turns against Durability (>30 days), Actionability, and User Relevance before saving.
+   - **Conflict Resolution & Upsert**: Automatically detects conflicting or updated preferences (cosine distance <= 0.18) and updates existing chunks in-place rather than accumulating duplicate contradictions.
+   - **Context-Aware Retrieval & Attention Priming**: Resolves pronouns/entities from recent turns before vector searching and formats retrieved memories into a prominent `## Established User Context (Priority: Follow Strictly)` banner directly above the active turn.
+   - **Agent Memory Tools**: Exposed via MCP / custom tools: `memory_save`, `memory_search`, `memory_update`, and `memory_forget`.
+
+| File / Store | Written by | Read by | Purpose |
 |---|---|---|---|
 | `/spiffs/config/SOUL.md` | web dashboard (config sync) | context builder | Personality, values, hard behavior rules |
-| `/spiffs/config/USER.md` | web dashboard (config sync) | context builder | Who the user is, language, timezone, context |
-| `/spiffs/memory/MEMORY.md` | web dashboard **and** the agent (consolidation) | context builder | Long-term facts |
-| `/spiffs/memory/YYYY-MM-DD.md` | the agent | context builder (last N days) | Daily episodic notes |
-| `/spiffs/sessions/*` | session_mgr | agent loop | Rolling conversation history |
-| `/spiffs/skills/*.md` | web dashboard (config sync) **and** the agent (`write_file`) | context builder | Reusable skill playbooks |
+| `/spiffs/config/USER.md` | web dashboard / MemoryOrganizer | context builder | Who the user is, language, timezone, context |
+| `/spiffs/memory/MEMORY.md` | backend distillation / serial CLI | context builder | Bounded working memory scratchpad (< 3 KB) |
+| `/spiffs/sessions/*` | session_mgr | agent loop | Rolling conversation history (20 msgs) |
+| `action_logs` (backend DB) | cloud_router tool interceptor | audit / diagnostics | Ephemeral execution traces (7-day TTL) |
+| `vec_memories` (backend DB) | MemoryOrganizer / agent tools | RAG injection / agent tools | Deep semantic vector memory with embeddings |
 
 ### 3.4 Proactive daemons
 
@@ -1367,3 +1388,4 @@ Append-only session log. Newest first. One line per change:
 - 2026-11-19 — Resolved `esp_task_stack_is_sane_cache_disabled` panic when resolving backend URL from tasks with PSRAM stack: moved NVS backend URL resolution to boot-time `backend_discovery_init()` running on DRAM main task and made `backend_discovery_base_url()` 100% in-memory; tasks with PSRAM stacks (like `camera_stream_task` and `agent_loop_task`) never invoke SPI flash / NVS, eliminating flash cache disable assertion crashes (files: main/sync/backend_discovery.h, main/sync/backend_discovery.c, main/mimi.c, main/onboard/wifi_onboard_ble.c, .agent/SYSTEM_OVERVIEW.md).
 - 2026-11-19 — Fixed live camera streaming write timeout and WebSocket stability over WAN/TLS: increased frame send timeout in tool_camera.c from 200ms to 1500ms (pdMS_TO_TICKS(1500)) preventing esp_transport_poll_write(0) and connection aborts when streaming 30-50KB JPEG frames over cellular hotspot / WAN; boosted camera WebSocket task_stack to 8192 bytes and buffer_size to 16384 bytes for mbedTLS TLS handling; added sent <= 0 failure handling with 100ms yield and 1500ms reconnect backoff (files: main/tools/tool_camera.c, .agent/SYSTEM_OVERVIEW.md).
 - 2026-11-20 — Implemented ultra-low latency single-pass OLED summary architecture and audio-first dispatch: (1) Added prompt instructions in `context_builder.c` and `spiffs_data/config/SOUL.md` for the main agent model to output `[OLED: Line 1 | Line 2]` directly in its response, dropping distillation latency to 0ms and eliminating secondary LLM API roundtrips. (2) Implemented `extract_and_strip_oled_tag` on Core 1 in `agent_loop.c` to immediately display the 2-line summary on the 128x64 OLED upon LLM completion (<5ms visual feedback) and clean the tag in-place before saving to session history and outbound dispatch. (3) Added timed text hold and extend APIs in `display_status.{c,h}` keeping summary text visible throughout audio playback plus a 5-second buffer (min 8s total) before smoothly returning to the animated living eyes face. (4) Reordered outbound dispatch in `mimi.c` for voice system messages to speak audio immediately without waiting for Telegram network latency. (5) Removed blocking secondary LLM summarizer from espet-backend `/api/voice/tts` in `voice_router.py`, speeding up TTS synthesis by 1.5–3.0s (files: main/agent/context_builder.c, spiffs_data/config/SOUL.md, main/agent/agent_loop.c, main/display/display_status.h, main/display/display_status.c, main/voice/voice_client.c, main/mimi.c, espet-backend/api/voice_router.py, .agent/SYSTEM_OVERVIEW.md).
+- 2026-11-20 — Decoupled action logs, added 3-factor salience rubric, conflict-resolving upsert, working memory distillation, and context-aware RAG priming: (1) Decoupled tool action traces from vector RAG: created lightweight `action_logs` table (7-day rolling TTL) in `memory_db.py` for raw execution traces, purged noisy actions from `vec_memories` via `rag_service.delete_noisy_actions`, and restricted semantic event promotion strictly to high-salience mutations (emails sent, calendar events created) in `cloud_router.py`. (2) 3-Factor Salience Rubric & Conflict Resolution: upgraded `MemoryOrganizer` prompt with durability (>30 days), actionability, and user relevance criteria, and implemented `upsert_memory_with_conflict_resolution` in `rag_service.py` to update modified facts in-place and skip duplicates. (3) Context-Aware RAG Retrieval & Attention Priming: added pronoun/entity resolution from prior turns before vector queries in `cloud_router.py`, formatted retrieved facts into a prominent `## Established User Context (Priority: Follow Strictly)` banner, and maintained sub-15ms roundtrip latency. (4) Bounded Memory Distillation & Agent Tools: added `distill_working_memory` ensuring on-device SPIFFS `MEMORY.md` stays strictly <= 3 KB, exposed `GET /api/memory/actions` and `POST /api/memory/distill` endpoints in `memory_router.py`, and added `memory_update` and `memory_forget` MCP tools to `custom_tools.py` with full unit test coverage (files: espet-backend/services/memory_db.py, espet-backend/services/rag_service.py, espet-backend/services/memory_organizer.py, espet-backend/api/cloud_router.py, espet-backend/api/memory_router.py, espet-backend/api/custom_tools.py, espet-backend/tests/test_memory_system.py, espet-backend/tests/test_rag_service.py, .agent/SYSTEM_OVERVIEW.md).

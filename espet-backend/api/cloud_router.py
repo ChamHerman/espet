@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -549,16 +550,37 @@ async def _llm_relay(websocket, request_id, body_str: str, device_id: str = "esp
                         break
 
             if user_query:
+                # Fast heuristic context reformulation: resolve pronouns or short follow-ups from prior turn
+                search_query = user_query
+                pronouns = {"he", "she", "it", "they", "that", "this", "his", "her", "him", "them", "there", "then"}
+                words = set(re.findall(r"\b\w+\b", user_query.lower()))
+                if words & pronouns or len(words) <= 3:
+                    context_clues = []
+                    for prev_msg in reversed(messages[:-1]):
+                        if isinstance(prev_msg, dict):
+                            prev_text = prev_msg.get("content") or ""
+                            if isinstance(prev_text, str) and prev_text.strip():
+                                clues = [w for w in re.findall(r"\b[A-Z][a-z0-9_]+\b", prev_text) if len(w) > 2]
+                                context_clues.extend(clues[:3])
+                                if len(context_clues) >= 3:
+                                    break
+                    if context_clues:
+                        search_query = f"{' '.join(context_clues[:3])} {user_query}"
+
                 try:
                     rag_res = await asyncio.to_thread(
                         rag_service.search,
-                        query=user_query,
+                        query=search_query,
                         device_id=device_id,
                         top_k=settings.rag_top_k,
                         threshold=settings.rag_threshold,
+                        exclude_types=["action"],
                     )
                     if rag_res.get("results"):
-                        lines = ["## Retrieved Long-Term Memory (via SQLite-Vec RAG):"]
+                        lines = [
+                            "## Established User Context (Priority: Follow Strictly)",
+                            "The following verified facts, preferences, and commitments must guide your response:",
+                        ]
                         for item in rag_res["results"]:
                             lines.append(f"- [{item['source_type']}]: {item['content']}")
                         injected_block = "\n".join(lines)
@@ -570,10 +592,11 @@ async def _llm_relay(websocket, request_id, body_str: str, device_id: str = "esp
                             messages.insert(0, {"role": "system", "content": injected_block})
 
                         logger.info(
-                            "rag: Injected %d memory chunk(s) for device %s (%.2f ms)",
+                            "rag: Injected %d memory chunk(s) for device %s (%.2f ms, query='%s')",
                             len(rag_res["results"]),
                             device_id,
                             rag_res.get("latency_ms", 0.0),
+                            search_query[:40],
                         )
                 except Exception as ex:
                     logger.warning("rag: search/injection failed: %r", ex)
@@ -604,16 +627,30 @@ async def _llm_relay(websocket, request_id, body_str: str, device_id: str = "esp
         await _reply(False, 0, json.dumps({"error": f"{type(e).__name__}: {e}"}))
 
 
-NOISE_TOOLS = {
-    "get_current_time",
-    "cron_list",
-    "gpio_read",
-    "gpio_read_all",
-    "read_file",
-    "list_dir",
-    "memory_search",
-    "memory_save",
+HIGH_SALIENCE_ACTIONS = {
+    "gmail_send_email",
+    "gcal_create_event",
+    "cron_add",
 }
+
+def _format_action_summary(tool_name: str, args_raw: str | dict) -> str | None:
+    try:
+        args = json.loads(args_raw) if isinstance(args_raw, str) else (args_raw or {})
+    except Exception:
+        args = {}
+    if tool_name == "gmail_send_email":
+        to = args.get("to") or args.get("recipient") or ""
+        subj = args.get("subject") or "Message"
+        return f"Sent email to {to} regarding '{subj}'"
+    elif tool_name == "gcal_create_event":
+        summary = args.get("summary") or args.get("title") or "Event"
+        start = args.get("start_time") or args.get("start") or ""
+        return f"Scheduled calendar event '{summary}' at {start}".strip()
+    elif tool_name == "cron_add":
+        desc = args.get("description") or args.get("command") or args.get("job") or ""
+        cron_expr = args.get("cron") or args.get("schedule") or ""
+        return f"Scheduled recurring task '{desc}' with schedule '{cron_expr}'".strip()
+    return None
 
 async def _capture_episodic_action(device_id: str, resp_text: str) -> None:
     try:
@@ -627,15 +664,27 @@ async def _capture_episodic_action(device_id: str, resp_text: str) -> None:
             fn = tc.get("function", {})
             name = fn.get("name", "")
             args = fn.get("arguments", "")
-            if name and name not in NOISE_TOOLS:
-                summary = f"Action: executed tool {name} with args {args[:120]}"
+            if name:
+                # 1. Always record in lightweight rolling action_logs table (decoupled from vector RAG)
                 await asyncio.to_thread(
-                    rag_service.add_memory,
+                    rag_service.log_tool_action,
                     device_id=device_id,
-                    content=summary,
-                    source_type="action",
-                    source_ref="relay_tool",
+                    tool_name=name,
+                    arguments_json=args,
+                    result_summary="",
                 )
+                # 2. Only promote high-salience external actions to semantic event memory in vector RAG
+                if name in HIGH_SALIENCE_ACTIONS:
+                    summary = _format_action_summary(name, args)
+                    if summary:
+                        await asyncio.to_thread(
+                            rag_service.upsert_memory_with_conflict_resolution,
+                            device_id=device_id,
+                            content=summary,
+                            source_type="event",
+                            source_ref="relay_action",
+                            threshold=0.20,
+                        )
     except Exception as e:
         logger.debug("Episodic action capture skipped: %r", e)
 

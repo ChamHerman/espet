@@ -219,3 +219,47 @@ async def auto_organize_memory(
     except Exception as e:
         logger.error("Auto-organize memory failed: %r", e)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/actions", summary="List recent tool execution traces from action_logs")
+async def get_recent_actions(
+    device_id: str = Query("espet_s3_01"),
+    limit: int = Query(20, ge=1, le=100),
+    _key: str = Depends(verify_device_key),
+) -> dict[str, Any]:
+    try:
+        actions = await asyncio.to_thread(rag_service.list_recent_actions, device_id=device_id, limit=limit)
+        return {"ok": True, "actions": actions, "count": len(actions), "device_id": device_id}
+    except Exception as e:
+        logger.error("Failed to list recent actions: %r", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/distill", summary="Distill long-term memories into bounded on-device MEMORY.md")
+async def distill_working_memory(
+    device_id: str = Query("espet_s3_01"),
+    sync_to_device: bool = Query(True),
+    max_bytes: int = Query(3000, ge=500, le=8000),
+    _key: str = Depends(verify_device_key),
+) -> dict[str, Any]:
+    try:
+        distilled_md = await asyncio.to_thread(
+            rag_service.distill_working_memory,
+            device_id=device_id,
+            max_bytes=max_bytes,
+        )
+        if sync_to_device:
+            store.update_markdown("memory", distilled_md, device_id)
+            from api.cloud_router import notify_device_sync
+            await notify_device_sync(device_id)
+
+        return {
+            "ok": True,
+            "distilled_bytes": len(distilled_md.encode("utf-8")),
+            "synced": sync_to_device,
+            "content": distilled_md,
+            "device_id": device_id,
+        }
+    except Exception as e:
+        logger.error("Failed to distill working memory: %r", e)
+        raise HTTPException(status_code=500, detail=str(e))

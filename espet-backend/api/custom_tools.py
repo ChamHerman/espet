@@ -339,6 +339,96 @@ async def execute_memory_search(arguments: dict) -> dict:
     except Exception as e:
         return {"error": f"Failed to search memory: {e}"}
 
+async def execute_memory_update(arguments: dict) -> dict:
+    new_content = (
+        arguments.get("new_content")
+        or arguments.get("content")
+        or arguments.get("text")
+        or ""
+    )
+    new_content = str(new_content).strip()
+    if not new_content:
+        return {"error": "Parameter 'new_content' (or 'content') is required to update memory."}
+
+    device_id = str(arguments.get("device_id") or "espet_s3_01").strip()
+    category = arguments.get("category")
+
+    memory_id = arguments.get("memory_id") or arguments.get("id")
+    if memory_id:
+        try:
+            mid = int(memory_id)
+            ok = rag_service.update_memory(chunk_id=mid, content=new_content, source_type=category)
+            if ok:
+                return {"result": f"Successfully updated memory (ID: {mid}) to: '{new_content}'"}
+            return {"error": f"Memory item with ID {mid} not found."}
+        except Exception as e:
+            return {"error": f"Failed to update memory by ID: {e}"}
+
+    # Otherwise search by target/query
+    target = (
+        arguments.get("target")
+        or arguments.get("query")
+        or arguments.get("old_content")
+        or ""
+    )
+    target = str(target).strip()
+    if not target:
+        target = new_content
+
+    try:
+        search_res = rag_service.search(query=target, device_id=device_id, top_k=1, threshold=0.35)
+        matches = search_res.get("results", [])
+        if not matches:
+            return {"error": f"No existing memory found matching '{target}' to update."}
+        top_match = matches[0]
+        mid = top_match["id"]
+        old_text = top_match["content"]
+        rag_service.update_memory(chunk_id=mid, content=new_content, source_type=category or top_match["source_type"])
+        return {
+            "result": f"Successfully updated memory (ID: {mid}) from '{old_text}' to '{new_content}'"
+        }
+    except Exception as e:
+        return {"error": f"Failed to update memory: {e}"}
+
+
+async def execute_memory_forget(arguments: dict) -> dict:
+    device_id = str(arguments.get("device_id") or "espet_s3_01").strip()
+    memory_id = arguments.get("memory_id") or arguments.get("id")
+    if memory_id:
+        try:
+            mid = int(memory_id)
+            ok = rag_service.delete_memory(chunk_id=mid)
+            if ok:
+                return {"result": f"Successfully deleted memory with ID {mid}."}
+            return {"error": f"Memory item with ID {mid} not found."}
+        except Exception as e:
+            return {"error": f"Failed to delete memory by ID: {e}"}
+
+    query = (
+        arguments.get("query")
+        or arguments.get("target")
+        or arguments.get("content")
+        or arguments.get("text")
+        or ""
+    )
+    query = str(query).strip()
+    if not query:
+        return {"error": "Parameter 'query' or 'memory_id' is required to forget memory."}
+
+    try:
+        search_res = rag_service.search(query=query, device_id=device_id, top_k=1, threshold=0.30)
+        matches = search_res.get("results", [])
+        if not matches:
+            return {"result": f"No matching memory found to forget for query '{query}'."}
+        top_match = matches[0]
+        mid = top_match["id"]
+        content = top_match["content"]
+        rag_service.delete_memory(chunk_id=mid)
+        return {"result": f"Successfully forgot memory (ID: {mid}): '{content}'"}
+    except Exception as e:
+        return {"error": f"Failed to forget memory: {e}"}
+
+
 CUSTOM_TOOLS["memory_save"] = {
     "description": (
         "Save a critical fact, user preference, routine, or event into ESPET's "
@@ -384,6 +474,51 @@ CUSTOM_TOOLS["memory_search"] = {
     },
     "server": "custom-backend",
     "executor": execute_memory_search
+}
+
+CUSTOM_TOOLS["memory_update"] = {
+    "description": (
+        "Update or correct an existing long-term memory fact or user preference when it has changed or was incorrect."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "target": {
+                "type": "string",
+                "description": "The old fact, subject, or search term of the memory to update"
+            },
+            "new_content": {
+                "type": "string",
+                "description": "The new corrected fact or preference to replace it with"
+            },
+            "category": {
+                "type": "string",
+                "enum": ["fact", "preference", "event", "note"],
+                "description": "Optional category of the memory"
+            }
+        },
+        "required": ["new_content"]
+    },
+    "server": "custom-backend",
+    "executor": execute_memory_update
+}
+
+CUSTOM_TOOLS["memory_forget"] = {
+    "description": (
+        "Delete or remove a specific long-term memory or preference from ESPET's database when requested by the user."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "The topic, fact, or keyword of the memory to forget/delete"
+            }
+        },
+        "required": ["query"]
+    },
+    "server": "custom-backend",
+    "executor": execute_memory_forget
 }
 
 # ---------------------------------------------------------------------------
