@@ -81,8 +81,9 @@ static const char *TAG = "voice";
 
 #define ACK_CACHE_BYTES        (96 * 1024)  /* "Yes?" WAV cache in PSRAM */
 
-#define UTTERANCE_MAX_MS       2500         /* cap on wake word utterance (2.5s) */
-#define CMD_MAX_MS             8000         /* hard cap on command capture (8.0s) */
+#define VOICE_MAX_RECORD_MS    15000        /* hard cap on dynamic voice capture (15.0s) */
+#define UTTERANCE_MAX_MS       VOICE_MAX_RECORD_MS /* flexible wake capture (ends on silence or 15s) */
+#define CMD_MAX_MS             VOICE_MAX_RECORD_MS /* flexible command capture (ends on silence or 15s) */
 #define CMD_MAX_SAMPLES        (TOOL_AUDIO_SAMPLE_RATE * CMD_MAX_MS / 1000)
 #define CMD_LEAD_MS            3500         /* initial silence / wait-for-speech timeout (3.5s) */
 #define CMD_SILENCE_MS         1200         /* endpointing trailing silence cutoff (1.2s) */
@@ -784,7 +785,7 @@ static void voice_run_command(void)
             break;
         }
 
-        /* 3. Hard cap reached (8.0s) */
+        /* 3. Hard cap reached (15.0s) */
         if (now - start_ms >= CMD_MAX_MS) {
             ESP_LOGI(TAG, "[CMD] full %d ms countdown reached", CMD_MAX_MS);
             break;
@@ -1061,7 +1062,7 @@ static void voice_task(void *arg)
                     ESP_LOGI(TAG, "[utterance] silence timeout (%d ms)", CMD_SILENCE_MS);
                     break;
                 }
-                /* Hard cap at 1.5s for wake word utterance */
+                /* Hard cap for utterance (15.0s) */
                 if (cur_ms - start_ms >= UTTERANCE_MAX_MS) {
                     ESP_LOGI(TAG, "[utterance] max %d ms reached", UTTERANCE_MAX_MS);
                     break;

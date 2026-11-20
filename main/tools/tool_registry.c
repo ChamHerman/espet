@@ -1,6 +1,7 @@
 #include "tool_registry.h"
 #include "mimi_config.h"
 #include "sync/backend_discovery.h"
+#include "sync/config_sync.h"
 #include "display/display_status.h"
 #include "cJSON.h"
 #include "tools/tool_web_search.h"
@@ -810,6 +811,15 @@ esp_err_t tool_registry_execute(const char *name, const char *input_json,
                 ret = tool_remote_execute(name, input_json, output, output_size);
             }
             display_status_set(ret == ESP_OK ? "Done:" : "Tool failed:", name);
+            if (ret == ESP_OK) {
+                if (strncmp(name, "update_", 7) == 0 ||
+                    strncmp(name, "manage_", 7) == 0 ||
+                    strcmp(name, "write_file") == 0 ||
+                    strcmp(name, "edit_file") == 0) {
+                    ESP_LOGI(TAG, "Config/file modifying tool '%s' succeeded — triggering immediate config sync", name);
+                    config_sync_trigger();
+                }
+            }
             return ret;
         }
     }
@@ -819,6 +829,15 @@ esp_err_t tool_registry_execute(const char *name, const char *input_json,
     display_status_set("Tool:", name);
     ret = tool_remote_execute(name, input_json, output, output_size);
     display_status_set(ret == ESP_OK ? "Done:" : "Tool failed:", name);
+    if (ret == ESP_OK) {
+        if (strncmp(name, "update_", 7) == 0 ||
+            strncmp(name, "manage_", 7) == 0 ||
+            strcmp(name, "write_file") == 0 ||
+            strcmp(name, "edit_file") == 0) {
+            ESP_LOGI(TAG, "Remote config tool '%s' succeeded — triggering immediate config sync", name);
+            config_sync_trigger();
+        }
+    }
     return ret;
 }
 

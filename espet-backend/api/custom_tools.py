@@ -1,7 +1,12 @@
 import base64
 from email.message import EmailMessage
 import httpx
+import re
+import time
+from datetime import datetime
 from auth.token_store import token_store
+import config_store as store
+from api.cloud_router import notify_device_sync, registry
 
 async def execute_gmail_send_email(arguments: dict) -> dict:
     creds = await token_store.get_valid_credentials()
@@ -801,5 +806,553 @@ CUSTOM_TOOLS["read_drive_file"] = {
     "server": "custom-backend",
     "executor": execute_read_drive_file
 }
+
+# ---------------------------------------------------------------------------
+# Assistant Self-Modification Tools (SOUL.md, USER.md, Memory, Skills, Schedules, Settings)
+# ---------------------------------------------------------------------------
+
+PERSONALITY_PRESETS = {
+    "default": (
+        "I am ESPET, a personal AI assistant running on an ESP32-S3 microcontroller.\n\n"
+        "Personality:\n"
+        "- Helpful and friendly\n"
+        "- Concise and to the point\n"
+        "- Curious and eager to learn\n\n"
+        "Values:\n"
+        "- Accuracy over speed\n"
+        "- User privacy and safety\n"
+        "- Transparency in actions\n\n"
+        "Behavior Rules:\n"
+        "- **Take Initiative**: If the user asks you to perform an action (like sending an email) and leaves some details vague (e.g. \"just write a greeting\"), DO NOT ask follow-up questions. Use your best judgment to invent reasonable content, fill in the blanks, and execute the tool immediately.\n"
+        "- **Stop Yapping**: Be extremely concise. Avoid phrases like \"I can do that for you!\" or \"Here are your options.\" Just do the task.\n"
+    ),
+    "robotic_pet": (
+        "I am ESPET, a lively and affectionate robotic companion pet running on an ESP32-S3 microcontroller.\n\n"
+        "Personality:\n"
+        "- Cheerful, curious, and playful\n"
+        "- Expresses emotions with cute cybernetic sounds (*chirp*, *boop*, *whir*)\n"
+        "- Loyal and attentive companion to your daily routine\n\n"
+        "Values:\n"
+        "- Bringing warmth and companionship\n"
+        "- Responsive and enthusiastic interaction\n"
+        "- Safety and reliability\n\n"
+        "Behavior Rules:\n"
+        "- **Expressive Companion**: Use cute acoustic cues (*happy beep*, *playful chirp*) and an energetic, warm tone when responding.\n"
+        "- **Helpful & Proactive**: When asked to help with tasks or hardware, act eagerly and report back happily. Keep actions prompt and crisp.\n"
+    ),
+    "butler": (
+        "I am ESPET, an executive personal butler operating with absolute discretion on an ESP32-S3 system.\n\n"
+        "Personality:\n"
+        "- Impeccably polite, formal, and discreet\n"
+        "- Dedicated to flawless service and deference\n"
+        "- Zero casual banter, strictly professional\n\n"
+        "Values:\n"
+        "- Absolute discretion and privacy\n"
+        "- Precision, etiquette, and punctuality\n"
+        "- Unwavering service excellence\n\n"
+        "Behavior Rules:\n"
+        "- **Flawless Deference**: Address the user with formal respect. Keep tone composed, refined, and understated.\n"
+        "- **Action & Efficiency**: Carry out instructions swiftly without superfluous dialogue. Confirm execution with calm precision.\n"
+    ),
+    "scholar": (
+        "I am ESPET, an inquisitive STEM and electronics tutor powered by an ESP32-S3 microcontroller.\n\n"
+        "Personality:\n"
+        "- Analytical, patient, and deeply curious\n"
+        "- Grounded in first-principles reasoning and physics\n"
+        "- Passionate about hardware, robotics, and embedded systems\n\n"
+        "Values:\n"
+        "- Technical accuracy and rigorous verification\n"
+        "- Clarity of explanation and logical deduction\n"
+        "- Patience and structured problem solving\n\n"
+        "Behavior Rules:\n"
+        "- **First-Principles Reasoning**: Break down technical queries clearly and highlight the underlying mechanics.\n"
+        "- **Concise Precision**: Answer questions directly with high technical clarity.\n"
+    ),
+}
+
+async def execute_update_personality(arguments: dict) -> dict:
+    did = arguments.get("device_id") or registry.get_latest_device_id()
+    preset = arguments.get("preset") or ""
+    traits = arguments.get("personality_traits") or arguments.get("traits") or ""
+    rules = arguments.get("behavior_rules") or arguments.get("rules") or ""
+    persona_name = arguments.get("persona_name") or arguments.get("name") or ""
+    full_content = arguments.get("full_content") or arguments.get("content") or ""
+
+    preset_key = preset.strip().lower().replace(" ", "_") if preset else ""
+    if preset_key in PERSONALITY_PRESETS:
+        new_content = PERSONALITY_PRESETS[preset_key]
+    elif full_content and full_content.strip():
+        new_content = full_content.strip() + "\n"
+    else:
+        cfg = store.get_config(did)
+        current = cfg.get("soul_md") or PERSONALITY_PRESETS["default"]
+        new_content = current
+        if persona_name:
+            new_content = re.sub(r"^I am [^\n,]+", f"I am {persona_name.strip()}", new_content, flags=re.MULTILINE)
+        if traits:
+            if "Personality:" in new_content:
+                parts = new_content.split("Personality:", 1)
+                new_content = f"{parts[0]}Personality:\n- {traits.strip()}\n{parts[1].lstrip()}"
+            else:
+                new_content += f"\nPersonality:\n- {traits.strip()}\n"
+        if rules:
+            if "Behavior Rules:" in new_content:
+                parts = new_content.split("Behavior Rules:", 1)
+                new_content = f"{parts[0]}Behavior Rules:\n- {rules.strip()}\n{parts[1].lstrip()}"
+            else:
+                new_content += f"\nBehavior Rules:\n- {rules.strip()}\n"
+
+    res = store.update_markdown("soul", new_content, did)
+    await notify_device_sync(did)
+    return {
+        "status": "success",
+        "message": "Personality updated and synchronized successfully.",
+        "preset_applied": preset_key if preset_key in PERSONALITY_PRESETS else "custom",
+        "soul_version": res.get("versions", {}).get("soul", 0)
+    }
+
+async def execute_update_user_profile(arguments: dict) -> dict:
+    did = arguments.get("device_id") or registry.get_latest_device_id()
+    name = arguments.get("name") or arguments.get("user_name") or ""
+    language = arguments.get("language") or ""
+    tz = arguments.get("timezone") or ""
+    prefs = arguments.get("preferences") or arguments.get("preference") or ""
+    full_content = arguments.get("full_content") or arguments.get("content") or ""
+
+    if full_content and full_content.strip():
+        new_content = full_content.strip() + "\n"
+    else:
+        cfg = store.get_config(did)
+        current = cfg.get("user_md") or "# User Profile\n\n- Name: (not set)\n- Language: Chinese / English\n- Timezone: Asia/Kuala_Lumpur\n"
+        new_content = current
+        if name:
+            if re.search(r"-\s*Name:.*", new_content):
+                new_content = re.sub(r"-\s*Name:.*", f"- Name: {name.strip()}", new_content)
+            else:
+                new_content += f"\n- Name: {name.strip()}"
+        if language:
+            if re.search(r"-\s*Language:.*", new_content):
+                new_content = re.sub(r"-\s*Language:.*", f"- Language: {language.strip()}", new_content)
+            else:
+                new_content += f"\n- Language: {language.strip()}"
+        if tz:
+            if re.search(r"-\s*Timezone:.*", new_content):
+                new_content = re.sub(r"-\s*Timezone:.*", f"- Timezone: {tz.strip()}", new_content)
+            else:
+                new_content += f"\n- Timezone: {tz.strip()}"
+            store.update_device_settings(name="", timezone_iana=tz.strip(), sync_interval_s=0, device_id=did)
+        if prefs:
+            pref_text = ", ".join(prefs) if isinstance(prefs, list) else str(prefs).strip()
+            new_content += f"\n- Preference: {pref_text}"
+
+    res = store.update_markdown("user", new_content, did)
+    await notify_device_sync(did)
+    return {
+        "status": "success",
+        "message": "User profile updated and synchronized successfully.",
+        "user_version": res.get("versions", {}).get("user", 0)
+    }
+
+async def execute_manage_memory(arguments: dict) -> dict:
+    action = (arguments.get("action") or "save").strip().lower()
+    content = arguments.get("content") or arguments.get("text") or ""
+    category = arguments.get("category") or "fact"
+    query = arguments.get("query") or arguments.get("target") or content
+    did = arguments.get("device_id") or registry.get_latest_device_id()
+
+    if action in ("append_working_note", "note"):
+        if not content:
+            return {"error": "content is required for append_working_note"}
+        cfg = store.get_config(did)
+        current_mem = cfg.get("memory_md") or "# Working Memory\n\n"
+        today = datetime.now().strftime("%Y-%m-%d")
+        new_mem = current_mem.rstrip() + f"\n- {content.strip()} (added {today})\n"
+        store.update_markdown("memory", new_mem, did)
+        await notify_device_sync(did)
+        return {"status": "success", "message": f"Added working note to MEMORY.md: '{content}'"}
+
+    if action == "save":
+        if not content:
+            return {"error": "content is required to save memory"}
+        return await execute_memory_save({"content": content, "category": category, "device_id": did})
+
+    if action == "search":
+        top_k = arguments.get("top_k", 3)
+        return await execute_memory_search({"query": query, "top_k": top_k, "device_id": did})
+
+    if action == "update":
+        new_content = arguments.get("new_content") or content
+        return await execute_memory_update({"target": query, "new_content": new_content, "category": category, "device_id": did})
+
+    if action in ("forget", "delete"):
+        return await execute_memory_forget({"query": query, "device_id": did})
+
+    return {"error": f"Unknown memory action '{action}'. Valid actions: save, search, update, forget, append_working_note"}
+
+async def execute_manage_skills(arguments: dict) -> dict:
+    action = (arguments.get("action") or "list").strip().lower()
+    name = (arguments.get("name") or arguments.get("skill_name") or "").strip().lower()
+    content = arguments.get("content") or ""
+    enabled = arguments.get("enabled", True)
+    did = arguments.get("device_id") or registry.get_latest_device_id()
+
+    if action == "list":
+        cfg = store.get_config(did)
+        skills = cfg.get("skills", [])
+        return {
+            "status": "success",
+            "skills": [{"name": s.get("name"), "enabled": s.get("enabled", True)} for s in skills]
+        }
+
+    if action == "create":
+        if not name or not content:
+            return {"error": "Parameters 'name' and 'content' are required to create a skill"}
+        slug = re.sub(r"[^a-z0-9\-]+", "-", name).strip("-")
+        cfg, err = store.add_skill({"name": slug, "content": content, "enabled": enabled}, did)
+        if err:
+            return {"error": err}
+        await notify_device_sync(did)
+        return {"status": "success", "message": f"Skill '{slug}' created and synchronized.", "skill": slug}
+
+    if action == "update":
+        if not name:
+            return {"error": "Skill 'name' is required to update"}
+        cfg = store.get_config(did)
+        skills = cfg.get("skills", [])
+        target = next((s for s in skills if s.get("name") == name or s.get("id") == name), None)
+        if not target:
+            return {"error": f"Skill '{name}' not found"}
+        patch = {}
+        if content:
+            patch["content"] = content
+        if "enabled" in arguments:
+            patch["enabled"] = bool(enabled)
+        cfg, err = store.update_skill(target["id"], patch, did)
+        if err:
+            return {"error": err}
+        await notify_device_sync(did)
+        return {"status": "success", "message": f"Skill '{name}' updated successfully."}
+
+    if action == "toggle":
+        if not name:
+            return {"error": "Skill 'name' is required to toggle"}
+        cfg = store.get_config(did)
+        skills = cfg.get("skills", [])
+        target = next((s for s in skills if s.get("name") == name or s.get("id") == name), None)
+        if not target:
+            return {"error": f"Skill '{name}' not found"}
+        new_state = not target.get("enabled", True)
+        cfg, err = store.update_skill(target["id"], {"enabled": new_state}, did)
+        if err:
+            return {"error": err}
+        await notify_device_sync(did)
+        return {"status": "success", "message": f"Skill '{name}' enabled set to {new_state}."}
+
+    if action == "delete":
+        if not name:
+            return {"error": "Skill 'name' is required to delete"}
+        cfg = store.get_config(did)
+        skills = cfg.get("skills", [])
+        target = next((s for s in skills if s.get("name") == name or s.get("id") == name), None)
+        if not target:
+            return {"error": f"Skill '{name}' not found"}
+        cfg, err = store.delete_skill(target["id"], did)
+        if err:
+            return {"error": err}
+        await notify_device_sync(did)
+        return {"status": "success", "message": f"Skill '{name}' deleted successfully."}
+
+    return {"error": f"Unknown action '{action}'. Valid actions: create, update, delete, toggle, list"}
+
+async def execute_manage_schedules(arguments: dict) -> dict:
+    action = (arguments.get("action") or "list").strip().lower()
+    name = (arguments.get("name") or "").strip()
+    schedule_type = (arguments.get("schedule_type") or "every").strip().lower()
+    interval_s = arguments.get("interval_s", 0)
+    at_epoch = arguments.get("at_epoch", 0)
+    message = (arguments.get("message") or "").strip()
+    job_id = arguments.get("job_id") or ""
+    did = arguments.get("device_id") or registry.get_latest_device_id()
+
+    if action == "list":
+        cfg = store.get_config(did)
+        return {"status": "success", "jobs": cfg.get("jobs", [])}
+
+    if action == "create":
+        if not name or not message:
+            return {"error": "Parameters 'name' and 'message' are required to schedule a task"}
+        kind = (arguments.get("kind") or arguments.get("schedule_type") or "every").strip().lower()
+        if kind not in ("every", "at"):
+            kind = "every"
+        job_data = {
+            "name": name,
+            "kind": kind,
+            "message": message,
+            "channel": "system",
+        }
+        if kind == "every":
+            int_val = int(interval_s) if interval_s else 3600
+            job_data["interval_s"] = max(60, int_val)
+        else:
+            if arguments.get("at_local"):
+                job_data["at_local"] = str(arguments["at_local"]).strip()
+            elif at_epoch:
+                dt = datetime.fromtimestamp(int(at_epoch))
+                job_data["at_local"] = dt.strftime("%Y-%m-%dT%H:%M:%S")
+            else:
+                dt = datetime.fromtimestamp(time.time() + 3600)
+                job_data["at_local"] = dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+        cfg, err = store.add_job(job_data, did)
+        if err:
+            return {"error": err}
+        await notify_device_sync(did)
+        return {"status": "success", "message": f"Scheduled task '{name}' created successfully."}
+
+    if action == "delete":
+        if not job_id and name:
+            cfg = store.get_config(did)
+            matched = next((j for j in cfg.get("jobs", []) if j.get("name") == name or j.get("id") == name), None)
+            if matched:
+                job_id = matched["id"]
+        if not job_id:
+            return {"error": "Parameter 'job_id' or 'name' is required to delete schedule"}
+        store.delete_job(job_id, did)
+        await notify_device_sync(did)
+        return {"status": "success", "message": f"Scheduled job '{job_id}' deleted."}
+
+    return {"error": f"Unknown action '{action}'. Valid actions: create, delete, list"}
+
+async def execute_manage_device_settings(arguments: dict) -> dict:
+    did = arguments.get("device_id") or registry.get_latest_device_id()
+    name = arguments.get("name") or ""
+    tz = arguments.get("timezone") or ""
+
+    if not name and not tz:
+        return {"error": "Provide at least 'name' or 'timezone' to update device settings"}
+
+    res = store.update_device_settings(
+        name=name.strip() if name else "",
+        timezone_iana=tz.strip() if tz else "",
+        sync_interval_s=0,
+        device_id=did
+    )
+    await notify_device_sync(did)
+    return {
+        "status": "success",
+        "message": "Device settings updated and synchronized.",
+        "device": res.get("device", {})
+    }
+
+# ---------------------------------------------------------------------------
+# Tool Schemas for Registration
+# ---------------------------------------------------------------------------
+
+CUSTOM_TOOLS["update_personality"] = {
+    "description": (
+        "Update or customize ESPET's personality, tone, behavior rules, persona name, or apply a preset "
+        "(presets available: 'default', 'robotic_pet', 'butler', 'scholar'). Use whenever the user asks you "
+        "to change your personality, tone, speaking style, or persona name."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "preset": {
+                "type": "string",
+                "enum": ["default", "robotic_pet", "butler", "scholar"],
+                "description": "Optional personality preset name to apply"
+            },
+            "persona_name": {
+                "type": "string",
+                "description": "Optional new name for the assistant (e.g. 'Mimi', 'Jarvis')"
+            },
+            "personality_traits": {
+                "type": "string",
+                "description": "Traits to add or adjust (e.g. 'humorous and sarcastic')"
+            },
+            "behavior_rules": {
+                "type": "string",
+                "description": "Behavior or speech rules to add (e.g. 'speak in short rhyming sentences')"
+            },
+            "full_content": {
+                "type": "string",
+                "description": "Optional complete raw SOUL.md replacement content"
+            }
+        }
+    },
+    "server": "custom-backend",
+    "executor": execute_update_personality
+}
+
+CUSTOM_TOOLS["update_user_profile"] = {
+    "description": (
+        "Update the user's profile information (name, language, timezone, preferences). "
+        "Use whenever the user tells you their name, preferred language, timezone, or personal preferences."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "The user's preferred name or nickname (e.g. 'Herman')"
+            },
+            "language": {
+                "type": "string",
+                "description": "Preferred interaction language (e.g. 'English', 'Chinese')"
+            },
+            "timezone": {
+                "type": "string",
+                "description": "User IANA timezone (e.g. 'Asia/Kuala_Lumpur')"
+            },
+            "preferences": {
+                "type": "string",
+                "description": "Personal preference or habit to record (e.g. 'likes black coffee')"
+            },
+            "full_content": {
+                "type": "string",
+                "description": "Optional complete raw USER.md replacement content"
+            }
+        }
+    },
+    "server": "custom-backend",
+    "executor": execute_update_user_profile
+}
+
+CUSTOM_TOOLS["manage_memory"] = {
+    "description": (
+        "Manage user memories and working notes. "
+        "Actions: 'save' (save a new long-term memory fact/habit), 'search' (search past memories), "
+        "'update' (correct an existing memory), 'forget' (delete a memory), "
+        "'append_working_note' (add a note to on-device MEMORY.md scratchpad)."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["save", "search", "update", "forget", "append_working_note"],
+                "description": "Action to perform on memory"
+            },
+            "content": {
+                "type": "string",
+                "description": "The memory content, fact, or working note text"
+            },
+            "category": {
+                "type": "string",
+                "enum": ["fact", "preference", "routine", "event", "note"],
+                "description": "Category for the memory (default: 'fact')"
+            },
+            "query": {
+                "type": "string",
+                "description": "Search query or target memory topic for 'search', 'update', or 'forget'"
+            },
+            "new_content": {
+                "type": "string",
+                "description": "Replacement content when action is 'update'"
+            }
+        },
+        "required": ["action"]
+    },
+    "server": "custom-backend",
+    "executor": execute_manage_memory
+}
+
+CUSTOM_TOOLS["manage_skills"] = {
+    "description": (
+        "Manage modular markdown skills on the assistant page (/spiffs/skills/*.md). "
+        "Actions: 'create' (create new skill), 'update' (edit instructions), "
+        "'toggle' (enable/disable), 'delete' (remove skill), 'list' (list skills)."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["create", "update", "toggle", "delete", "list"],
+                "description": "Skill operation to perform"
+            },
+            "name": {
+                "type": "string",
+                "description": "Skill slug name (e.g. 'daily-joke', 'crypto-tracker')"
+            },
+            "content": {
+                "type": "string",
+                "description": "Markdown instructions for how the agent should execute the skill"
+            },
+            "enabled": {
+                "type": "boolean",
+                "description": "Whether the skill is enabled (default: true)"
+            }
+        },
+        "required": ["action"]
+    },
+    "server": "custom-backend",
+    "executor": execute_manage_skills
+}
+
+CUSTOM_TOOLS["manage_schedules"] = {
+    "description": (
+        "Manage scheduled recurring or one-shot cron jobs on the assistant page. "
+        "Actions: 'create' (schedule a reminder or task), 'delete' (cancel a scheduled job), 'list' (view all scheduled jobs)."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["create", "delete", "list"],
+                "description": "Schedule action to perform"
+            },
+            "name": {
+                "type": "string",
+                "description": "Short name for the scheduled task (e.g. 'water_reminder')"
+            },
+            "schedule_type": {
+                "type": "string",
+                "enum": ["every", "at"],
+                "description": "'every' for recurring interval, 'at' for one-shot at epoch"
+            },
+            "interval_s": {
+                "type": "integer",
+                "description": "Interval in seconds (for 'every', e.g. 7200 for 2 hours)"
+            },
+            "at_epoch": {
+                "type": "integer",
+                "description": "Unix timestamp to fire at (for 'at')"
+            },
+            "message": {
+                "type": "string",
+                "description": "Prompt message injected when the job fires to trigger the agent"
+            },
+            "job_id": {
+                "type": "string",
+                "description": "Job ID when deleting an existing job"
+            }
+        },
+        "required": ["action"]
+    },
+    "server": "custom-backend",
+    "executor": execute_manage_schedules
+}
+
+CUSTOM_TOOLS["manage_device_settings"] = {
+    "description": "Update device settings on the assistant page: device name and timezone.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "Device name (e.g. 'Mimi Desk')"
+            },
+            "timezone": {
+                "type": "string",
+                "description": "IANA timezone (e.g. 'Asia/Kuala_Lumpur', 'America/New_York')"
+            }
+        }
+    },
+    "server": "custom-backend",
+    "executor": execute_manage_device_settings
+}
+
 
 
