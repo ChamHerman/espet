@@ -26,6 +26,7 @@
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
+#include "esp_crt_bundle.h"
 #include "cJSON.h"
 
 static const char *TAG = "tools";
@@ -618,6 +619,7 @@ static esp_err_t tool_remote_execute(const char *name, const char *input_json,
         .event_handler = http_event_handler,
         .user_data = &resp_ctx,
         .timeout_ms = 15000,
+        .crt_bundle_attach = esp_crt_bundle_attach,
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
@@ -712,6 +714,7 @@ esp_err_t tool_registry_fetch_remote_tools(void)
         .timeout_ms = 10000,
         .buffer_size = 4096,
         .buffer_size_tx = 1024,
+        .crt_bundle_attach = esp_crt_bundle_attach,
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&config);

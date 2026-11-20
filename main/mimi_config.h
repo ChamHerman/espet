@@ -203,11 +203,13 @@
 #define MIMI_NVS_LLM "llm_config"
 #define MIMI_NVS_PROXY "proxy_config"
 #define MIMI_NVS_SEARCH "search_config"
+#define MIMI_NVS_BACKEND "backend_cfg"
 
 /* NVS Keys */
 #define MIMI_NVS_KEY_SSID "ssid"
 #define MIMI_NVS_KEY_PASS "password"
 #define MIMI_NVS_KEY_TG_TOKEN "bot_token"
+#define MIMI_NVS_KEY_BACKEND_URL "url"
 #if MIMI_FEISHU_ENABLE
 #define MIMI_NVS_KEY_FEISHU_APP_ID "app_id"
 #define MIMI_NVS_KEY_FEISHU_APP_SECRET "app_secret"

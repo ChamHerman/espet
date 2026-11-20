@@ -20,6 +20,10 @@
 #include "wifi_provisioning/scheme_ble.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "nvs_flash.h"
+#include "nvs.h"
+#include "sync/backend_discovery.h"
+#include "cJSON.h"
 
 static const char *TAG = "onboard_ble";
 
@@ -59,6 +63,52 @@ static void prov_event_handler(void *user_data, wifi_prov_cb_event_t event, void
     default:
         break;
     }
+}
+
+static esp_err_t custom_config_prov_handler(uint32_t session_id, const uint8_t *inbuf, ssize_t inlen,
+                                            uint8_t **outbuf, ssize_t *outlen, void *priv_data)
+{
+    if (inbuf && inlen > 0) {
+        ESP_LOGI(TAG, "Received custom config: %.*s", (int)inlen, (const char *)inbuf);
+        cJSON *root = cJSON_ParseWithLength((const char *)inbuf, inlen);
+        if (root) {
+            cJSON *item = cJSON_GetObjectItem(root, "backend_url");
+            if (cJSON_IsString(item) && item->valuestring) {
+                const char *url = item->valuestring;
+                nvs_handle_t nvs;
+                if (url[0] != '\0') {
+                    if (strlen(url) < 96 && (strncmp(url, "http://", 7) == 0 || strncmp(url, "https://", 8) == 0)) {
+                        if (nvs_open(MIMI_NVS_BACKEND, NVS_READWRITE, &nvs) == ESP_OK) {
+                            nvs_set_str(nvs, MIMI_NVS_KEY_BACKEND_URL, url);
+                            nvs_commit(nvs);
+                            nvs_close(nvs);
+                            backend_discovery_set_url(url);
+                            ESP_LOGI(TAG, "Saved backend URL to NVS: %s", url);
+                        }
+                    } else {
+                        ESP_LOGW(TAG, "Invalid backend URL format: %s", url);
+                    }
+                } else {
+                    if (nvs_open(MIMI_NVS_BACKEND, NVS_READWRITE, &nvs) == ESP_OK) {
+                        nvs_erase_key(nvs, MIMI_NVS_KEY_BACKEND_URL);
+                        nvs_commit(nvs);
+                        nvs_close(nvs);
+                        backend_discovery_set_url("");
+                        ESP_LOGI(TAG, "Cleared backend URL from NVS");
+                    }
+                }
+            }
+            cJSON_Delete(root);
+        }
+    }
+
+    const char *resp = "{\"status\":\"ok\"}";
+    *outbuf = (uint8_t *)strdup(resp);
+    if (*outbuf == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    *outlen = strlen(resp) + 1;
+    return ESP_OK;
 }
 
 static void on_ip_event(void *arg, esp_event_base_t base, int32_t id, void *data)
@@ -107,10 +157,16 @@ esp_err_t wifi_onboard_ble_start(void)
 
     ESP_ERROR_CHECK(wifi_prov_mgr_init(config));
 
+    /* Create custom endpoint for custom configuration (e.g. backend URL) */
+    wifi_prov_mgr_endpoint_create("custom-config");
+
     // ponytail: Security 0 used for personal companion; upgrade to Security 1 (PoP) if deployed in untrusted public environments.
     wifi_prov_security_t security = WIFI_PROV_SECURITY_0;
     const char *pop = NULL;
     ESP_ERROR_CHECK(wifi_prov_mgr_start_provisioning(security, pop, service_name, NULL));
+
+    /* Register handler for custom endpoint */
+    wifi_prov_mgr_endpoint_register("custom-config", custom_config_prov_handler, NULL);
 
     /* Block until provisioning completes */
     wifi_prov_mgr_wait();

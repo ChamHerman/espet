@@ -209,6 +209,7 @@
           </svg>
         </button>
       </div>
+      <input type="text" id="backend-url" placeholder="Backend Server URL (optional, e.g. http://172.20.10.2:8000)" autocomplete="off" spellcheck="false">
       <button id="btn-provision">Connect Wi-Fi</button>
       <button class="btn-secondary" id="btn-scan">Scan 2.4 GHz Networks</button>
       <div id="scan-results" style="margin-top: 8px;"></div>
@@ -322,10 +323,30 @@
         return;
       }
 
-      log(`Sending credentials for "${ssid}" to ESPET...`, 'info');
+      const rawBackendUrl = document.getElementById('backend-url').value.trim();
+      let backendUrl = '';
+      if (rawBackendUrl) {
+        backendUrl = rawBackendUrl.replace(/\/+$/, '');
+        if (!backendUrl.startsWith('http://') && !backendUrl.startsWith('https://')) {
+          backendUrl = 'http://' + backendUrl;
+        }
+      }
+
       document.getElementById('btn-provision').disabled = true;
 
       try {
+        if (backendUrl) {
+          log(`Sending backend URL to ESPET: ${backendUrl}...`, 'info');
+          try {
+            const payload = JSON.stringify({ backend_url: backendUrl });
+            await provDevice.sendData('custom-config', new TextEncoder().encode(payload));
+            log('Backend URL saved to ESPET!', 'success');
+          } catch (e) {
+            log(`Notice: Could not send custom config (${e.message}). Proceeding with Wi-Fi...`, 'info');
+          }
+        }
+
+        log(`Sending credentials for "${ssid}" to ESPET...`, 'info');
         await provDevice.provision(ssid, password);
         log('Credentials delivered. ESPET testing connection...', 'info');
 

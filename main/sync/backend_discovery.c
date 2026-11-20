@@ -10,6 +10,8 @@
 
 #include "mimi_config.h"
 #include "display/display_status.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 
 #define BACKEND_MDNS_SERVICE "_espet"
 #define BACKEND_MDNS_PROTO   "_tcp"
@@ -21,6 +23,7 @@
 static const char *TAG = "discovery";
 
 static char s_base_url[96];
+static char s_nvs_url[96];
 static volatile bool s_task_running;
 
 static void store_base_url(const char *url)
@@ -28,16 +31,59 @@ static void store_base_url(const char *url)
     strlcpy(s_base_url, url, sizeof(s_base_url));
 }
 
+static bool get_nvs_backend_url(char *out, size_t out_sz)
+{
+    if (!out || out_sz == 0) return false;
+    nvs_handle_t nvs;
+    if (nvs_open(MIMI_NVS_BACKEND, NVS_READONLY, &nvs) == ESP_OK) {
+        size_t len = out_sz;
+        esp_err_t err = nvs_get_str(nvs, MIMI_NVS_KEY_BACKEND_URL, out, &len);
+        nvs_close(nvs);
+        if (err == ESP_OK && out[0] != '\0') {
+            return true;
+        }
+    }
+    return false;
+}
+
+void backend_discovery_init(void)
+{
+    /* Safe to call from app_main (main task stack in DRAM).
+     * Reads NVS once and primes in-memory caches so tasks running with
+     * stacks in PSRAM never invoke SPI flash / NVS. */
+    if (get_nvs_backend_url(s_nvs_url, sizeof(s_nvs_url))) {
+        store_base_url(s_nvs_url);
+        ESP_LOGI(TAG, "Backend discovery primed from NVS: %s", s_nvs_url);
+    }
+}
+
+void backend_discovery_set_url(const char *url)
+{
+    if (url && url[0] != '\0') {
+        strlcpy(s_nvs_url, url, sizeof(s_nvs_url));
+        store_base_url(url);
+    } else {
+        s_nvs_url[0] = '\0';
+        s_base_url[0] = '\0';
+    }
+}
+
 void backend_discovery_base_url(char *out, size_t out_sz)
 {
     if (!out || out_sz == 0) return;
-    /* s_base_url is only written by the single discovery task; readers either
-     * see the full previous or full next URL, never a torn one. */
+    /* PURE IN-MEMORY: Never call NVS here because callers like camera_stream_task
+     * or agent_loop_task have stacks in PSRAM. SPI flash access disables cache
+     * which triggers esp_task_stack_is_sane_cache_disabled() panic. */
     if (s_base_url[0] != '\0') {
         strlcpy(out, s_base_url, out_sz);
-    } else {
-        strlcpy(out, MIMI_BACKEND_URL, out_sz);
+        return;
     }
+    if (s_nvs_url[0] != '\0') {
+        strlcpy(out, s_nvs_url, out_sz);
+        return;
+    }
+    /* Fallback: compiled-in default */
+    strlcpy(out, MIMI_BACKEND_URL, out_sz);
 }
 
 static bool resolve_once(char *out, size_t out_sz)
@@ -122,19 +168,34 @@ static bool resolve_once(char *out, size_t out_sz)
 static void discovery_task(void *arg)
 {
     char url[96];
+    char nvs_url[96] = {0};
+    bool has_nvs = get_nvs_backend_url(nvs_url, sizeof(nvs_url));
+
+    /* If NVS was explicitly configured, prime s_base_url immediately so callers don't wait */
+    if (has_nvs && s_base_url[0] == '\0') {
+        store_base_url(nvs_url);
+        ESP_LOGI(TAG, "Backend primed with NVS configured URL: %s", nvs_url);
+    }
+
     /* Let boot-time allocations settle before creating the mDNS task */
     vTaskDelay(pdMS_TO_TICKS(3000));
-    for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    int max_attempts = has_nvs ? 2 : MAX_ATTEMPTS;
+    for (int attempt = 1; attempt <= max_attempts; attempt++) {
         if (resolve_once(url, sizeof(url))) {
             store_base_url(url);
             ESP_LOGI(TAG, "Backend discovered via mDNS: %s", url);
             break;
         }
-        ESP_LOGW(TAG, "Backend not found via mDNS (attempt %d/%d)", attempt, MAX_ATTEMPTS);
+        ESP_LOGW(TAG, "Backend not found via mDNS (attempt %d/%d)", attempt, max_attempts);
         vTaskDelay(pdMS_TO_TICKS(RETRY_DELAY_MS));
     }
     if (s_base_url[0] == '\0') {
-        ESP_LOGI(TAG, "Backend discovery using compiled-in fallback: %s", MIMI_BACKEND_URL);
+        if (has_nvs) {
+            store_base_url(nvs_url);
+            ESP_LOGI(TAG, "Backend discovery falling back to NVS URL: %s", nvs_url);
+        } else {
+            ESP_LOGI(TAG, "Backend discovery using compiled-in fallback: %s", MIMI_BACKEND_URL);
+        }
     }
     s_task_running = false;
     vTaskDelete(NULL);
@@ -162,6 +223,12 @@ void backend_discovery_start(void)
 
 void backend_discovery_invalidate(void)
 {
+    if (s_nvs_url[0] != '\0') {
+        /* When an explicit URL is configured in NVS (e.g. cloud server),
+         * keep it primed rather than dropping to empty. */
+        store_base_url(s_nvs_url);
+        return;
+    }
     if (s_base_url[0] == '\0' && s_task_running) {
         return;   /* nothing cached and a lookup is already in flight */
     }

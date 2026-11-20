@@ -27,6 +27,7 @@
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
+#include "esp_crt_bundle.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -240,6 +241,7 @@ static bool ack_fetch(void)
         .user_data = &rx,
         .buffer_size = VOICE_TX_CHUNK,
         .buffer_size_tx = VOICE_TX_CHUNK,
+        .crt_bundle_attach = esp_crt_bundle_attach,
     };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (!client) {
@@ -307,6 +309,7 @@ bool voice_client_transcribe_full(const int16_t *pcm, size_t samples, voice_stt_
         .user_data = rx,
         .buffer_size = VOICE_TX_CHUNK,
         .buffer_size_tx = VOICE_TX_CHUNK,
+        .crt_bundle_attach = esp_crt_bundle_attach,
     };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (!client) {
@@ -417,6 +420,7 @@ char *voice_client_vision_query_full(const uint8_t *jpeg_data, size_t jpeg_len, 
         .user_data = rx,
         .buffer_size = 4096,
         .buffer_size_tx = 4096,
+        .crt_bundle_attach = esp_crt_bundle_attach,
     };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (!client) {
@@ -593,6 +597,7 @@ static uint8_t *voice_tts_fetch(const char *text, size_t *out_len,
         .user_data = rx,
         .buffer_size = VOICE_TX_CHUNK,
         .buffer_size_tx = VOICE_TX_CHUNK,
+        .crt_bundle_attach = esp_crt_bundle_attach,
     };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (!client) {

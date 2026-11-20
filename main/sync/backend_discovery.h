@@ -25,6 +25,20 @@ extern "C" {
 void backend_discovery_start(void);
 
 /**
+ * @brief Initialize discovery caches from NVS safely on DRAM stack (app_main).
+ *
+ * Primes in-memory caches so subsequent calls to backend_discovery_base_url()
+ * never access SPI flash / NVS, allowing callers running with stacks in PSRAM
+ * (like camera_stream_task or agent_loop_task) to safely retrieve the backend URL.
+ */
+void backend_discovery_init(void);
+
+/**
+ * @brief Update in-memory backend URL immediately (called e.g. after BLE provisioning).
+ */
+void backend_discovery_set_url(const char *url);
+
+/**
  * @brief Copy the current backend base URL (with no trailing slash) into @p out.
  *
  * Returns the discovered URL when available, otherwise the compile-time

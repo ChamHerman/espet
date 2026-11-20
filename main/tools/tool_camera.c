@@ -167,14 +167,14 @@ static void camera_stream_task(void *arg)
     ESP_LOGI(TAG, "Camera stream task started");
 
     while (s_stream_running) {
-        char url[192];
+        char url[256];
         build_camera_ws_url(url, sizeof(url));
 
         esp_websocket_client_config_t cfg = {
             .uri = url,
-            .network_timeout_ms = 3000,
-            .buffer_size = 4096,
-            .task_stack = 4096,
+            .network_timeout_ms = 5000,
+            .buffer_size = 16384,
+            .task_stack = 8192,
             .disable_auto_reconnect = true,
             .crt_bundle_attach = esp_crt_bundle_attach,
         };
@@ -184,12 +184,12 @@ static void camera_stream_task(void *arg)
             if (ws) {
                 esp_websocket_client_destroy(ws);
             }
-            vTaskDelay(pdMS_TO_TICKS(1000));
+            vTaskDelay(pdMS_TO_TICKS(1500));
             continue;
         }
 
         int wait_ms = 0;
-        while (s_stream_running && !esp_websocket_client_is_connected(ws) && wait_ms < 3000) {
+        while (s_stream_running && !esp_websocket_client_is_connected(ws) && wait_ms < 5000) {
             vTaskDelay(pdMS_TO_TICKS(100));
             wait_ms += 100;
         }
@@ -198,7 +198,7 @@ static void camera_stream_task(void *arg)
             esp_websocket_client_stop(ws);
             esp_websocket_client_destroy(ws);
             if (s_stream_running) {
-                vTaskDelay(pdMS_TO_TICKS(1000));
+                vTaskDelay(pdMS_TO_TICKS(1500));
             }
             continue;
         }
@@ -213,11 +213,12 @@ static void camera_stream_task(void *arg)
                 fb = esp_camera_fb_get();
                 if (fb) {
                     int sent = esp_websocket_client_send_bin(ws, (const char *)fb->buf,
-                                                             (int)fb->len, pdMS_TO_TICKS(200));
-                    if (sent < 0) {
+                                                             (int)fb->len, pdMS_TO_TICKS(1500));
+                    if (sent <= 0) {
                         consecutive_send_failures++;
-                        ESP_LOGW(TAG, "Camera stream frame send failed (%d); dropping frame",
-                                 consecutive_send_failures);
+                        ESP_LOGW(TAG, "Camera stream frame send failed (%d, ret=%d); dropping frame",
+                                 consecutive_send_failures, sent);
+                        vTaskDelay(pdMS_TO_TICKS(100));
                     } else {
                         consecutive_send_failures = 0;
                     }
@@ -228,7 +229,7 @@ static void camera_stream_task(void *arg)
                 }
             }
 
-            if (consecutive_send_failures >= 3) {
+            if (consecutive_send_failures >= 5) {
                 ESP_LOGW(TAG, "Camera stream send stalled; reconnecting WS");
                 break;
             }
@@ -248,7 +249,7 @@ static void camera_stream_task(void *arg)
         esp_websocket_client_stop(ws);
         esp_websocket_client_destroy(ws);
         if (s_stream_running) {
-            vTaskDelay(pdMS_TO_TICKS(500));
+            vTaskDelay(pdMS_TO_TICKS(1500));
         }
     }
 
