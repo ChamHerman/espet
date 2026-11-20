@@ -769,6 +769,7 @@ static void voice_run_command(void)
         /* 1. Initial silence timeout (no speech within 3.5s) */
         if (!heard_speech && (now - start_ms >= CMD_LEAD_MS)) {
             ESP_LOGI(TAG, "[CMD] wait-for-speech timeout (%d ms) — no speech detected", CMD_LEAD_MS);
+            tool_audio_capture_disarm();
             telegram_send_to_last_chat("⏱️ Listening timed out (no speech heard).");
             tool_audio_beep(BEEP_TIMEOUT_HZ, BEEP_MS, BEEP_VOL);
             tool_audio_clear_cache();
@@ -776,6 +777,12 @@ static void voice_run_command(void)
             s_busy_start_ms = 0;
             display_status_idle();
             return;
+        }
+
+        /* Check for barge-in / abort */
+        if (voice_client_is_abort_requested()) {
+            ESP_LOGI(TAG, "[CMD] command window aborted by user interruption");
+            break;
         }
 
         /* 2. Trailing silence cutoff (speech ended with >= 1.2s silence) */
@@ -793,6 +800,14 @@ static void voice_run_command(void)
     }
 
     tool_audio_capture_disarm();
+    if (voice_client_is_abort_requested()) {
+        ESP_LOGI(TAG, "[CMD] abort flag set — discarding captured command");
+        tool_audio_clear_cache();
+        s_busy = false;
+        s_busy_start_ms = 0;
+        display_status_idle();
+        return;
+    }
     uint32_t dur = (uint32_t)(esp_timer_get_time() / 1000) - (uint32_t)start_ms;
     ESP_LOGI(TAG, "[CMD] captured %u samples (%u ms)", (unsigned)total, (unsigned)dur);
 
@@ -931,10 +946,10 @@ static void voice_task(void *arg)
             ESP_LOGI(TAG, "[listen] 5s: frames=%u avg_rms=%u peak_rms=%d loud=%u paused/empty=%u",
                      (unsigned)dbg_frames, avg, (int)dbg_rms_peak,
                      (unsigned)dbg_loud, (unsigned)dbg_empties);
-            ESP_LOGI(TAG, "[debug] feeder: dma_reads=%u zero_reads=%u ring_written=%u | busy=%d spk_busy=%d",
+            ESP_LOGI(TAG, "[debug] feeder: dma_reads=%u zero_reads=%u ring_written=%u | busy=%d audio_busy=%d spk_busy=%d",
                      (unsigned)s_feeder_reads, (unsigned)s_feeder_zeros,
                      (unsigned)s_ring_written,
-                     s_busy, tool_audio_is_busy());
+                     s_busy, tool_audio_is_busy(), tool_audio_is_speaker_busy());
             dbg_frames = 0; dbg_rms_sum = 0; dbg_rms_peak = 0; dbg_loud = 0; dbg_empties = 0;
             dbg_last_report_ms = now;
 
