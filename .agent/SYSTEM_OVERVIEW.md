@@ -330,7 +330,7 @@ ESPET employs a hierarchical 3-tier memory lifecycle balancing device flash limi
 
 ### 3.6 Connectivity & onboarding
 
-`wifi/wifi_manager.c` (credential store, non-blocking `esp_timer` exponential backoff, WPA2/WPA3 PMF compatibility) and `onboard/wifi_onboard_ble.c`
+`wifi/wifi_manager.c` (credential store, non-blocking `esp_timer` exponential backoff, universal WPA/WPA2/WPA3 compatibility with disabled PMF to prevent router re-auth expiration, clean deauth on reboot) and `onboard/wifi_onboard_ble.c`
 (BLE Wi-Fi provisioning via Apache NimBLE and Protocomm with Security 0 plain text;
 allows personal hotspot onboarding without app via Web Bluetooth, releases BT RAM
 on completion; mandatory onboarding mechanism for the device — entered on boot
@@ -767,6 +767,8 @@ Herman's full gap analysis and prioritized roadmap of needed tools/functions:
 
 Append-only session log. Newest first. One line per change:
 `- YYYY-MM-DD — summary (files: ...)`.
+
+- 2026-11-20 — Fixed Wi-Fi reboot AUTH_EXPIRE (2) / AUTH_FAIL (202) and premature BLE onboarding fallback: (1) Added clean Wi-Fi teardown and deauth in `wifi_onboard_ble.c`: explicitly calls `esp_wifi_disconnect()` and `esp_wifi_stop()` with settling delays before `esp_restart()` so AP router receives 802.11 Deauth frame and clears client association table before reboot. (2) Configured universal Wi-Fi STA compatibility in `wifi_manager.c`: disabled PMF (`pmf_cfg.capable = false`) to eliminate 802.11w SA query re-auth failures on home routers; relaxed authmode threshold to `WIFI_AUTH_WPA_PSK`; enabled `WIFI_ALL_CHANNEL_SCAN` and `WIFI_CONNECT_AP_BY_SIGNAL`; added masked credential debug logging; added explicit disconnect before reconnect in `on_reconnect_timer()`. (3) Backoff & Boot Timeout Alignment: capped `MIMI_WIFI_RETRY_MAX_MS` to 8000ms in `mimi_config.h` (23s total backoff) and increased `wifi_manager_wait_connected` timeout in `mimi.c` from 30s to 60s, ensuring all 5 retries execute without getting prematurely aborted by BLE onboarding fallback (files: main/onboard/wifi_onboard_ble.c, main/wifi/wifi_manager.c, main/mimi_config.h, main/mimi.c, .agent/SYSTEM_OVERVIEW.md).
 
 - 2026-11-14 — Removed "Speaking..." placeholder on OLED: updated `voice_client.c` and `mimi.c` to remove the static "Speaking..." display text, now directly rendering the spoken response text on the SSD1306 OLED across lines 1 and 2 during audio playback (files: main/voice/voice_client.c, main/mimi.c, .agent/SYSTEM_OVERVIEW.md).
 

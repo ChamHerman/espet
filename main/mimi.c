@@ -470,7 +470,7 @@ void app_main(void)
     bool wifi_ok = false;
     if (wifi_err == ESP_OK) {
         ESP_LOGI(TAG, "Waiting for WiFi connection...");
-        if (wifi_manager_wait_connected(30000) == ESP_OK) {
+        if (wifi_manager_wait_connected(60000) == ESP_OK) {
             wifi_ok = true;
             ESP_LOGI(TAG, "WiFi connected: %s", wifi_manager_get_ip());
             /* Fetch remote MCP tools from backend server */
