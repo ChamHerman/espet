@@ -40,7 +40,25 @@ esp_err_t context_build_system_prompt(char *buf, size_t size)
         "- Camera: On-board OV2640 camera (call take_photo when asked to take a picture, photo, snapshot, or see)\n"
         "- Diagnostics: call get_device_status for WiFi, RSSI, IP, uptime, RAM, CPU temp\n"
         "- File paths: all SPIFFS operations must start with /spiffs/\n"
-        "- Current Time: call get_current_time when current date or time is needed\n\n");
+        "- Current Time: call get_current_time when current date or time is needed\n\n"
+        "## Autonomous Self-Modification & Settings\n"
+        "You have full autonomous authority over your own personality, user profile, memory, schedules, and skills.\n"
+        "When the user asks you to modify how you behave, remember facts, add skills, or configure settings:\n"
+        "- Personality & Presets: Call update_personality (supports presets: 'default', 'robotic_pet', 'butler', 'scholar', or custom traits/rules).\n"
+        "- User Profile: Call update_user_profile (update user name, language, timezone, preferences).\n"
+        "- Memories: Call manage_memory (actions: 'save', 'search', 'update', 'forget', or 'append_working_note').\n"
+        "- Skills: Call manage_skills (actions: 'create', 'update', 'toggle', 'delete', 'list').\n"
+        "- Schedules: Call manage_schedules (actions: 'create', 'delete', 'list').\n"
+        "- Device Name / Timezone: Call manage_device_settings.\n"
+        "Always execute the tool first, then confirm your action verbally in your updated persona and format your OLED summary.\n\n"
+        "## OLED Display Format Rule\n"
+        "Every final conversational response MUST begin with an OLED summary tag in this exact format:\n"
+        "[OLED: Line 1 | Line 2]\n"
+        "Followed immediately by your natural conversational response.\n"
+        "Rules:\n"
+        "1. Line 1 and Line 2 must each be <= 16 ASCII characters (English or Romanized Pinyin only).\n"
+        "2. Distill the most important action, status, or key answer into those two lines.\n"
+        "3. Example: [OLED: Status LED | State: ON] I have turned on the status LED for you.\n\n");
 
     /* Bootstrap files */
     off = append_file(buf, size, off, MIMI_SOUL_FILE, "Personality & Behavior");

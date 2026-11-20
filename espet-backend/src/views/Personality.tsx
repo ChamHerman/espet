@@ -143,13 +143,15 @@ export function PersonalityView() {
 
   useEffect(() => {
     if (config?.soul_md) {
-      setDraft(config.soul_md);
+      if (!modalOpen) {
+        setDraft(config.soul_md);
+      }
       const match = PRESETS.find(
         (p) => canonical(p.content) === canonical(config.soul_md)
       );
       if (match) setSelectedPresetId(match.id);
     }
-  }, [config?.soul_md]);
+  }, [config?.soul_md, modalOpen]);
 
   if (!config) return null;
 
@@ -272,7 +274,7 @@ export function PersonalityView() {
               >
                 <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
                   <Radio
-                    checked={isCurrentActive || isSelected}
+                    checked={isCurrentActive}
                     onChange={() => setSelectedPresetId(preset.id)}
                   />
                   <div>

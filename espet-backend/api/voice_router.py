@@ -638,21 +638,19 @@ async def tts(req: TTSRequest):
 
     voice = req.voice or settings.voice_tts_voice
     try:
-        wav, (line1, line2) = await asyncio.gather(
-            _tts_to_wav(text, voice),
-            extract_oled_keywords_llm(req.text),
-        )
+        wav = await _tts_to_wav(text, voice)
+        line1, line2 = extract_oled_keywords(req.text)
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception("TTS/OLED distillation failed")
+        logger.exception("TTS synthesis failed")
         raise HTTPException(500, f"tts failed: {e}")
 
     headers = {
         "X-OLED-Line1": line1,
         "X-OLED-Line2": line2,
     }
-    logger.info("TTS OLED keywords (LLM): L1='%s', L2='%s' (for text: '%.40s...')",
+    logger.info("TTS ok: L1='%s', L2='%s' (for text: '%.40s...')",
                 line1, line2, req.text)
 
     return Response(content=wav, media_type="audio/wav", headers=headers)

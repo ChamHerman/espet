@@ -258,10 +258,32 @@ static void display_status_output(const char *line1, const char *line2)
 }
 /* ───────────────────────────────────────────────────────────── */
 
+static esp_timer_handle_t s_hold_timer = NULL;
+static int64_t s_text_hold_until_us = 0;
+
+static void hold_timer_cb(void *arg)
+{
+    if (s_lock && xSemaphoreTake(s_lock, pdMS_TO_TICKS(50)) == pdTRUE) {
+        s_text_hold_until_us = 0;
+        display_face_set_state(FACE_STATE_IDLE);
+        xSemaphoreGive(s_lock);
+    } else {
+        s_text_hold_until_us = 0;
+        display_face_set_state(FACE_STATE_IDLE);
+    }
+}
+
 void display_status_init(void)
 {
     if (!s_lock) {
         s_lock = xSemaphoreCreateMutex();
+    }
+    if (!s_hold_timer) {
+        esp_timer_create_args_t timer_args = {
+            .callback = &hold_timer_cb,
+            .name = "oled_hold_tmr",
+        };
+        esp_timer_create(&timer_args, &s_hold_timer);
     }
 }
 
@@ -269,13 +291,61 @@ void display_status_set(const char *line1, const char *line2)
 {
     if (!s_lock || !line1) return;
     if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) != pdTRUE) return;
+    if (s_hold_timer && esp_timer_is_active(s_hold_timer)) {
+        esp_timer_stop(s_hold_timer);
+    }
+    s_text_hold_until_us = 0;
     strlcpy(s_line1, line1, sizeof(s_line1));
     strlcpy(s_line2, line2 ? line2 : "", sizeof(s_line2));
     display_status_output(s_line1, s_line2);
     xSemaphoreGive(s_lock);
 }
 
+void display_status_set_text_timed(const char *line1, const char *line2, uint32_t min_hold_ms)
+{
+    if (!s_lock || !line1) return;
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) != pdTRUE) return;
+    if (s_hold_timer) {
+        esp_timer_stop(s_hold_timer);
+        if (min_hold_ms > 0) {
+            esp_timer_start_once(s_hold_timer, (uint64_t)min_hold_ms * 1000);
+            s_text_hold_until_us = esp_timer_get_time() + ((int64_t)min_hold_ms * 1000);
+        } else {
+            s_text_hold_until_us = 0;
+        }
+    }
+    strlcpy(s_line1, line1, sizeof(s_line1));
+    strlcpy(s_line2, line2 ? line2 : "", sizeof(s_line2));
+    display_status_output(s_line1, s_line2);
+    xSemaphoreGive(s_lock);
+}
+
+void display_status_extend_hold(uint32_t extra_ms)
+{
+    if (!s_lock) return;
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(50)) != pdTRUE) return;
+    if (s_hold_timer && extra_ms > 0) {
+        esp_timer_stop(s_hold_timer);
+        esp_timer_start_once(s_hold_timer, (uint64_t)extra_ms * 1000);
+        s_text_hold_until_us = esp_timer_get_time() + ((int64_t)extra_ms * 1000);
+    }
+    xSemaphoreGive(s_lock);
+}
+
+bool display_status_is_held(void)
+{
+    return (s_text_hold_until_us > 0 && esp_timer_get_time() < s_text_hold_until_us);
+}
+
 void display_status_idle(void)
 {
+    if (s_text_hold_until_us > 0 && esp_timer_get_time() < s_text_hold_until_us) {
+        /* Hold is still active; keep text on screen */
+        return;
+    }
+    if (s_hold_timer && esp_timer_is_active(s_hold_timer)) {
+        esp_timer_stop(s_hold_timer);
+    }
+    s_text_hold_until_us = 0;
     display_face_set_state(FACE_STATE_IDLE);
 }

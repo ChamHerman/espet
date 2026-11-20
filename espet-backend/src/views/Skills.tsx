@@ -41,7 +41,7 @@ export function SkillsView() {
   useEffect(() => {
     reload();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedDeviceId]);
+  }, [selectedDeviceId, config?.versions?.skills]);
 
   if (!config) return null;
 

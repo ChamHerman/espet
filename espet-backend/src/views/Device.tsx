@@ -3,7 +3,7 @@
    the Chat view to reach the ESP32 WebSocket gateway directly. */
 
 import { Button, Input, Select } from "antd";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { client, getDeviceAddr, setDeviceAddr } from "../api";
 import { Icon } from "../components/Icon";
 import { SectionDirtyChip } from "../components/StatusChips";
@@ -22,6 +22,15 @@ export function DeviceView() {
   const [interval, setIntervalS] = useState(dev?.sync_interval_s ?? 300);
   const [addr, setAddr] = useState(getDeviceAddr());
   const [savedAddr, setSavedAddr] = useState(getDeviceAddr());
+
+  useEffect(() => {
+    if (config?.device) {
+      setName(config.device.name ?? "");
+      setTz(config.device.timezone ?? "");
+      setIntervalS(config.device.sync_interval_s ?? 300);
+    }
+  }, [config?.device]);
+
   if (!config || !dev) return null;
 
   const dirty =

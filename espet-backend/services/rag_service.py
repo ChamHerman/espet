@@ -139,40 +139,90 @@ class RAGService:
             logger.info("Deleted memory chunk %d", chunk_id)
         return deleted
 
-    def delete_noisy_actions(self, device_id: str) -> int:
+    def delete_noisy_actions(self, device_id: str, all_actions: bool = True) -> int:
         """
-        Clean up noisy read-only and memory query tool executions from episodic action logs.
+        Clean up action records from vector memory chunks to decouple execution traces from semantic RAG.
         """
-        patterns = [
-            "Action: executed tool get_current_time%",
-            "Action: executed tool cron_list%",
-            "Action: executed tool gpio_read%",
-            "Action: executed tool read_file%",
-            "Action: executed tool list_dir%",
-            "Action: executed tool memory_search%",
-            "Action: executed tool memory_save%",
-        ]
         deleted_count = 0
         with self.db._lock:
             conn = self.db.get_conn()
             with conn:
                 cur = conn.cursor()
-                # Find chunk IDs matching noisy patterns
-                where_pattern = " OR ".join(["content LIKE ?" for _ in patterns])
-                query = f"""
-                    SELECT id FROM memory_chunks
-                    WHERE device_id = ? AND source_type = 'action' AND ({where_pattern})
-                """
-                cur.execute(query, (device_id, *patterns))
+                if all_actions:
+                    query = """
+                        SELECT id FROM memory_chunks
+                        WHERE device_id = ? AND (source_type = 'action' OR content LIKE 'Action:%')
+                    """
+                    cur.execute(query, (device_id,))
+                else:
+                    patterns = [
+                        "Action: executed tool get_current_time%",
+                        "Action: executed tool cron_list%",
+                        "Action: executed tool gpio_read%",
+                        "Action: executed tool read_file%",
+                        "Action: executed tool list_dir%",
+                        "Action: executed tool memory_search%",
+                        "Action: executed tool memory_save%",
+                    ]
+                    where_pattern = " OR ".join(["content LIKE ?" for _ in patterns])
+                    query = f"""
+                        SELECT id FROM memory_chunks
+                        WHERE device_id = ? AND source_type = 'action' AND ({where_pattern})
+                    """
+                    cur.execute(query, (device_id, *patterns))
                 rows = cur.fetchall()
                 chunk_ids = [r[0] for r in rows]
                 if chunk_ids:
                     placeholders = ",".join("?" * len(chunk_ids))
                     cur.execute(f"DELETE FROM vec_memories WHERE chunk_id IN ({placeholders})", chunk_ids)
                     cur.execute(f"DELETE FROM memory_chunks WHERE id IN ({placeholders})", chunk_ids)
-                    deleted_count = cur.rowcount
-        logger.info("Deleted %d noisy action records for device %s", deleted_count, device_id)
+                    deleted_count = len(chunk_ids)
+        logger.info("Deleted %d action records for device %s", deleted_count, device_id)
         return deleted_count
+
+    def log_tool_action(
+        self,
+        device_id: str,
+        tool_name: str,
+        arguments_json: str = "",
+        result_summary: str = "",
+    ) -> int:
+        """
+        Logs a hardware or API tool execution trace to the lightweight action_logs table.
+        Does NOT insert into vec_memories to prevent semantic vector pollution.
+        """
+        with self.db._lock:
+            conn = self.db.get_conn()
+            with conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    INSERT INTO action_logs (device_id, tool_name, arguments_json, result_summary)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (device_id, tool_name, str(arguments_json)[:500], str(result_summary)[:500]),
+                )
+                action_id = cur.lastrowid
+        logger.debug("Logged tool action %s for %s (id: %d)", tool_name, device_id, action_id)
+        return action_id
+
+    def list_recent_actions(
+        self,
+        device_id: str,
+        limit: int = 20,
+    ) -> list[dict]:
+        """
+        List recent tool execution traces from action_logs table.
+        """
+        query = """
+            SELECT id, device_id, tool_name, arguments_json, result_summary, created_at
+            FROM action_logs
+            WHERE device_id = ?
+            ORDER BY created_at DESC
+            LIMIT ?
+        """
+        rows = self.db.fetchall(query, (device_id, limit))
+        return [dict(r) for r in rows]
 
     def get_memory(self, chunk_id: int) -> dict | None:
         row = self.db.fetchone(
@@ -242,15 +292,18 @@ class RAGService:
         device_id: str,
         top_k: int = 3,
         threshold: float = 0.28,
+        exclude_types: list[str] | None = None,
+        source_type: str | None = None,
     ) -> dict[str, Any]:
         """
         KNN semantic similarity search via sqlite-vec cosine distance.
         Cosine distance: 0.0 = identical, 1.0 = orthogonal.
         threshold=0.28 means cosine similarity >= 0.72.
+        exclude_types: list of source_types to ignore (e.g. ['action']).
         """
         t0 = time.perf_counter()
         query_vec = self.get_embedding(query)
-        # Fetch candidate set to account for device_id filtering
+        # Fetch candidate set to account for device_id & category filtering
         k_fetch = max(top_k * 5, 50)
         with self.db._lock:
             conn = self.db.get_conn()
@@ -270,6 +323,11 @@ class RAGService:
         results = []
         for r in rows:
             dist = float(r["distance"])
+            stype = r["source_type"]
+            if exclude_types and stype in exclude_types:
+                continue
+            if source_type and stype != source_type:
+                continue
             if dist <= threshold:
                 results.append(
                     {
@@ -293,6 +351,104 @@ class RAGService:
             "count": len(results),
             "results": results,
         }
+
+    def upsert_memory_with_conflict_resolution(
+        self,
+        device_id: str,
+        content: str,
+        source_type: str = "fact",
+        source_ref: str = "auto_organizer",
+        user_id: str = "default_user",
+        threshold: float = 0.18,
+    ) -> dict[str, Any]:
+        """
+        Inserts memory or resolves conflicts by updating existing similar memories.
+        If a similar memory exists (cosine distance <= threshold):
+          - If exact match (case-insensitive), returns existing id (duplicate_skipped).
+          - If changed/refined, updates content and re-embeds (updated).
+        Otherwise creates new memory chunk (created).
+        """
+        content_clean = content.strip()
+        if not content_clean:
+            raise ValueError("Memory content cannot be empty")
+
+        # Search existing memories for device
+        search_res = self.search(
+            query=content_clean,
+            device_id=device_id,
+            top_k=1,
+            threshold=threshold,
+            exclude_types=["action"],
+        )
+        matches = search_res.get("results", [])
+        if matches:
+            top_match = matches[0]
+            top_id = top_match["id"]
+            existing_content = top_match["content"].strip()
+
+            if existing_content.lower() == content_clean.lower():
+                logger.debug("Duplicate memory skipped: id %d", top_id)
+                return {"id": top_id, "action": "duplicate_skipped", "content": content_clean}
+
+            # Update existing memory with new content
+            self.update_memory(chunk_id=top_id, content=content_clean, source_type=source_type)
+            logger.info("Updated existing memory %d (%s -> %s)", top_id, existing_content[:40], content_clean[:40])
+            return {"id": top_id, "action": "updated", "content": content_clean, "prev_content": existing_content}
+
+        # Otherwise create new memory chunk
+        new_id = self.add_memory(
+            device_id=device_id,
+            content=content_clean,
+            source_type=source_type,
+            source_ref=source_ref,
+            user_id=user_id,
+        )
+        return {"id": new_id, "action": "created", "content": content_clean}
+
+    def distill_working_memory(self, device_id: str, max_bytes: int = 3000) -> str:
+        """
+        Distills top user profile facts, preferences, and commitments into a concise
+        Markdown document suitable for physical ESP32 SPIFFS (/spiffs/memory/MEMORY.md).
+        Guaranteed to be <= max_bytes.
+        """
+        memories = self.list_memories(device_id=device_id, limit=60)
+        # Filter out noisy or raw action records
+        valid = [m for m in memories if m["source_type"] not in ("action",)]
+
+        prefs = [m["content"] for m in valid if m["source_type"] == "preference"]
+        facts = [m["content"] for m in valid if m["source_type"] == "fact"]
+        events = [m["content"] for m in valid if m["source_type"] in ("event", "daily_note")]
+        others = [m["content"] for m in valid if m["source_type"] not in ("preference", "fact", "event", "daily_note")]
+
+        lines = ["# Working Memory (Distilled)", ""]
+
+        def _add_section(title: str, items: list[str]):
+            if not items:
+                return
+            lines.append(f"## {title}")
+            for item in items:
+                lines.append(f"- {item}")
+            lines.append("")
+
+        _add_section("User Preferences", prefs)
+        _add_section("Important Facts", facts)
+        _add_section("Events & Tasks", events)
+        _add_section("Other Notes", others)
+
+        out = "\n".join(lines).strip()
+        # Truncate cleanly if exceeds max_bytes
+        if len(out.encode("utf-8")) > max_bytes:
+            truncated = []
+            cur_bytes = 0
+            for l in lines:
+                l_bytes = len(l.encode("utf-8")) + 1
+                if cur_bytes + l_bytes > max_bytes:
+                    break
+                truncated.append(l)
+                cur_bytes += l_bytes
+            out = "\n".join(truncated).strip()
+
+        return out
 
     def archive_daily_note(
         self,

@@ -177,7 +177,15 @@ esp_err_t wifi_onboard_ble_start(void)
 
     wifi_prov_mgr_deinit();
 
-    ESP_LOGI(TAG, "Provisioning complete. Restarting in %dms...", MIMI_BLE_PROV_RESTART_DELAY_MS);
+    /* Cleanly disconnect and stop Wi-Fi so the AP receives an 802.11 Deauth/Disassoc frame
+     * and clears the station from its active client table before ESP reboots. */
+    ESP_LOGI(TAG, "Provisioning complete. Disconnecting Wi-Fi cleanly before restart...");
+    esp_wifi_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(300));
+    esp_wifi_stop();
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    ESP_LOGI(TAG, "Restarting in %dms...", MIMI_BLE_PROV_RESTART_DELAY_MS);
     vTaskDelay(pdMS_TO_TICKS(MIMI_BLE_PROV_RESTART_DELAY_MS));
     esp_restart();
 

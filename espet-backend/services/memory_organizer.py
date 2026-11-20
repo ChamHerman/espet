@@ -53,7 +53,7 @@ class MemoryOrganizer:
         # Pure punctuation
         if not re.search(r"\w", clean):
             return True
-        # Pure trivial hardware/status commands
+        # Pure trivial hardware/status commands or non-informative greetings
         lower = clean.lower()
         trivial_commands = {
             "turn on led",
@@ -68,6 +68,18 @@ class MemoryOrganizer:
             "current time",
             "what time is it",
             "ping",
+            "hi",
+            "hello",
+            "hey",
+            "bye",
+            "goodbye",
+            "good morning",
+            "good night",
+            "ok",
+            "okay",
+            "thanks",
+            "thank you",
+            "test",
         }
         if lower in trivial_commands:
             return True
@@ -105,19 +117,25 @@ class MemoryOrganizer:
         system_prompt = (
             "You are an autonomous memory organizer for an embodied personal AI assistant (ESPET).\n"
             "Analyze the conversation turn between the User and the Assistant.\n"
-            "Extract any durable user profile information or personal facts/preferences/events worth remembering long-term.\n"
+            "Apply the 3-Factor Salience Rubric to extract durable knowledge worth remembering:\n"
+            "1. Durability: Will this fact/preference remain true and useful 30+ days from now? (Reject momentary states like 'I am hungry', 'I had rice today', 'I am tired').\n"
+            "2. Actionability: Does this fact impact how ESPET should act, speak, or assist the user in future turns? (e.g. dietary restrictions, technical setup, preferred name/language, persistent schedules).\n"
+            "3. User Relevance: Is it directly tied to the user's identity, preferences, commitments, or specific environment?\n\n"
+            "Extract:\n"
+            "- User profile updates (Name, Language, Timezone, User notes)\n"
+            "- Long-term memories (Preferences, Enduring facts, Major scheduled events, Important commitments)\n\n"
             "Return ONLY a valid JSON object with the following schema, with no markdown fences, no conversational filler:\n"
             "{\n"
             '  "profile_update": {\n'
             '    "name": "string or null",\n'
             '    "language": "string or null",\n'
             '    "timezone": "string or null",\n'
-            '    "note": "string or null (e.g. background info, current occupation, interests)"\n'
+            '    "note": "string or null"\n'
             "  },\n"
             '  "memories": [\n'
             "    {\n"
             '      "content": "string (clear self-contained natural language fact)",\n'
-            '      "category": "fact" | "preference" | "event" | "note"\n'
+            '      "category": "preference" | "fact" | "event" | "note"\n'
             "    }\n"
             "  ]\n"
             "}\n"
@@ -209,25 +227,28 @@ class MemoryOrganizer:
             if not content:
                 continue
 
-            # Check for existing memory with distance threshold 0.15 (cosine similarity >= 0.85)
+            # Upsert with conflict resolution (distance <= 0.18 updates/replaces rather than duplicating)
             try:
-                res = await asyncio.to_thread(
-                    rag_service.search,
-                    query=content,
+                upsert_res = await asyncio.to_thread(
+                    rag_service.upsert_memory_with_conflict_resolution,
                     device_id=device_id,
-                    top_k=1,
-                    threshold=0.15,
+                    content=content,
+                    source_type=cat,
+                    source_ref="auto_organizer",
+                    threshold=0.18,
                 )
-                if not res.get("results"):
-                    new_id = await asyncio.to_thread(
-                        rag_service.add_memory,
-                        device_id=device_id,
-                        content=content,
-                        source_type=cat,
-                        source_ref="auto_organizer",
-                    )
-                    added_memories.append({"id": new_id, "content": content})
+                action = upsert_res.get("action")
+                if action == "created":
+                    added_memories.append({"id": upsert_res["id"], "action": "created", "content": content})
                     logger.info("MemoryOrganizer added new %s memory for %s: %s", cat, device_id, content[:60])
+                elif action == "updated":
+                    added_memories.append({
+                        "id": upsert_res["id"],
+                        "action": "updated",
+                        "content": content,
+                        "prev": upsert_res.get("prev_content"),
+                    })
+                    logger.info("MemoryOrganizer updated %s memory for %s: %s", cat, device_id, content[:60])
                 else:
                     logger.debug("MemoryOrganizer: skipped duplicate memory: %s", content[:40])
             except Exception as e:
