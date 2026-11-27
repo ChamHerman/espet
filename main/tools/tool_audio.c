@@ -1297,10 +1297,6 @@ esp_err_t tool_audio_play_wav(const uint8_t *wav, size_t len)
     size_t played = 0;
     esp_err_t err = ESP_OK;
     while (played < data_len) {
-        if (voice_client_is_abort_requested()) {
-            ESP_LOGI(TAG, "[SPK] WAV playback interrupted by user");
-            break;
-        }
         size_t frames = AUDIO_TX_CHUNK_FRAMES;
         size_t need;
         if (channels == 2) {
