@@ -215,10 +215,8 @@ outbound dispatch task → agent_loop_start → backend_discovery_start (last)
    - tool exists locally → executed on-chip (`tool_gpio`, `tool_audio`,
      `tool_camera` (`take_photo`), `get_device_status`, `restart_device`, `tool_files`, `tool_cron`, `tool_get_time`, `tool_web_search`)
    - otherwise → `POST /api/mcp/execute` to the backend (`tool_registry.c`)
-4. **Loop & Voice Interruption**: the tool result is fed back as a new LLM message. Max 10 iterations /
+4. **Loop**: the tool result is fed back as a new LLM message. Max 10 iterations /
    4 tool calls per request. Safety: GPIO writes go through `gpio_policy.c`.
-   If a voice barge-in interrupt is detected (`voice_client_is_abort_requested()`), the loop breaks immediately,
-   discards in-flight tool outputs and obsolete TTS, and handles the new incoming command without lag.
 
 ### 3.3 Memory system (`memory/` & `espet-backend/services/`)
 
@@ -614,33 +612,30 @@ hallucinated wake words:
   (450 ms) for the ack echo to decay, then opens the command window.
 Agent replies are routed via `voice_client_speak()` → `POST /api/voice/tts` → MAX98357A speaker.
 
-**Decoupled VAD Listening, Echo Guard & Voice Interruption (Barge-In)**:
-VAD microphone listening is decoupled from the agent's thinking and tool-execution state (`s_busy`):
-- The VAD wake listener remains **active** while the LLM thinks, runs tools, captures camera snapshots,
-  or executes multi-step ReAct iterations. This eliminates wake-word deaf spots during camera captures or tool turns.
-- Listening is **only** suspended when audio is actively being played through the speaker (`tool_audio_is_speaker_busy()`),
-  when a microphone recording is in progress (`tool_audio_is_busy()`), or during the post-playback echo guard (`mic_guard_active()`, 700 ms).
-- **Voice Interruption / Barge-In**: If the user utters the wake word ("Hey ESPET") while the agent loop is running tools or generating LLM responses, the wake detector signals `voice_client_request_abort()`. The in-flight ReAct loop detects the abort, immediately breaks execution, drops pending tools/obsolete TTS output, and seamlessly processes the new incoming voice command.
+**Half-Duplex Turn-Taking, Paused Mic & Echo Guard**:
+Once a command is captured/queued to the LLM agent, the voice client holds `s_busy = true`:
+- The VAD wake listener pauses while `s_busy` is `true` (agent thinking, tool execution, camera snapshots),
+  while speaker audio is playing (`tool_audio_is_speaker_busy()`), when manual/active recording runs (`tool_audio_is_busy()`),
+  or during the post-playback echo guard (`mic_guard_active()`, 700 ms). Because the INMP441 mic and MAX98357A speaker share
+  I2S `BCLK`/`WS` lines on this hardware, strict half-duplex turn-taking prevents false wake-word triggers and mid-command interruptions.
 - After playback, `voice_client_speak()` arms a **700 ms echo guard** (`ECHO_GUARD_MS`): VAD is
   skipped and the ring/DMA are flushed until the amp tail + room reverb decay. Without it the
   VAD re-triggered ~330 ms after TTS end and Whisper hallucinated the wake word from the tail.
-- Guard timers: Thinking watchdog auto-clears stuck thinking flags at 35 s, and a 32 s audio recording safety watchdog disarms hung recording states.
+- Guard timers: Thinking watchdog auto-clears stuck `s_busy` flags at 35 s, and a 32 s audio recording safety watchdog disarms hung recording states.
 
 ```
 [LISTEN ] voice_wake task monitors mic stream via energy VAD (32 ms frames, adaptive threshold,
           floor-tracked: max(420, 1.33×ambient), cap 14000; 3 consecutive frames to trigger)
-          (Remains active during agent thinking & tool execution!)
 [CAPTURE] Speech detected → arm capture with 250 ms pre-roll from ring buffer
-          Captures until 700 ms silence (adaptive cutoff ≈1.25×ambient) or 1.5 s utterance cap
+          Captures until 1200 ms silence (adaptive cutoff ≈1.25×ambient) or 15 s utterance cap
 [VERIFY ] POST /api/voice/transcribe ──▶ backend faster-whisper (neutral prompt)
           ├─ rms < voice_min_rms ──▶ skip STT, no wake
           ├─ Wake not matched ──▶ silent ignore, flush ring, resume listening
           ├─ Wake matched but confidence gate rejects (logp/nsp) ──▶ no wake
-          ├─ If agent already thinking (s_busy): barge-in interrupt triggered! ──▶ voice_client_request_abort()
-          ├─ One-shot command ("Hey Expert what's the weather") ──▶ push to agent bus
+          ├─ One-shot command ("Hey Expert what's the weather") ──▶ push to agent bus (s_busy = true)
           └─ Wake only ("Hey Expert") ──▶ play "Yes?" ack ──▶ ACK_SETTLE_MS (450 ms) ──▶ record follow-up command
               (if no command/only wake word heard, ignore & clear cache, do not queue to agent)
-[ THINK ] Agent ReAct loop executes tools & LLM API (mic remains LISTENING; aborts on barge-in)
+[ THINK ] Agent ReAct loop executes tools & LLM API (mic PAUSED via s_busy)
 [ SPEAK ] voice_client_speak(): POST /api/voice/tts {"text"}
           ──▶ backend edge-tts + ffmpeg ──▶ 16 kHz WAV ──▶ MAX98357A 🔊 (mic PAUSED during speaker output)
           ──▶ playback done ──▶ ECHO_GUARD_MS (700 ms) ──▶ tool_audio_clear_cache() (DMA+ring) ──▶ s_busy = false ──▶ resume LISTEN!
@@ -1401,3 +1396,4 @@ Append-only session log. Newest first. One line per change:
 - 2026-11-20 — Implemented Voice Self-Modification Suite and Dynamic VAD Listening: (1) Dynamic VAD & Flexible Listening: extended utterance capture cap from 2.5s to 15s (`VOICE_MAX_RECORD_MS = 15000`) with unified 1200ms trailing silence cutoff (`CMD_SILENCE_MS = 1200`), allowing full conversational prompts to be captured without truncation in both one-shot and two-step wake modes. (2) Self-Modification Backend Tools: added `update_personality` (presets: default, robotic_pet, butler, scholar, or custom traits/rules), `update_user_profile` (name, language, timezone, preferences), `manage_memory` (unified vector RAG + on-device MEMORY.md working notes), `manage_skills` (CRUD + toggle for modular markdown skills), `manage_schedules` (cron jobs), and `manage_device_settings` (name/timezone) in `custom_tools.py`, directly updating `config_store.py` and pushing real-time WebSocket sync to the device. (3) Instant SPIFFS Synchronization: updated `tool_registry.c` to automatically trigger `config_sync_trigger()` upon execution of any self-modification tool, immediately reflecting changes in `/spiffs/config/` and `/spiffs/skills/` without waiting for the 5-minute sync timer. (4) System Prompt Guidance: updated `context_builder.c` instructing the ReAct agent on its autonomous self-modification authority and tools (files: main/voice/voice_client.c, espet-backend/api/custom_tools.py, main/tools/tool_registry.c, main/agent/context_builder.c, .agent/SYSTEM_OVERVIEW.md).
 - 2026-11-20 — Fixed audio recording latch on command timeout: added missing `tool_audio_capture_disarm()` in `voice_client.c` when wait-for-speech times out (3.5s) so `s_recording` is reset, allowing the timeout beep to play and preventing VAD listening from pausing indefinitely; added abort checks in `voice_run_command()`; updated feeder debug log labels (files: main/voice/voice_client.c, .agent/SYSTEM_OVERVIEW.md).
 - 2026-11-20 — Real-Time Frontend Web UI, Backend & ESP32 Synchronization: (1) Hardware Identity in Remote Tools: updated `tool_remote_execute` in `main/tools/tool_registry.c` to read Wi-Fi STA MAC address (`ESP-%02X%02X...`) and send `X-Device-Id` HTTP header to `/api/mcp/execute`, guaranteeing remote tools target the active hardware device. (2) Backend Device Targeting & Web Broadcast: updated `espet-backend/api/mcp_router.py` to accept `X-Device-Id` and inject `device_id` into tool arguments; updated `espet-backend/services/device_registry.py` with absolute path resolution and online/MAC-derived device prioritization; updated `notify_device_sync` in `espet-backend/api/cloud_router.py` to broadcast `config_updated` frames to active browser WebSocket clients. (3) Byte-for-Byte Personality Alignment: aligned all 5 presets (`default`, `robotic_pet`, `butler`, `scholar`, `minimalist`) and alias dictionary in `espet-backend/api/custom_tools.py` with `Personality.tsx`, ensuring canonical matching activates the matching preset tag. (4) Reactive Web Dashboard: added lightweight `/api/config/version` polling (2.5s interval and on window focus) in `espet-backend/src/store.tsx`; updated `Personality.tsx` with strict `checked={isCurrentActive}` radio logic and reactive draft synchronization; updated `Profile.tsx`, `Memory.tsx`, and `Skills.tsx` with reactive `useEffect` hooks reloading drafts and data on version bumps; compiled SPA distribution via `npm run build:app` (files: main/tools/tool_registry.c, espet-backend/services/device_registry.py, espet-backend/api/mcp_router.py, espet-backend/api/cloud_router.py, espet-backend/api/custom_tools.py, espet-backend/src/api.ts, espet-backend/src/store.tsx, espet-backend/src/views/Personality.tsx, espet-backend/src/views/Profile.tsx, espet-backend/src/views/Memory.tsx, espet-backend/src/views/Skills.tsx, espet-backend/src/views/Device.tsx, espet-backend/static/vendor/app/**, .agent/SYSTEM_OVERVIEW.md).
+- 2026-11-27 — Removed voice interruption / barge-in mechanism and restored strict half-duplex turn-taking: removed `s_abort_requested` and `voice_client_{request_abort,is_abort_requested,clear_abort}` from `voice_client.{h,c}`, removed all abort checks from `voice_run_command()`, `voice_speak_internal()`, `agent_loop.c`, and `tool_audio_play_wav()` in `tool_audio.c`, restored `s_busy` gating in `voice_task()` so wake-word listening pauses cleanly during active turns while preserving hardware fixes (button-glitch disarm, INMP441 L/R restore, 32s/35s watchdogs, timeout disarm) (files: main/voice/voice_client.h, main/voice/voice_client.c, main/agent/agent_loop.c, main/tools/tool_audio.c, .agent/SYSTEM_OVERVIEW.md).
