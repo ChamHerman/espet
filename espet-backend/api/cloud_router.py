@@ -37,10 +37,11 @@ router = APIRouter(prefix="/api/cloud", tags=["cloud"])
 
 registry = DeviceRegistry()
 
-# Asynchronous response tracking for manual recording and voice listen toggle
+# Asynchronous response tracking for manual recording, voice listen toggle, and TTS say
 _pending_record_start: dict[str, asyncio.Future] = {}
 _pending_record_stop: dict[str, asyncio.Future] = {}
 _pending_voice_listen: dict[str, asyncio.Future] = {}
+_pending_tts_say: dict[str, asyncio.Future] = {}
 _voice_listen_state: dict[str, bool] = {}
 
 # ---------------------------------------------------------------------------
@@ -351,6 +352,10 @@ async def ws_device(websocket: WebSocket, key: str = Query("")):
                 fut = _pending_voice_listen.pop(device_id, None)
                 if fut and not fut.done():
                     fut.set_result(frame)
+            elif ftype == "tts_say_status":
+                fut = _pending_tts_say.pop(device_id, None)
+                if fut and not fut.done():
+                    fut.set_result(frame)
             elif ftype == "camera_stream_status":
                 logger.info("Camera stream status from %s: %s", device_id, frame)
             elif ftype == "device_sync_report":
@@ -374,7 +379,7 @@ async def ws_device(websocket: WebSocket, key: str = Query("")):
     except WebSocketDisconnect:
         logger.info("Device %s disconnected", device_id)
     finally:
-        for pmap in (_pending_record_start, _pending_record_stop, _pending_voice_listen):
+        for pmap in (_pending_record_start, _pending_record_stop, _pending_voice_listen, _pending_tts_say):
             fut = pmap.pop(device_id, None)
             if fut and not fut.done():
                 fut.set_exception(RuntimeError("Device disconnected"))
@@ -980,3 +985,56 @@ async def get_voice_listen(device_id: str | None = Query(None)):
     did, ws = registry.get_connection(device_id)
     enabled = _voice_listen_state.get(did, True) if did else True
     return {"ok": True, "device_id": did, "enabled": enabled, "online": ws is not None}
+
+
+@router.post("/tts-say")
+async def trigger_tts_say(
+    payload: dict | None = None,
+    device_id: str | None = Query(None),
+    _key: str = Depends(verify_device_key),
+):
+    """Push a tts_say frame to the connected ESP32 to test speaker + OLED."""
+    data = payload or {}
+    text = str(data.get("text") or "").strip()
+    if not text:
+        return {"ok": False, "error": "text is required"}
+
+    req_did = data.get("device_id") or device_id
+    did, ws = registry.get_connection(req_did)
+    if not did or not ws:
+        return {"ok": False, "error": "No ESP32 device online"}
+
+    prev_fut = _pending_tts_say.pop(did, None)
+    if prev_fut and not prev_fut.done():
+        prev_fut.cancel()
+
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()
+    _pending_tts_say[did] = fut
+
+    frame: dict[str, Any] = {"type": "tts_say", "text": text}
+    title = str(data.get("display_title") or "").strip()
+    body = str(data.get("display_body") or "").strip()
+    if title:
+        frame["display_title"] = title[:16]
+    if body:
+        frame["display_body"] = body[:16]
+
+    t0 = time.perf_counter()
+    try:
+        await ws.send_text(json.dumps(frame))
+        res = await asyncio.wait_for(fut, timeout=5.0)
+        latency_ms = round((time.perf_counter() - t0) * 1000, 1)
+        return {
+            "ok": bool(res.get("ok", False)),
+            "device_id": did,
+            "text": text,
+            "latency_ms": latency_ms,
+            "error": res.get("error"),
+        }
+    except asyncio.TimeoutError:
+        _pending_tts_say.pop(did, None)
+        return {"ok": False, "device_id": did, "error": "Timeout waiting for device tts_say_status"}
+    except Exception as e:
+        _pending_tts_say.pop(did, None)
+        return {"ok": False, "device_id": did, "error": str(e)}
