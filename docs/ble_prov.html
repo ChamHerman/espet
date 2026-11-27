@@ -330,6 +330,18 @@
         if (!backendUrl.startsWith('http://') && !backendUrl.startsWith('https://')) {
           backendUrl = 'http://' + backendUrl;
         }
+        try {
+          const parsed = new URL(backendUrl);
+          const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+          if (host === 'localhost' || host.endsWith('.localhost') ||
+              host.startsWith('127.') || host === '::1' || host === '0.0.0.0') {
+            log('Backend URL cannot be localhost/127.0.0.1 (that points to the ESP32 itself). Enter your PC LAN IP (e.g. http://192.168.0.34:8000) or leave blank for auto-discovery.', 'error');
+            return;
+          }
+        } catch (e) {
+          log(`Invalid Backend URL: ${rawBackendUrl}`, 'error');
+          return;
+        }
       }
 
       document.getElementById('btn-provision').disabled = true;

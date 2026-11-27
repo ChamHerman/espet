@@ -1,7 +1,9 @@
 #include "backend_discovery.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -31,6 +33,43 @@ static void store_base_url(const char *url)
     strlcpy(s_base_url, url, sizeof(s_base_url));
 }
 
+bool backend_discovery_is_loopback_url(const char *url)
+{
+    if (!url || url[0] == '\0') return false;
+    const char *host = url;
+    if (strncasecmp(host, "http://", 7) == 0) {
+        host += 7;
+    } else if (strncasecmp(host, "https://", 8) == 0) {
+        host += 8;
+    }
+
+    char hbuf[64] = {0};
+    size_t i = 0;
+    if (host[0] == '[') {
+        host++;
+        while (host[i] && host[i] != ']' && i < sizeof(hbuf) - 1) {
+            hbuf[i] = (char)tolower((unsigned char)host[i]);
+            i++;
+        }
+    } else {
+        while (host[i] && host[i] != ':' && host[i] != '/' && i < sizeof(hbuf) - 1) {
+            hbuf[i] = (char)tolower((unsigned char)host[i]);
+            i++;
+        }
+    }
+    hbuf[i] = '\0';
+
+    if (strcmp(hbuf, "localhost") == 0 || strcmp(hbuf, "::1") == 0 ||
+        strcmp(hbuf, "0.0.0.0") == 0 || strncmp(hbuf, "127.", 4) == 0) {
+        return true;
+    }
+    size_t hlen = strlen(hbuf);
+    if (hlen > 10 && strcmp(hbuf + hlen - 10, ".localhost") == 0) {
+        return true;
+    }
+    return false;
+}
+
 static bool get_nvs_backend_url(char *out, size_t out_sz)
 {
     if (!out || out_sz == 0) return false;
@@ -52,6 +91,17 @@ void backend_discovery_init(void)
      * Reads NVS once and primes in-memory caches so tasks running with
      * stacks in PSRAM never invoke SPI flash / NVS. */
     if (get_nvs_backend_url(s_nvs_url, sizeof(s_nvs_url))) {
+        if (backend_discovery_is_loopback_url(s_nvs_url)) {
+            ESP_LOGW(TAG, "Ignoring invalid loopback NVS backend URL '%s' (clearing NVS)", s_nvs_url);
+            s_nvs_url[0] = '\0';
+            nvs_handle_t nvs;
+            if (nvs_open(MIMI_NVS_BACKEND, NVS_READWRITE, &nvs) == ESP_OK) {
+                nvs_erase_key(nvs, MIMI_NVS_KEY_BACKEND_URL);
+                nvs_commit(nvs);
+                nvs_close(nvs);
+            }
+            return;
+        }
         store_base_url(s_nvs_url);
         ESP_LOGI(TAG, "Backend discovery primed from NVS: %s", s_nvs_url);
     }
