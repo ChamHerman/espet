@@ -462,7 +462,7 @@ esp_err_t tool_registry_init(void)
 
     mimi_tool_t ga = {
         .name = "gpio_read_all",
-        .description = "Read all allowed GPIO pin states at once (GPIO 1, 2, 21, 38, 39, 40, 41, 42, 47).",
+        .description = "Read all allowed GPIO pin states at once (GPIO 41, 42).",
         .input_schema_json =
             "{\"type\":\"object\","
             "\"properties\":{},"

@@ -3,11 +3,12 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-/* GPIO defaults for ESP32-S3-LCD-1.47B safe user-accessible pins */
-#define MIMI_GPIO_MIN_PIN 1
-#define MIMI_GPIO_MAX_PIN 21
-#define MIMI_GPIO_ALLOWED_CSV                                                  \
-  "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,21,38,39,40,41,42,46,47"
+/* Safe user-accessible GPIO pins (41 = Green Button, 42 = White LED).
+ * Excludes I2S audio (21,38,39,40), OLED I2C (1,2), Camera DVP (4-18),
+ * USB JTAG (19,20), Flash/PSRAM (26-37), and UART0 (43,44). */
+#define MIMI_GPIO_MIN_PIN 41
+#define MIMI_GPIO_MAX_PIN 42
+#define MIMI_GPIO_ALLOWED_CSV "41,42"
 
 /**
  * Check if a pin is allowed for user GPIO operations.

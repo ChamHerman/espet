@@ -278,7 +278,7 @@ idf.py build
 1. **Interactive Serial CLI Smoke Tests**:
    Connect a terminal to the UART COM port at 115200 baud and execute:
    ```text
-   mimi> tool_exec gpio_write '{"pin":40,"state":1}'  # Verify status LED
+   mimi> tool_exec gpio_write '{"pin":42,"state":1}'  # Verify status LED
    mimi> tool_exec audio_play_tone "{}"               # Test speaker (440Hz sine wave)
    mimi> tool_exec audio_record_test "{}"             # Test microphone capture
    mimi> heap_info                                    # Check PSRAM and internal SRAM leaks
@@ -286,12 +286,11 @@ idf.py build
    ```
 
 2. **Physical Button & Telegram Runbook (`docs/telegram_hardware_testing.md`)**:
-   - **White Button (GPIO 38)**: Short press triggers an OV2640 camera capture and uploads the image to Telegram.
-   - **Green Button (GPIO 39)**: Press and hold initiates INMP441 audio recording; release stops recording and submits audio.
+   - **Green Button (GPIO 41)**: Short click captures an OV2640 snapshot; press and hold performs multimodal push-to-talk (snapshot + INMP441 voice query). *(White Button is unassigned/disabled; GPIO 38/39 are shared I2S audio clocks.)*
    - **Telegram Commands**: Send prompts to verify the ReAct loop:
-     - `"Turn on the white LED"` → verifies `gpio_write` on pin 40.
-     - `"Display 'Hello' on OLED"` → verifies `oled_print` on GPIO 21/47.
-     - `"Read all GPIO pins"` → verifies `gpio_read_all`.
+     - `"Turn on the white LED"` → verifies `gpio_write` on pin 42.
+     - `"Display 'Hello' on OLED"` → verifies `oled_print` on GPIO 1 (SDA) / GPIO 2 (SCL).
+     - `"Read all GPIO pins"` → verifies `gpio_read_all` (safe pins `41, 42`).
 
 ### Backend Verification Procedures
 ```bash
