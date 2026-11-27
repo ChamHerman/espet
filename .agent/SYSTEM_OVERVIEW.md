@@ -206,23 +206,51 @@ outbound dispatch task → agent_loop_start → backend_discovery_start (last)
    such as `apihub.agnes-ai.com`, local LM Studio via `HOST_IP:1234`, or Anthropic). Optionally emits a working
    status to the caller's channel.
 3. **Dispatch**: the LLM answers with either `text` (→ outbound queue → speaker/
-   chat) or `tool_use`. Each tool_use goes to the **tool registry**:
+   chat) or `tool_use`. The main model produces a single-pass `[OLED: Line 1 | Line 2]` header
+   at the start of final conversational text responses; `agent_loop.c` parses and extracts this tag immediately
+   upon LLM completion on Core 1, displaying it on the SSD1306 OLED in <5ms with an active readability hold
+   (speech duration + 5s buffer, min 8s total), strips the tag in-place for clean session history storage
+   and outbound delivery, and pushes to `s_outbound_queue`. Outbound dispatcher transmits voice
+   immediately without blocking on Telegram network roundtrips. Each tool_use goes to the **tool registry**:
    - tool exists locally → executed on-chip (`tool_gpio`, `tool_audio`,
      `tool_camera` (`take_photo`), `get_device_status`, `restart_device`, `tool_files`, `tool_cron`, `tool_get_time`, `tool_web_search`)
    - otherwise → `POST /api/mcp/execute` to the backend (`tool_registry.c`)
-4. **Loop**: the tool result is fed back as a new LLM message. Max 10 iterations /
+4. **Loop & Voice Interruption**: the tool result is fed back as a new LLM message. Max 10 iterations /
    4 tool calls per request. Safety: GPIO writes go through `gpio_policy.c`.
+   If a voice barge-in interrupt is detected (`voice_client_is_abort_requested()`), the loop breaks immediately,
+   discards in-flight tool outputs and obsolete TTS, and handles the new incoming command without lag.
 
-### 3.3 Memory system (`memory/`)
+### 3.3 Memory system (`memory/` & `espet-backend/services/`)
 
-| File (SPIFFS) | Written by | Read by | Purpose |
+ESPET employs a hierarchical 3-tier memory lifecycle balancing device flash limits against long-term semantic persistence:
+
+1. **Tier 1: On-Device Hot Working Scratchpad (`/spiffs/memory/MEMORY.md`)**:
+   - Strictly bounded (< 3 KB) Markdown file stored on SPIFFS flash.
+   - Read directly into the Core 1 agent loop system prompt on every turn (fast, offline-capable, zero network latency).
+   - Contains high-priority user profile bullets, enduring preferences, and active goals.
+   - Refreshed from the backend via automated distillation (`distill_working_memory`).
+   - Session history is ring-buffered per chat in `/spiffs/sessions/tg_<chat_id>.jsonl` (last 20 messages).
+
+2. **Tier 2: Lightweight Execution Action Audit Log (`action_logs` table)**:
+   - Dedicated SQLite table storing raw tool invocations (`gpio_write`, `read_file`, `take_photo`, etc.) with 7-day rolling TTL (`purge_expired_actions`).
+   - **Completely decoupled from vector RAG**: raw tool execution traces never enter `vec_memories`, preventing vector database bloat and semantic pollution.
+   - Only significant external real-world state mutations (e.g. emails sent, calendar events created) are promoted to semantic event memory.
+
+3. **Tier 3: Deep Semantic Vector Memory (SQLite-Vec `vec_memories`)**:
+   - Uses `fastembed` (BAAI/bge-small-en-v1.5, 384 dimensions) with sqlite-vec cosine distance.
+   - **3-Factor Salience Rubric**: Autonomous background extraction (`MemoryOrganizer`) evaluates turns against Durability (>30 days), Actionability, and User Relevance before saving.
+   - **Conflict Resolution & Upsert**: Automatically detects conflicting or updated preferences (cosine distance <= 0.18) and updates existing chunks in-place rather than accumulating duplicate contradictions.
+   - **Context-Aware Retrieval & Attention Priming**: Resolves pronouns/entities from recent turns before vector searching and formats retrieved memories into a prominent `## Established User Context (Priority: Follow Strictly)` banner directly above the active turn.
+   - **Agent Memory Tools**: Exposed via MCP / custom tools: `memory_save`, `memory_search`, `memory_update`, and `memory_forget`.
+
+| File / Store | Written by | Read by | Purpose |
 |---|---|---|---|
 | `/spiffs/config/SOUL.md` | web dashboard (config sync) | context builder | Personality, values, hard behavior rules |
-| `/spiffs/config/USER.md` | web dashboard (config sync) | context builder | Who the user is, language, timezone, context |
-| `/spiffs/memory/MEMORY.md` | web dashboard **and** the agent (consolidation) | context builder | Long-term facts |
-| `/spiffs/memory/YYYY-MM-DD.md` | the agent | context builder (last N days) | Daily episodic notes |
-| `/spiffs/sessions/*` | session_mgr | agent loop | Rolling conversation history |
-| `/spiffs/skills/*.md` | web dashboard (config sync) **and** the agent (`write_file`) | context builder | Reusable skill playbooks |
+| `/spiffs/config/USER.md` | web dashboard / MemoryOrganizer | context builder | Who the user is, language, timezone, context |
+| `/spiffs/memory/MEMORY.md` | backend distillation / serial CLI | context builder | Bounded working memory scratchpad (< 3 KB) |
+| `/spiffs/sessions/*` | session_mgr | agent loop | Rolling conversation history (20 msgs) |
+| `action_logs` (backend DB) | cloud_router tool interceptor | audit / diagnostics | Ephemeral execution traces (7-day TTL) |
+| `vec_memories` (backend DB) | MemoryOrganizer / agent tools | RAG injection / agent tools | Deep semantic vector memory with embeddings |
 
 ### 3.4 Proactive daemons
 
@@ -302,7 +330,7 @@ outbound dispatch task → agent_loop_start → backend_discovery_start (last)
 
 ### 3.6 Connectivity & onboarding
 
-`wifi/wifi_manager.c` (credential store, non-blocking `esp_timer` exponential backoff, WPA2/WPA3 PMF compatibility) and `onboard/wifi_onboard_ble.c`
+`wifi/wifi_manager.c` (credential store, non-blocking `esp_timer` exponential backoff, universal WPA/WPA2/WPA3 compatibility with disabled PMF to prevent router re-auth expiration, clean deauth on reboot) and `onboard/wifi_onboard_ble.c`
 (BLE Wi-Fi provisioning via Apache NimBLE and Protocomm with Security 0 plain text;
 allows personal hotspot onboarding without app via Web Bluetooth, releases BT RAM
 on completion; mandatory onboarding mechanism for the device — entered on boot
@@ -586,37 +614,41 @@ hallucinated wake words:
   (450 ms) for the ack echo to decay, then opens the command window.
 Agent replies are routed via `voice_client_speak()` → `POST /api/voice/tts` → MAX98357A speaker.
 
-**Half-Duplex Turn-Taking, Paused Mic & Echo Guard**:
-Once a command is queued to the LLM agent, the voice client enters `s_busy = true`:
-- The microphone listening and VAD tasks are completely paused while the LLM thinks,
-  runs tools, and speaks its reply. This prevents self-triggering from the speaker,
-  eliminates Wi-Fi socket contention during tool use, and avoids wasting CPU/STT on ambient noise.
+**Decoupled VAD Listening, Echo Guard & Voice Interruption (Barge-In)**:
+VAD microphone listening is decoupled from the agent's thinking and tool-execution state (`s_busy`):
+- The VAD wake listener remains **active** while the LLM thinks, runs tools, captures camera snapshots,
+  or executes multi-step ReAct iterations. This eliminates wake-word deaf spots during camera captures or tool turns.
+- Listening is **only** suspended when audio is actively being played through the speaker (`tool_audio_is_speaker_busy()`),
+  when a microphone recording is in progress (`tool_audio_is_busy()`), or during the post-playback echo guard (`mic_guard_active()`, 700 ms).
+- **Voice Interruption / Barge-In**: If the user utters the wake word ("Hey ESPET") while the agent loop is running tools or generating LLM responses, the wake detector signals `voice_client_request_abort()`. The in-flight ReAct loop detects the abort, immediately breaks execution, drops pending tools/obsolete TTS output, and seamlessly processes the new incoming voice command.
 - After playback, `voice_client_speak()` arms a **700 ms echo guard** (`ECHO_GUARD_MS`): VAD is
   skipped and the ring/DMA are flushed until the amp tail + room reverb decay. Without it the
-  VAD re-triggered ~330 ms after TTS end and Whisper hallucinated the wake word from the tail
-  (endless self-wake loop — field log 2026-10-09).
+  VAD re-triggered ~330 ms after TTS end and Whisper hallucinated the wake word from the tail.
+- Guard timers: Thinking watchdog auto-clears stuck thinking flags at 35 s, and a 32 s audio recording safety watchdog disarms hung recording states.
 
 ```
 [LISTEN ] voice_wake task monitors mic stream via energy VAD (32 ms frames, adaptive threshold,
           floor-tracked: max(420, 1.33×ambient), cap 14000; 3 consecutive frames to trigger)
+          (Remains active during agent thinking & tool execution!)
 [CAPTURE] Speech detected → arm capture with 250 ms pre-roll from ring buffer
           Captures until 700 ms silence (adaptive cutoff ≈1.25×ambient) or 1.5 s utterance cap
 [VERIFY ] POST /api/voice/transcribe ──▶ backend faster-whisper (neutral prompt)
           ├─ rms < voice_min_rms ──▶ skip STT, no wake
           ├─ Wake not matched ──▶ silent ignore, flush ring, resume listening
           ├─ Wake matched but confidence gate rejects (logp/nsp) ──▶ no wake
+          ├─ If agent already thinking (s_busy): barge-in interrupt triggered! ──▶ voice_client_request_abort()
           ├─ One-shot command ("Hey Expert what's the weather") ──▶ push to agent bus
-          │                                                       (mic enters s_busy pause)
           └─ Wake only ("Hey Expert") ──▶ play "Yes?" ack ──▶ ACK_SETTLE_MS (450 ms) ──▶ record follow-up command
               (if no command/only wake word heard, ignore & clear cache, do not queue to agent)
-[ THINK ] Agent ReAct loop executes tools & LLM API (mic is PAUSED)
+[ THINK ] Agent ReAct loop executes tools & LLM API (mic remains LISTENING; aborts on barge-in)
 [ SPEAK ] voice_client_speak(): POST /api/voice/tts {"text"}
-          ──▶ backend edge-tts + ffmpeg ──▶ 16 kHz WAV ──▶ MAX98357A 🔊
+          ──▶ backend edge-tts + ffmpeg ──▶ 16 kHz WAV ──▶ MAX98357A 🔊 (mic PAUSED during speaker output)
           ──▶ playback done ──▶ ECHO_GUARD_MS (700 ms) ──▶ tool_audio_clear_cache() (DMA+ring) ──▶ s_busy = false ──▶ resume LISTEN!
 ```
 
-Echo control: the listener pauses while anything plays/records (`tool_audio_is_busy`, `s_busy`)
-or the post-playback echo guard is active, so the device never wakes on its own voice.
+Echo control: the listener pauses while the speaker is active (`tool_audio_is_speaker_busy()`),
+during manual/active recording (`tool_audio_is_busy()`), or while the post-playback echo guard is active,
+so the device never wakes on its own voice.
 Configurable in `espet-backend/config.py` / `.env`: `voice_wake_words` (default: `"expert,hey expert,hi expert,espet,hey espet,mimi,hey mimi,hi mimi,ok mimi,hi esp,米米,咪咪,小米"`),
 `voice_stt_model` (default `base`), `voice_stt_device` (default `auto` — CUDA with CPU fallback),
 `voice_stt_beam_size` (default `1` — greedy fast decoding), `voice_stt_compute_type` (default `auto`),
@@ -735,6 +767,8 @@ Herman's full gap analysis and prioritized roadmap of needed tools/functions:
 
 Append-only session log. Newest first. One line per change:
 `- YYYY-MM-DD — summary (files: ...)`.
+
+- 2026-11-20 — Fixed Wi-Fi reboot AUTH_EXPIRE (2) / AUTH_FAIL (202) and premature BLE onboarding fallback: (1) Added clean Wi-Fi teardown and deauth in `wifi_onboard_ble.c`: explicitly calls `esp_wifi_disconnect()` and `esp_wifi_stop()` with settling delays before `esp_restart()` so AP router receives 802.11 Deauth frame and clears client association table before reboot. (2) Configured universal Wi-Fi STA compatibility in `wifi_manager.c`: disabled PMF (`pmf_cfg.capable = false`) to eliminate 802.11w SA query re-auth failures on home routers; relaxed authmode threshold to `WIFI_AUTH_WPA_PSK`; enabled `WIFI_ALL_CHANNEL_SCAN` and `WIFI_CONNECT_AP_BY_SIGNAL`; added masked credential debug logging; added explicit disconnect before reconnect in `on_reconnect_timer()`. (3) Backoff & Boot Timeout Alignment: capped `MIMI_WIFI_RETRY_MAX_MS` to 8000ms in `mimi_config.h` (23s total backoff) and increased `wifi_manager_wait_connected` timeout in `mimi.c` from 30s to 60s, ensuring all 5 retries execute without getting prematurely aborted by BLE onboarding fallback (files: main/onboard/wifi_onboard_ble.c, main/wifi/wifi_manager.c, main/mimi_config.h, main/mimi.c, .agent/SYSTEM_OVERVIEW.md).
 
 - 2026-11-14 — Removed "Speaking..." placeholder on OLED: updated `voice_client.c` and `mimi.c` to remove the static "Speaking..." display text, now directly rendering the spoken response text on the SSD1306 OLED across lines 1 and 2 during audio playback (files: main/voice/voice_client.c, main/mimi.c, .agent/SYSTEM_OVERVIEW.md).
 
@@ -1361,3 +1395,9 @@ Append-only session log. Newest first. One line per change:
 - 2026-11-19 — Added TLS certificate bundle verification across all backend REST HTTP clients: attached `esp_crt_bundle_attach` across `tool_registry.c` (`/api/tools`, `/api/mcp/execute`), `config_sync.c` (`/api/config`), and `voice_client.c` (`/api/voice/tts`, `/api/voice/transcribe`, `/api/camera/vision-query`), resolving `ESP_ERR_MBEDTLS_SSL_SETUP_FAILED` [0x8017] when connecting to HTTPS backend cloud endpoints (files: main/tools/tool_registry.c, main/sync/config_sync.c, main/voice/voice_client.c, .agent/SYSTEM_OVERVIEW.md).
 - 2026-11-19 — Resolved `esp_task_stack_is_sane_cache_disabled` panic when resolving backend URL from tasks with PSRAM stack: moved NVS backend URL resolution to boot-time `backend_discovery_init()` running on DRAM main task and made `backend_discovery_base_url()` 100% in-memory; tasks with PSRAM stacks (like `camera_stream_task` and `agent_loop_task`) never invoke SPI flash / NVS, eliminating flash cache disable assertion crashes (files: main/sync/backend_discovery.h, main/sync/backend_discovery.c, main/mimi.c, main/onboard/wifi_onboard_ble.c, .agent/SYSTEM_OVERVIEW.md).
 - 2026-11-19 — Fixed live camera streaming write timeout and WebSocket stability over WAN/TLS: increased frame send timeout in tool_camera.c from 200ms to 1500ms (pdMS_TO_TICKS(1500)) preventing esp_transport_poll_write(0) and connection aborts when streaming 30-50KB JPEG frames over cellular hotspot / WAN; boosted camera WebSocket task_stack to 8192 bytes and buffer_size to 16384 bytes for mbedTLS TLS handling; added sent <= 0 failure handling with 100ms yield and 1500ms reconnect backoff (files: main/tools/tool_camera.c, .agent/SYSTEM_OVERVIEW.md).
+- 2026-11-20 — Implemented ultra-low latency single-pass OLED summary architecture and audio-first dispatch: (1) Added prompt instructions in `context_builder.c` and `spiffs_data/config/SOUL.md` for the main agent model to output `[OLED: Line 1 | Line 2]` directly in its response, dropping distillation latency to 0ms and eliminating secondary LLM API roundtrips. (2) Implemented `extract_and_strip_oled_tag` on Core 1 in `agent_loop.c` to immediately display the 2-line summary on the 128x64 OLED upon LLM completion (<5ms visual feedback) and clean the tag in-place before saving to session history and outbound dispatch. (3) Added timed text hold and extend APIs in `display_status.{c,h}` keeping summary text visible throughout audio playback plus a 5-second buffer (min 8s total) before smoothly returning to the animated living eyes face. (4) Reordered outbound dispatch in `mimi.c` for voice system messages to speak audio immediately without waiting for Telegram network latency. (5) Removed blocking secondary LLM summarizer from espet-backend `/api/voice/tts` in `voice_router.py`, speeding up TTS synthesis by 1.5–3.0s (files: main/agent/context_builder.c, spiffs_data/config/SOUL.md, main/agent/agent_loop.c, main/display/display_status.h, main/display/display_status.c, main/voice/voice_client.c, main/mimi.c, espet-backend/api/voice_router.py, .agent/SYSTEM_OVERVIEW.md).
+- 2026-11-20 — Decoupled action logs, added 3-factor salience rubric, conflict-resolving upsert, working memory distillation, and context-aware RAG priming: (1) Decoupled tool action traces from vector RAG: created lightweight `action_logs` table (7-day rolling TTL) in `memory_db.py` for raw execution traces, purged noisy actions from `vec_memories` via `rag_service.delete_noisy_actions`, and restricted semantic event promotion strictly to high-salience mutations (emails sent, calendar events created) in `cloud_router.py`. (2) 3-Factor Salience Rubric & Conflict Resolution: upgraded `MemoryOrganizer` prompt with durability (>30 days), actionability, and user relevance criteria, and implemented `upsert_memory_with_conflict_resolution` in `rag_service.py` to update modified facts in-place and skip duplicates. (3) Context-Aware RAG Retrieval & Attention Priming: added pronoun/entity resolution from prior turns before vector queries in `cloud_router.py`, formatted retrieved facts into a prominent `## Established User Context (Priority: Follow Strictly)` banner, and maintained sub-15ms roundtrip latency. (4) Bounded Memory Distillation & Agent Tools: added `distill_working_memory` ensuring on-device SPIFFS `MEMORY.md` stays strictly <= 3 KB, exposed `GET /api/memory/actions` and `POST /api/memory/distill` endpoints in `memory_router.py`, and added `memory_update` and `memory_forget` MCP tools to `custom_tools.py` with full unit test coverage (files: espet-backend/services/memory_db.py, espet-backend/services/rag_service.py, espet-backend/services/memory_organizer.py, espet-backend/api/cloud_router.py, espet-backend/api/memory_router.py, espet-backend/api/custom_tools.py, espet-backend/tests/test_memory_system.py, espet-backend/tests/test_rag_service.py, .agent/SYSTEM_OVERVIEW.md).
+- 2026-11-20 — Fixed mic + camera concurrency lockout and implemented voice interruption / barge-in: decoupled VAD wake listener from agent thinking state (`s_busy`) in `voice_client.c` so listening remains active during tool execution and camera snapshots; added voice interruption APIs to abort in-flight LLM/tool turns and skip obsolete TTS; fixed manual recording state leak in `mimi.c` on glitch pulses in `on_camera_button_up(0)`; resolved INMP441 L/R auto-switch latch in `tool_audio.c`; added 35s thinking watchdog and 32s recording watchdog (files: main/agent/agent_loop.c, main/mimi.c, main/tools/tool_audio.c, main/voice/voice_client.c, main/voice/voice_client.h, docs/plans/p2011_fix_mic_camera_tradeoff_plan.md, .agent/SYSTEM_OVERVIEW.md).
+- 2026-11-20 — Implemented Voice Self-Modification Suite and Dynamic VAD Listening: (1) Dynamic VAD & Flexible Listening: extended utterance capture cap from 2.5s to 15s (`VOICE_MAX_RECORD_MS = 15000`) with unified 1200ms trailing silence cutoff (`CMD_SILENCE_MS = 1200`), allowing full conversational prompts to be captured without truncation in both one-shot and two-step wake modes. (2) Self-Modification Backend Tools: added `update_personality` (presets: default, robotic_pet, butler, scholar, or custom traits/rules), `update_user_profile` (name, language, timezone, preferences), `manage_memory` (unified vector RAG + on-device MEMORY.md working notes), `manage_skills` (CRUD + toggle for modular markdown skills), `manage_schedules` (cron jobs), and `manage_device_settings` (name/timezone) in `custom_tools.py`, directly updating `config_store.py` and pushing real-time WebSocket sync to the device. (3) Instant SPIFFS Synchronization: updated `tool_registry.c` to automatically trigger `config_sync_trigger()` upon execution of any self-modification tool, immediately reflecting changes in `/spiffs/config/` and `/spiffs/skills/` without waiting for the 5-minute sync timer. (4) System Prompt Guidance: updated `context_builder.c` instructing the ReAct agent on its autonomous self-modification authority and tools (files: main/voice/voice_client.c, espet-backend/api/custom_tools.py, main/tools/tool_registry.c, main/agent/context_builder.c, .agent/SYSTEM_OVERVIEW.md).
+- 2026-11-20 — Fixed audio recording latch on command timeout: added missing `tool_audio_capture_disarm()` in `voice_client.c` when wait-for-speech times out (3.5s) so `s_recording` is reset, allowing the timeout beep to play and preventing VAD listening from pausing indefinitely; added abort checks in `voice_run_command()`; updated feeder debug log labels (files: main/voice/voice_client.c, .agent/SYSTEM_OVERVIEW.md).
+- 2026-11-20 — Real-Time Frontend Web UI, Backend & ESP32 Synchronization: (1) Hardware Identity in Remote Tools: updated `tool_remote_execute` in `main/tools/tool_registry.c` to read Wi-Fi STA MAC address (`ESP-%02X%02X...`) and send `X-Device-Id` HTTP header to `/api/mcp/execute`, guaranteeing remote tools target the active hardware device. (2) Backend Device Targeting & Web Broadcast: updated `espet-backend/api/mcp_router.py` to accept `X-Device-Id` and inject `device_id` into tool arguments; updated `espet-backend/services/device_registry.py` with absolute path resolution and online/MAC-derived device prioritization; updated `notify_device_sync` in `espet-backend/api/cloud_router.py` to broadcast `config_updated` frames to active browser WebSocket clients. (3) Byte-for-Byte Personality Alignment: aligned all 5 presets (`default`, `robotic_pet`, `butler`, `scholar`, `minimalist`) and alias dictionary in `espet-backend/api/custom_tools.py` with `Personality.tsx`, ensuring canonical matching activates the matching preset tag. (4) Reactive Web Dashboard: added lightweight `/api/config/version` polling (2.5s interval and on window focus) in `espet-backend/src/store.tsx`; updated `Personality.tsx` with strict `checked={isCurrentActive}` radio logic and reactive draft synchronization; updated `Profile.tsx`, `Memory.tsx`, and `Skills.tsx` with reactive `useEffect` hooks reloading drafts and data on version bumps; compiled SPA distribution via `npm run build:app` (files: main/tools/tool_registry.c, espet-backend/services/device_registry.py, espet-backend/api/mcp_router.py, espet-backend/api/cloud_router.py, espet-backend/api/custom_tools.py, espet-backend/src/api.ts, espet-backend/src/store.tsx, espet-backend/src/views/Personality.tsx, espet-backend/src/views/Profile.tsx, espet-backend/src/views/Memory.tsx, espet-backend/src/views/Skills.tsx, espet-backend/src/views/Device.tsx, espet-backend/static/vendor/app/**, .agent/SYSTEM_OVERVIEW.md).

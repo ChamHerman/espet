@@ -68,6 +68,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [devices, setDevices] = useState<DeviceInfo[]>([]);
   const selectedDevRef = useRef(selectedDeviceId);
   selectedDevRef.current = selectedDeviceId;
+  const configRef = useRef<ConfigBundle | null>(null);
+  configRef.current = config;
 
   const setSelectedDeviceId = useCallback((id: string) => {
     setSelectedDeviceIdState(id);
@@ -96,6 +98,32 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setConfig(c);
     return c;
   }, []);
+
+  const checkVersion = useCallback(async () => {
+    const devId = selectedDevRef.current;
+    if (!devId) return;
+    try {
+      const ver = await client.configVersion(devId);
+      const curr = configRef.current;
+      if (!curr) {
+        await loadConfig(devId);
+        return;
+      }
+      let hasNewer = false;
+      const curVersions = curr.versions || {};
+      for (const [k, v] of Object.entries(ver.versions || {})) {
+        if (typeof v === "number" && v > (curVersions[k as keyof typeof curVersions] ?? 0)) {
+          hasNewer = true;
+          break;
+        }
+      }
+      if (hasNewer) {
+        await loadConfig(devId);
+      }
+    } catch {
+      /* ignore transient poll error */
+    }
+  }, [loadConfig]);
 
   const refreshHealth = useCallback(async () => {
     try {
@@ -132,8 +160,19 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     refreshHealth();
     refreshAuth();
     const t = setInterval(refreshHealth, 30000);
-    return () => clearInterval(t);
-  }, [loadConfig, refreshHealth, refreshAuth]);
+    const v = setInterval(checkVersion, 2500);
+    const d = setInterval(refreshDevices, 15000);
+    const onFocus = () => {
+      checkVersion();
+    };
+    window.addEventListener("focus", onFocus);
+    return () => {
+      clearInterval(t);
+      clearInterval(v);
+      clearInterval(d);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [loadConfig, refreshHealth, refreshAuth, checkVersion, refreshDevices]);
   const patchConfig = useCallback((fn: (c: ConfigBundle) => void) => {
     setConfig((prev) => {
       if (!prev) return prev;

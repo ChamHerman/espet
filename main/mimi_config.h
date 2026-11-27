@@ -62,7 +62,7 @@
 /* WiFi */
 #define MIMI_WIFI_MAX_RETRY 5
 #define MIMI_WIFI_RETRY_BASE_MS 1000
-#define MIMI_WIFI_RETRY_MAX_MS 15000
+#define MIMI_WIFI_RETRY_MAX_MS 8000
 
 /* Telegram Bot */
 #define MIMI_TG_POLL_TIMEOUT_S 5

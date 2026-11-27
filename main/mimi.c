@@ -159,7 +159,12 @@ static void on_camera_button_down(void)
 static void on_camera_button_up(uint32_t hold_duration_ms)
 {
     if (hold_duration_ms == 0) {
-        /* Cancelled or noise */
+        /* Cancelled or noise — always stop audio recording so s_recording is not leaked! */
+        size_t dummy_samples = 0;
+        uint32_t dummy_dur = 0;
+        double dummy_rms = 0.0;
+        tool_audio_manual_record_stop(&dummy_samples, &dummy_dur, &dummy_rms);
+
         if (s_snap_fb) {
             ESP_LOGW(TAG, "📸 [CAM BTN] Noise/cancelled press — returning camera buffer");
             tool_camera_return_picture(s_snap_fb);
@@ -171,6 +176,11 @@ static void on_camera_button_up(uint32_t hold_duration_ms)
 
     if (!s_snap_fb) {
         ESP_LOGW(TAG, "Button released but no photo was captured");
+        size_t dummy_samples = 0;
+        uint32_t dummy_dur = 0;
+        double dummy_rms = 0.0;
+        tool_audio_manual_record_stop(&dummy_samples, &dummy_dur, &dummy_rms);
+        display_status_idle();
         return;
     }
 
@@ -369,6 +379,10 @@ static void outbound_dispatch_task(void *arg)
             /* Voice pipeline output: bridge to Telegram chat so user sees output
              * while speaker is unavailable/untested, and speak through MAX98357A speaker. */
             if (strcmp(msg.chat_id, "voice") == 0) {
+                /* Audio-First: speak through MAX98357A speaker immediately without waiting for Telegram HTTP roundtrip */
+                if (msg.content) {
+                    voice_client_speak(msg.content);
+                }
                 size_t prefix_len = strlen("🤖 ESPET: ");
                 size_t content_len = msg.content ? strlen(msg.content) : 0;
                 char *tlg_msg = (char *)malloc(prefix_len + content_len + 1);
@@ -378,9 +392,6 @@ static void outbound_dispatch_task(void *arg)
                     free(tlg_msg);
                 } else if (msg.content) {
                     telegram_send_to_last_chat(msg.content);
-                }
-                if (msg.content) {
-                    voice_client_speak(msg.content);
                 }
             }
         } else {
@@ -459,7 +470,7 @@ void app_main(void)
     bool wifi_ok = false;
     if (wifi_err == ESP_OK) {
         ESP_LOGI(TAG, "Waiting for WiFi connection...");
-        if (wifi_manager_wait_connected(30000) == ESP_OK) {
+        if (wifi_manager_wait_connected(60000) == ESP_OK) {
             wifi_ok = true;
             ESP_LOGI(TAG, "WiFi connected: %s", wifi_manager_get_ip());
             /* Fetch remote MCP tools from backend server */

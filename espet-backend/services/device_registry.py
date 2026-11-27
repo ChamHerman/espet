@@ -14,21 +14,24 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
 logger = logging.getLogger("espet-backend.registry")
 
+_DEFAULT_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+
 
 class DeviceRegistry:
     def __init__(
         self,
-        persist_path: str | Path = "data/cloud_bindings.json",
-        devices_path: str | Path = "data/devices.json",
+        persist_path: str | Path | None = None,
+        devices_path: str | Path | None = None,
     ):
-        self.persist_path = Path(persist_path)
-        self.devices_path = Path(devices_path)
+        self.persist_path = Path(persist_path) if persist_path else _DEFAULT_DATA_DIR / "cloud_bindings.json"
+        self.devices_path = Path(devices_path) if devices_path else _DEFAULT_DATA_DIR / "devices.json"
         self._lock = threading.Lock()
         # device_id -> live websocket (or None when offline)
         self.connections: dict[str, object] = {}
@@ -138,6 +141,18 @@ class DeviceRegistry:
 
     def get_latest_device_id(self) -> str:
         devs = self.list_devices()
+        # Prioritize online/connected devices first
+        online_devs = [d for d in devs if d.get("online")]
+        if online_devs:
+            return online_devs[0]["device_id"]
+        # Prioritize real physical hardware devices (MAC-derived format ESP-XXXXXXXXXXXX)
+        mac_devs = [d for d in devs if re.match(r"^ESP-[0-9A-Fa-f]{12}$", d.get("device_id", ""))]
+        if mac_devs:
+            return mac_devs[0]["device_id"]
+        # Prioritize non-test devices
+        real_devs = [d for d in devs if not re.match(r"^ESP-(?:TC|TEST|TIME|SYNC)\d+", d.get("device_id", ""))]
+        if real_devs:
+            return real_devs[0]["device_id"]
         return devs[0]["device_id"] if devs else "espet_s3_01"
 
 

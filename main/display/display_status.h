@@ -18,6 +18,15 @@ void display_status_init(void);
 /* Set status text or trigger corresponding face expression. Thread-safe. */
 void display_status_set(const char *line1, const char *line2);
 
+/* Display text and hold for at least min_hold_ms before idle face is allowed. */
+void display_status_set_text_timed(const char *line1, const char *line2, uint32_t min_hold_ms);
+
+/* Extend current text hold duration (e.g. after speech ends). */
+void display_status_extend_hold(uint32_t extra_ms);
+
+/* Check if text hold is currently active. */
+bool display_status_is_held(void);
+
 /* Standard idle screen (resumes full-screen living eyes). */
 void display_status_idle(void);
 

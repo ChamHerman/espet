@@ -81,8 +81,9 @@ static const char *TAG = "voice";
 
 #define ACK_CACHE_BYTES        (96 * 1024)  /* "Yes?" WAV cache in PSRAM */
 
-#define UTTERANCE_MAX_MS       2500         /* cap on wake word utterance (2.5s) */
-#define CMD_MAX_MS             8000         /* hard cap on command capture (8.0s) */
+#define VOICE_MAX_RECORD_MS    15000        /* hard cap on dynamic voice capture (15.0s) */
+#define UTTERANCE_MAX_MS       VOICE_MAX_RECORD_MS /* flexible wake capture (ends on silence or 15s) */
+#define CMD_MAX_MS             VOICE_MAX_RECORD_MS /* flexible command capture (ends on silence or 15s) */
 #define CMD_MAX_SAMPLES        (TOOL_AUDIO_SAMPLE_RATE * CMD_MAX_MS / 1000)
 #define CMD_LEAD_MS            3500         /* initial silence / wait-for-speech timeout (3.5s) */
 #define CMD_SILENCE_MS         1200         /* endpointing trailing silence cutoff (1.2s) */
@@ -108,9 +109,26 @@ static volatile bool        s_running        = false;
 static volatile bool        s_listen_enabled = true;  /* autonomous VAD listener toggle (always on by default) */
 static volatile bool        s_busy           = false;  /* pipeline in flight */
 static int64_t              s_busy_start_ms  = 0;      /* watchdog timer for agent thinking */
+static volatile bool        s_abort_requested = false; /* interruption flag */
 static volatile int64_t     s_mic_guard_until_ms = 0;  /* post-playback echo guard deadline */
 static uint8_t             *s_ack_wav        = NULL;   /* "Yes?" cache */
 static size_t               s_ack_wav_len    = 0;
+
+void voice_client_request_abort(void)
+{
+    s_abort_requested = true;
+    ESP_LOGW(TAG, "Voice interruption requested — aborting current agent turn");
+}
+
+bool voice_client_is_abort_requested(void)
+{
+    return s_abort_requested;
+}
+
+void voice_client_clear_abort(void)
+{
+    s_abort_requested = false;
+}
 
 /* -----------------------------------------------------------------------
  * Signal Processing Helpers
@@ -648,6 +666,10 @@ static uint8_t *voice_tts_fetch(const char *text, size_t *out_len,
 
 static void voice_speak_internal(const char *text, const char *display_l1, const char *display_l2)
 {
+    if (voice_client_is_abort_requested()) {
+        ESP_LOGI(TAG, "voice_speak_internal: skipping playback (turn aborted by user)");
+        return;
+    }
     tool_audio_speaker_session_begin();
     size_t wav_len = 0;
     char fetched_l1[17] = {0};
@@ -658,15 +680,23 @@ static void voice_speak_internal(const char *text, const char *display_l1, const
         tool_audio_beep(BEEP_ERR_HZ, BEEP_MS * 2, BEEP_VOL);
         return;
     }
+    if (voice_client_is_abort_requested()) {
+        ESP_LOGI(TAG, "voice_speak_internal: dropping fetched WAV (turn aborted by user)");
+        free(wav);
+        tool_audio_speaker_session_end();
+        return;
+    }
     if ((display_l1 && display_l1[0]) || (display_l2 && display_l2[0])) {
-        display_status_set(display_l1 ? display_l1 : "", display_l2 ? display_l2 : "");
-    } else if (fetched_l1[0] || fetched_l2[0]) {
-        display_status_set(fetched_l1, fetched_l2);
-    } else if (text && text[0]) {
-        char l1[17] = {0};
-        char l2[17] = {0};
-        word_wrap_oled(text, l1, sizeof(l1), l2, sizeof(l2));
-        display_status_set(l1, l2);
+        display_status_set_text_timed(display_l1 ? display_l1 : "", display_l2 ? display_l2 : "", 8000);
+    } else if (!display_status_is_held()) {
+        if (fetched_l1[0] || fetched_l2[0]) {
+            display_status_set_text_timed(fetched_l1, fetched_l2, 8000);
+        } else if (text && text[0]) {
+            char l1[17] = {0};
+            char l2[17] = {0};
+            word_wrap_oled(text, l1, sizeof(l1), l2, sizeof(l2));
+            display_status_set_text_timed(l1, l2, 8000);
+        }
     }
     esp_err_t perr = tool_audio_play_wav(wav, wav_len);
     free(wav);
@@ -674,6 +704,8 @@ static void voice_speak_internal(const char *text, const char *display_l1, const
     if (perr != ESP_OK) {
         ESP_LOGE(TAG, "WAV playback failed: %s", esp_err_to_name(perr));
     }
+    /* Extend hold for 5 seconds after speech completes (Speech Duration + 5s buffer) */
+    display_status_extend_hold(5000);
 }
 
 /* -----------------------------------------------------------------------
@@ -737,6 +769,7 @@ static void voice_run_command(void)
         /* 1. Initial silence timeout (no speech within 3.5s) */
         if (!heard_speech && (now - start_ms >= CMD_LEAD_MS)) {
             ESP_LOGI(TAG, "[CMD] wait-for-speech timeout (%d ms) — no speech detected", CMD_LEAD_MS);
+            tool_audio_capture_disarm();
             telegram_send_to_last_chat("⏱️ Listening timed out (no speech heard).");
             tool_audio_beep(BEEP_TIMEOUT_HZ, BEEP_MS, BEEP_VOL);
             tool_audio_clear_cache();
@@ -746,6 +779,12 @@ static void voice_run_command(void)
             return;
         }
 
+        /* Check for barge-in / abort */
+        if (voice_client_is_abort_requested()) {
+            ESP_LOGI(TAG, "[CMD] command window aborted by user interruption");
+            break;
+        }
+
         /* 2. Trailing silence cutoff (speech ended with >= 1.2s silence) */
         if (heard_speech && (speech_ms >= CMD_MIN_SPEECH_MS) && (now - last_speech_ms >= CMD_SILENCE_MS)) {
             ESP_LOGI(TAG, "[CMD] speech ended with %lld ms trailing silence (speech_ms=%u)",
@@ -753,7 +792,7 @@ static void voice_run_command(void)
             break;
         }
 
-        /* 3. Hard cap reached (8.0s) */
+        /* 3. Hard cap reached (15.0s) */
         if (now - start_ms >= CMD_MAX_MS) {
             ESP_LOGI(TAG, "[CMD] full %d ms countdown reached", CMD_MAX_MS);
             break;
@@ -761,6 +800,14 @@ static void voice_run_command(void)
     }
 
     tool_audio_capture_disarm();
+    if (voice_client_is_abort_requested()) {
+        ESP_LOGI(TAG, "[CMD] abort flag set — discarding captured command");
+        tool_audio_clear_cache();
+        s_busy = false;
+        s_busy_start_ms = 0;
+        display_status_idle();
+        return;
+    }
     uint32_t dur = (uint32_t)(esp_timer_get_time() / 1000) - (uint32_t)start_ms;
     ESP_LOGI(TAG, "[CMD] captured %u samples (%u ms)", (unsigned)total, (unsigned)dur);
 
@@ -892,31 +939,34 @@ static void voice_task(void *arg)
             continue;
         }
 
-        /* ---- 5-second debug report ---- */
+        /* ---- 5-second debug report & watchdog ---- */
         int64_t now = esp_timer_get_time() / 1000;
         if (now - dbg_last_report_ms >= 5000) {
             uint32_t avg = dbg_frames ? (uint32_t)(dbg_rms_sum / dbg_frames) : 0;
             ESP_LOGI(TAG, "[listen] 5s: frames=%u avg_rms=%u peak_rms=%d loud=%u paused/empty=%u",
                      (unsigned)dbg_frames, avg, (int)dbg_rms_peak,
                      (unsigned)dbg_loud, (unsigned)dbg_empties);
-            ESP_LOGI(TAG, "[debug] feeder: dma_reads=%u zero_reads=%u ring_written=%u | busy=%d spk_busy=%d",
+            ESP_LOGI(TAG, "[debug] feeder: dma_reads=%u zero_reads=%u ring_written=%u | busy=%d audio_busy=%d spk_busy=%d",
                      (unsigned)s_feeder_reads, (unsigned)s_feeder_zeros,
                      (unsigned)s_ring_written,
-                     s_busy, tool_audio_is_busy());
+                     s_busy, tool_audio_is_busy(), tool_audio_is_speaker_busy());
             dbg_frames = 0; dbg_rms_sum = 0; dbg_rms_peak = 0; dbg_loud = 0; dbg_empties = 0;
             dbg_last_report_ms = now;
-        }
 
-        /* Pause while speaker plays, agent is thinking, capture runs, or the
-         * post-playback echo guard is still active (amp tail + room reverb) */
-        if (s_busy || tool_audio_is_busy() || mic_guard_active()) {
-            int64_t now_ms = esp_timer_get_time() / 1000;
-            if (s_busy && s_busy_start_ms > 0 && (now_ms - s_busy_start_ms >= 60000)) {
-                ESP_LOGW(TAG, "agent thinking timeout (60s) — resuming wake listener");
+            /* Auto-recover if agent turn dropped without clearing s_busy */
+            if (s_busy && s_busy_start_ms > 0 && (now - s_busy_start_ms >= 35000)) {
+                ESP_LOGW(TAG, "agent thinking watchdog (35s) — clearing busy flag");
                 s_busy = false;
                 s_busy_start_ms = 0;
                 display_status_idle();
             }
+        }
+
+        /* Pause while speaker plays, an audio recording session is active, or the
+         * post-playback echo guard is still active (amp tail + room reverb).
+         * NOTE: We do NOT pause merely because the agent is thinking/running tools (s_busy),
+         * allowing hands-free voice commands to be heard and to interrupt long operations! */
+        if (tool_audio_is_speaker_busy() || mic_guard_active() || tool_audio_is_busy()) {
             dbg_empties++;
             was_paused = true;
             consec_speech = 0;
@@ -1027,7 +1077,7 @@ static void voice_task(void *arg)
                     ESP_LOGI(TAG, "[utterance] silence timeout (%d ms)", CMD_SILENCE_MS);
                     break;
                 }
-                /* Hard cap at 1.5s for wake word utterance */
+                /* Hard cap for utterance (15.0s) */
                 if (cur_ms - start_ms >= UTTERANCE_MAX_MS) {
                     ESP_LOGI(TAG, "[utterance] max %d ms reached", UTTERANCE_MAX_MS);
                     break;
@@ -1078,6 +1128,11 @@ static void voice_task(void *arg)
             ESP_LOGI(TAG, "*** WAKE WORD MATCHED: '%s' (raw='%.60s') ***",
                      stt_res.wake_word ? stt_res.wake_word : "",
                      stt_res.raw_text ? stt_res.raw_text : "");
+
+            if (s_busy) {
+                ESP_LOGW(TAG, "*** WAKE WORD INTERRUPT: In-flight agent turn detected — requesting abort ***");
+                voice_client_request_abort();
+            }
 
             /* Feedback will be sent below depending on one-shot vs wake-only */
             display_status_set("Listening...", "");
@@ -1148,6 +1203,13 @@ bool voice_client_speak(const char *text)
 
 bool voice_client_speak_with_display(const char *text, const char *line1, const char *line2)
 {
+    if (voice_client_is_abort_requested()) {
+        ESP_LOGI(TAG, "Skipping voice speak — aborted by user interruption");
+        tool_audio_clear_cache();
+        s_busy = false;
+        s_busy_start_ms = 0;
+        return false;
+    }
     if (!text || !*text) {
         tool_audio_clear_cache();
         s_busy = false;

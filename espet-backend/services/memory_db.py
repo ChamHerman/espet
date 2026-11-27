@@ -97,6 +97,22 @@ class MemoryDB:
                 );
             """)
 
+            # 5. Lightweight rolling execution audit log (decoupled from vector RAG)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS action_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    device_id TEXT NOT NULL,
+                    tool_name TEXT NOT NULL,
+                    arguments_json TEXT,
+                    result_summary TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (device_id) REFERENCES devices(device_id)
+                );
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_action_logs_dev_date ON action_logs(device_id, created_at);
+            """)
+
             # Seed default device if not present
             cur.execute("""
                 INSERT OR IGNORE INTO devices (device_id, user_id, device_name)
@@ -125,6 +141,29 @@ class MemoryDB:
             cur = self.get_conn().cursor()
             cur.execute(sql, params)
             return cur.fetchall()
+
+    def purge_expired_actions(self, device_id: str | None = None, days: int = 7) -> int:
+        with self._lock:
+            conn = self.get_conn()
+            with conn:
+                cur = conn.cursor()
+                if device_id:
+                    cur.execute(
+                        """
+                        DELETE FROM action_logs
+                        WHERE device_id = ? AND created_at < datetime('now', ?)
+                        """,
+                        (device_id, f"-{days} days"),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        DELETE FROM action_logs
+                        WHERE created_at < datetime('now', ?)
+                        """,
+                        (f"-{days} days",),
+                    )
+                return cur.rowcount
 
     def close(self) -> None:
         with self._lock:

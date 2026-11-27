@@ -620,10 +620,14 @@ static void mic_feeder_task(void *arg)
                                   "INMP441 L/R pin is floating or on 3.3V -> auto-switched to Right channel",
                              (int)rms_l, (int)rms_r);
                     s_active_slot = 1;
-                } else if (s_active_slot == 1 && rms_r > 25000 && rms_l > 300 && rms_l < 20000) {
-                    ESP_LOGW(TAG, "MIC AUTO-SWITCH: Right channel railed (rms=%d) -> auto-switched to Left channel",
-                             (int)rms_r);
-                    s_active_slot = 0;
+                } else if (s_active_slot == 1) {
+                    /* Restore to Left channel if Right channel rails or if Left channel is healthy while Right is silent */
+                    if ((rms_r > 25000 && rms_l > 300 && rms_l < 20000) ||
+                        (rms_l > 300 && rms_l < 20000 && (rms_r < 200 || rms_r > 25000))) {
+                        ESP_LOGW(TAG, "MIC AUTO-SWITCH: Left channel healthy (rms=%d, right=%d) -> restored to Left channel",
+                                 (int)rms_l, (int)rms_r);
+                        s_active_slot = 0;
+                    }
                 }
             }
         }
@@ -828,6 +832,13 @@ static esp_err_t timed_capture(uint32_t duration_ms, size_t *out_n, uint32_t *ou
 
 bool tool_audio_is_busy(void)
 {
+    if (s_recording && s_record_start_ms > 0) {
+        uint32_t elapsed_ms = (uint32_t)(esp_timer_get_time() / 1000) - s_record_start_ms;
+        if (elapsed_ms > AUDIO_MAX_RECORD_MS + 2000) {
+            ESP_LOGW(TAG, "s_recording active for %u ms without stop — force disarming", (unsigned)elapsed_ms);
+            tool_audio_capture_disarm();
+        }
+    }
     return s_recording || s_playing;
 }
 
@@ -1286,6 +1297,10 @@ esp_err_t tool_audio_play_wav(const uint8_t *wav, size_t len)
     size_t played = 0;
     esp_err_t err = ESP_OK;
     while (played < data_len) {
+        if (voice_client_is_abort_requested()) {
+            ESP_LOGI(TAG, "[SPK] WAV playback interrupted by user");
+            break;
+        }
         size_t frames = AUDIO_TX_CHUNK_FRAMES;
         size_t need;
         if (channels == 2) {

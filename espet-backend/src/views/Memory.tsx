@@ -48,7 +48,7 @@ interface ItemDraft {
 }
 
 export function MemoryView() {
-  const { config, patchConfig, setDirty, toast, confirm, selectedDeviceId } = useApp();
+  const { config, patchConfig, setDirty, toast, confirm, selectedDeviceId, dirty: storeDirty } = useApp();
   const { styles } = useLayout();
 
   // Tier 1: On-Device MEMORY.md state
@@ -57,6 +57,12 @@ export function MemoryView() {
   const [note, setNote] = useState("");
   const [memoryModalOpen, setMemoryModalOpen] = useState(false);
   const [organizing, setOrganizing] = useState(false);
+
+  useEffect(() => {
+    if (config?.memory_md && !storeDirty?.memory && !memoryModalOpen) {
+      setDraft(config.memory_md);
+    }
+  }, [config?.memory_md, storeDirty?.memory, memoryModalOpen]);
   // Tier 2: Long-Term SQLite-Vec Memory state
   const [memories, setMemories] = useState<MemoryItem[]>([]);
   const [totalCount, setTotalCount] = useState(0);
@@ -150,7 +156,7 @@ export function MemoryView() {
   useEffect(() => {
     reloadMemories();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeCategory, selectedDeviceId]);
+  }, [activeCategory, selectedDeviceId, config?.versions?.memory]);
 
   const handleTestSearch = async () => {
     const q = testQuery.trim();

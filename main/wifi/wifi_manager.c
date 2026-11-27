@@ -29,6 +29,7 @@ static void on_reconnect_timer(void *arg)
 {
     if (s_reconnect_enabled) {
         ESP_LOGI(TAG, "Reconnecting to Wi-Fi...");
+        esp_wifi_disconnect();
         esp_wifi_connect();
     }
 }
@@ -159,9 +160,11 @@ esp_err_t wifi_manager_start(void)
 {
     wifi_config_t wifi_cfg = {
         .sta = {
-            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+            .scan_method = WIFI_ALL_CHANNEL_SCAN,
+            .sort_method = WIFI_CONNECT_AP_BY_SIGNAL,
+            .threshold.authmode = WIFI_AUTH_WPA_PSK,
             .pmf_cfg = {
-                .capable = true,
+                .capable = false,
                 .required = false,
             },
         },
@@ -195,7 +198,8 @@ esp_err_t wifi_manager_start(void)
     }
 
     s_reconnect_enabled = true;
-    ESP_LOGI(TAG, "Connecting to SSID: %s", wifi_cfg.sta.ssid);
+    ESP_LOGI(TAG, "Connecting to SSID: '%s' (pass_len=%d)",
+             wifi_cfg.sta.ssid, (int)strlen((char *)wifi_cfg.sta.password));
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
