@@ -315,82 +315,55 @@ esp_err_t tool_audio_init(void)
              (void *)s_tx_handle, (void *)s_rx_handle);
 
     /* ------------------------------------------------------------------
-     * Step 2a: RX channel config — INMP441 capture (unchanged, proven).
-     *   32-bit slots, stereo frame, LEFT slot carries data (L/R=GND).
+     * Step 2: Shared full-duplex STD config for TX + RX on I2S_NUM_0.
+     *   ESP-IDF i2s_std.c only enables full-duplex clock sharing
+     *   (sig_loopback=1, RX slave locked to TX master BCLK/WS) when BOTH
+     *   i2s_channel_init_std_mode() calls receive byte-identical configs.
+     *   Passing different slot_mask or dout/din structs leaves both
+     *   channels as independent simplex Masters and causes RX init to
+     *   overwrite GPIO 38/39 (BCLK/WS) away from TX, breaking speaker output.
      * ------------------------------------------------------------------ */
-    i2s_std_config_t rx_cfg = {
-        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(AUDIO_SAMPLE_RATE),
-        .slot_cfg = {
-            .data_bit_width = I2S_DATA_BIT_WIDTH_32BIT,
-            .slot_bit_width = I2S_SLOT_BIT_WIDTH_32BIT,
-            .slot_mode      = I2S_SLOT_MODE_STEREO,
-            .slot_mask      = I2S_STD_SLOT_LEFT,   /* INMP441 L/R=GND → left */
-            .ws_width       = 32,
-            .ws_pol         = false,
-            .bit_shift      = true,
-            .left_align     = false,
-            .big_endian     = false,
-            .bit_order_lsb  = false,
-        },
-        .gpio_cfg = {
-            .mclk = I2S_GPIO_UNUSED,
-            .bclk = MIMI_GPIO_I2S_BCLK,
-            .ws   = MIMI_GPIO_I2S_WS,
-            .dout = I2S_GPIO_UNUSED,
-            .din  = MIMI_GPIO_I2S_DIN,
-            .invert_flags = {
-                .mclk_inv = false,
-                .bclk_inv = false,
-                .ws_inv   = false,
-            },
+    i2s_std_config_t std_cfg;
+    memset(&std_cfg, 0, sizeof(std_cfg));
+    std_cfg.clk_cfg = (i2s_std_clk_config_t)I2S_STD_CLK_DEFAULT_CONFIG(AUDIO_SAMPLE_RATE);
+    std_cfg.slot_cfg = (i2s_std_slot_config_t){
+        .data_bit_width = I2S_DATA_BIT_WIDTH_32BIT,
+        .slot_bit_width = I2S_SLOT_BIT_WIDTH_32BIT,
+        .slot_mode      = I2S_SLOT_MODE_STEREO,
+        .slot_mask      = I2S_STD_SLOT_BOTH,
+        .ws_width       = 32,
+        .ws_pol         = false,
+        .bit_shift      = true,
+        .left_align     = true,
+        .big_endian     = false,
+        .bit_order_lsb  = false,
+    };
+    std_cfg.gpio_cfg = (i2s_std_gpio_config_t){
+        .mclk = I2S_GPIO_UNUSED,
+        .bclk = MIMI_GPIO_I2S_BCLK,
+        .ws   = MIMI_GPIO_I2S_WS,
+        .dout = MIMI_GPIO_I2S_DOUT,
+        .din  = MIMI_GPIO_I2S_DIN,
+        .invert_flags = {
+            .mclk_inv = false,
+            .bclk_inv = false,
+            .ws_inv   = false,
         },
     };
 
-    /* ------------------------------------------------------------------
-     * Step 2b: TX channel config — MAX98357A playback.
-     *   Same clocks/rate as RX; mono samples are duplicated into BOTH
-     *   slots at write time (SD pin may select L, R or (L+R)/2).
-     * ------------------------------------------------------------------ */
-    i2s_std_config_t tx_cfg = {
-        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(AUDIO_SAMPLE_RATE),
-        .slot_cfg = {
-            .data_bit_width = I2S_DATA_BIT_WIDTH_32BIT,
-            .slot_bit_width = I2S_SLOT_BIT_WIDTH_32BIT,
-            .slot_mode      = I2S_SLOT_MODE_STEREO,
-            .slot_mask      = I2S_STD_SLOT_BOTH,
-            .ws_width       = 32,
-            .ws_pol         = false,
-            .bit_shift      = true,
-            .left_align     = false,
-            .big_endian     = false,
-            .bit_order_lsb  = false,
-        },
-        .gpio_cfg = {
-            .mclk = I2S_GPIO_UNUSED,
-            .bclk = MIMI_GPIO_I2S_BCLK,
-            .ws   = MIMI_GPIO_I2S_WS,
-            .dout = MIMI_GPIO_I2S_DOUT,
-            .din  = I2S_GPIO_UNUSED,
-            .invert_flags = {
-                .mclk_inv = false,
-                .bclk_inv = false,
-                .ws_inv   = false,
-            },
-        },
-    };
-
-    ESP_LOGI(TAG, "[2/4] Configuring I2S STD Philips mode (TX + RX)...");
-    err = i2s_channel_init_std_mode(s_tx_handle, &tx_cfg);
+    ESP_LOGI(TAG, "[2/4] Configuring I2S STD Philips full-duplex mode (TX master + RX slave)...");
+    err = i2s_channel_init_std_mode(s_tx_handle, &std_cfg);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "TX i2s_channel_init_std_mode FAILED: %s", esp_err_to_name(err));
         goto fail;
     }
-    err = i2s_channel_init_std_mode(s_rx_handle, &rx_cfg);
+    err = i2s_channel_init_std_mode(s_rx_handle, &std_cfg);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "RX i2s_channel_init_std_mode FAILED: %s", esp_err_to_name(err));
         goto fail;
     }
-    ESP_LOGI(TAG, "[2/4] OK — Philips 32-bit stereo configured on both channels");
+    ESP_LOGI(TAG, "[2/4] OK — Full-duplex Philips 32-bit stereo (shared BCLK=%d WS=%d DOUT=%d DIN=%d)",
+             MIMI_GPIO_I2S_BCLK, MIMI_GPIO_I2S_WS, MIMI_GPIO_I2S_DOUT, MIMI_GPIO_I2S_DIN);
 
     /* ------------------------------------------------------------------
      * Step 3: Allocate PSRAM capture buffer.
