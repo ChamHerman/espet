@@ -15,16 +15,18 @@ TTS:  edge-tts (Microsoft Edge neural voices, free, no API key) + ffmpeg
 """
 
 import asyncio
+import json
 import logging
 import math
 import os
 import struct
 import sys
 import tempfile
+import time
 from pathlib import Path
 import subprocess
 import numpy as np
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import Response
 from pydantic import BaseModel
 
@@ -308,37 +310,43 @@ def _get_stt_model():
     return _stt_model
 
 
-def _transcribe_pcm(pcm16: np.ndarray, language: str | None) -> tuple[str, float, float]:
-    """Write a temp WAV, run faster-whisper.
-
-    Returns (text, first_segment_avg_logprob, first_segment_no_speech_prob).
-    The two confidence numbers let the caller reject hallucinated wake words:
-    Whisper readily invents short phrases on noise/echo, and those segments
-    carry tell-tale stats (high no_speech_prob / low avg_logprob).
-
-    IMPORTANT: never put the wake words themselves in initial_prompt. The
-    prompt biases the decoder and was verified to turn room noise / TTS echo
-    into exactly the wake word (field: endless self-wake loop). Keep the
-    prompt neutral, or empty (settings.voice_stt_prompt).
-    """
+def _transcribe_pcm_impl(
+    pcm16: np.ndarray,
+    language: str | None,
+    *,
+    apply_denoise: bool = True,
+    save_capture: bool = True,
+) -> dict:
+    """Internal Whisper runner returning transcript + acoustic/confidence diagnostics."""
     if len(pcm16) < ESP_SAMPLE_RATE // 5:  # < 0.2 s of audio
-        return "", 0.0, 1.0
+        return {
+            "text": "",
+            "avg_logprob": 0.0,
+            "no_speech_prob": 1.0,
+            "detected_language": "",
+            "language_prob": 0.0,
+            "duration_s": round(len(pcm16) / ESP_SAMPLE_RATE, 3),
+            "rms_processed": float(np.sqrt(np.mean(pcm16.astype(np.float64) ** 2))) if len(pcm16) else 0.0,
+        }
 
     # Clean electrical buzz (OLED charge pump 169 Hz harmonics) and normalize human voice
-    pcm16 = denoise_and_boost_audio(pcm16)
+    if apply_denoise:
+        pcm16 = denoise_and_boost_audio(pcm16)
+    rms_processed = float(np.sqrt(np.mean(pcm16.astype(np.float64) ** 2))) if len(pcm16) else 0.0
 
     model = _get_stt_model()
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
         wav_bytes = pcm_to_wav_bytes(pcm16)
         f.write(wav_bytes)
         tmp_path = f.name
-    # Save last audio capture for inspection
-    try:
-        debug_file = Path("data/last_capture.wav")
-        debug_file.parent.mkdir(parents=True, exist_ok=True)
-        debug_file.write_bytes(wav_bytes)
-    except Exception:
-        pass
+    # Save last audio capture for inspection (never clobber during synthetic regression runs)
+    if save_capture:
+        try:
+            debug_file = Path("data/last_capture.wav")
+            debug_file.parent.mkdir(parents=True, exist_ok=True)
+            debug_file.write_bytes(wav_bytes)
+        except Exception:
+            pass
     allowed_langs = [
         l.strip().lower() for l in (settings.voice_allowed_languages or "").split(",") if l.strip()
     ]
@@ -395,7 +403,15 @@ def _transcribe_pcm(pcm16: np.ndarray, language: str | None) -> tuple[str, float
             if best_prob < 0.03:
                 logger.info("Language confidence for %s too low (best=%.3f) — discarding noise",
                             allowed_langs, best_prob)
-                return "", 0.0, 1.0
+                return {
+                    "text": "",
+                    "avg_logprob": 0.0,
+                    "no_speech_prob": 1.0,
+                    "detected_language": str(info.language or ""),
+                    "language_prob": float(info.language_probability or 0.0),
+                    "duration_s": float(info.duration or 0.0),
+                    "rms_processed": rms_processed,
+                }
 
             target_lang = best_allowed
             segments, info = model.transcribe(
@@ -429,6 +445,7 @@ def _transcribe_pcm(pcm16: np.ndarray, language: str | None) -> tuple[str, float
                 initial_prompt=settings.voice_stt_prompt or None,
                 condition_on_previous_text=False,
             )
+            segs = list(segments)
             text = " ".join(seg.text.strip() for seg in segs).strip()
 
         # Strip any foreign scripts outside English (ASCII) and Chinese (\u4e00-\u9fff)
@@ -446,9 +463,34 @@ def _transcribe_pcm(pcm16: np.ndarray, language: str | None) -> tuple[str, float
             avg_logprob, no_speech_prob = 0.0, 1.0
         logger.info("STT ok (lang=%s, %.1f s audio, logp=%.2f nsp=%.2f): %.80s",
                     info.language, info.duration, avg_logprob, no_speech_prob, text)
-        return text, avg_logprob, no_speech_prob
+        return {
+            "text": text,
+            "avg_logprob": avg_logprob,
+            "no_speech_prob": no_speech_prob,
+            "detected_language": str(info.language or ""),
+            "language_prob": float(info.language_probability or 0.0),
+            "duration_s": float(info.duration or 0.0),
+            "rms_processed": rms_processed,
+        }
     finally:
         Path(tmp_path).unlink(missing_ok=True)
+
+
+def _transcribe_pcm(pcm16: np.ndarray, language: str | None) -> tuple[str, float, float]:
+    """Write a temp WAV, run faster-whisper.
+
+    Returns (text, first_segment_avg_logprob, first_segment_no_speech_prob).
+    The two confidence numbers let the caller reject hallucinated wake words:
+    Whisper readily invents short phrases on noise/echo, and those segments
+    carry tell-tale stats (high no_speech_prob / low avg_logprob).
+
+    IMPORTANT: never put the wake words themselves in initial_prompt. The
+    prompt biases the decoder and was verified to turn room noise / TTS echo
+    into exactly the wake word (field: endless self-wake loop). Keep the
+    prompt neutral, or empty (settings.voice_stt_prompt).
+    """
+    res = _transcribe_pcm_impl(pcm16, language, apply_denoise=True, save_capture=True)
+    return res["text"], res["avg_logprob"], res["no_speech_prob"]
 
 
 def check_wake_word(text: str, wake_words: list[str]) -> tuple[bool, str, str]:
@@ -667,3 +709,432 @@ async def get_last_capture_audio():
         media_type="audio/wav",
         headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
     )
+
+
+# ---------------------------------------------------------------------------
+# Debug & Regression Endpoints (for /stt hardware & voice bench only)
+# ---------------------------------------------------------------------------
+DEBUG_VOICE_PRESETS = [
+    {"id": "zh-CN-XiaoxiaoNeural", "label": "Chinese (Mandarin) — Xiaoxiao (Female)"},
+    {"id": "zh-CN-YunxiNeural", "label": "Chinese (Mandarin) — Yunxi (Male)"},
+    {"id": "zh-HK-HiuMaanNeural", "label": "Chinese (Cantonese) — HiuMaan (Female)"},
+    {"id": "en-US-AriaNeural", "label": "English (US) — Aria (Female)"},
+    {"id": "en-US-GuyNeural", "label": "English (US) — Guy (Male)"},
+    {"id": "en-GB-SoniaNeural", "label": "English (UK) — Sonia (Female)"},
+]
+
+
+def _audio_stats(pcm: np.ndarray, sample_rate: int = ESP_SAMPLE_RATE) -> dict:
+    if len(pcm) == 0:
+        return {"samples": 0, "duration_s": 0.0, "rms": 0.0, "peak": 0, "dc_offset": 0.0}
+    f = pcm.astype(np.float64)
+    return {
+        "samples": int(len(pcm)),
+        "duration_s": round(len(pcm) / sample_rate, 3),
+        "rms": round(float(np.sqrt(np.mean(f ** 2))), 2),
+        "peak": int(np.max(np.abs(pcm))),
+        "dc_offset": round(float(np.mean(f)), 2),
+    }
+
+
+def _inspect_wav_header(wav: bytes) -> dict:
+    if len(wav) < 44 or wav[:4] != b"RIFF" or wav[8:12] != b"WAVE":
+        raise ValueError("Invalid RIFF/WAVE header")
+    channels = struct.unpack("<H", wav[22:24])[0]
+    sample_rate = struct.unpack("<I", wav[24:28])[0]
+    bits_per_sample = struct.unpack("<H", wav[34:36])[0]
+    pcm = wav_bytes_to_pcm16(wav)
+    duration_ms = round((len(pcm) / sample_rate) * 1000, 1) if sample_rate > 0 else 0.0
+    return {
+        "bytes": len(wav),
+        "channels": channels,
+        "sample_rate": sample_rate,
+        "bits_per_sample": bits_per_sample,
+        "samples": len(pcm),
+        "duration_ms": duration_ms,
+    }
+
+
+@router.get("/debug/config", dependencies=[Depends(verify_device_key)])
+async def debug_voice_config():
+    """Return active STT/TTS runtime configuration and last_capture.wav stats."""
+    wake_words = [w.strip() for w in settings.voice_wake_words.split(",") if w.strip()]
+    last_cap: dict = {"exists": False}
+    wav_path = Path("data/last_capture.wav")
+    if wav_path.exists():
+        try:
+            raw = wav_path.read_bytes()
+            pcm = wav_bytes_to_pcm16(raw)
+            st = _audio_stats(pcm)
+            last_cap = {
+                "exists": True,
+                "size_bytes": len(raw),
+                "modified_ts": round(wav_path.stat().st_mtime, 2),
+                **st,
+            }
+        except Exception as e:
+            last_cap = {"exists": True, "error": str(e)}
+
+    active_device = "not_loaded"
+    if _stt_model is not None:
+        active_device = getattr(getattr(_stt_model, "model", None), "device", None) or settings.voice_stt_device
+
+    return {
+        "stt_model": settings.voice_stt_model,
+        "stt_device_pref": settings.voice_stt_device,
+        "stt_compute_type": settings.voice_stt_compute_type,
+        "stt_beam_size": settings.voice_stt_beam_size,
+        "stt_loaded": _stt_model is not None,
+        "stt_active_device": str(active_device),
+        "voice_language": settings.voice_language or "auto",
+        "voice_allowed_languages": settings.voice_allowed_languages,
+        "voice_hw_rate_8k": settings.voice_hw_rate_8k,
+        "voice_min_rms": settings.voice_min_rms,
+        "voice_min_avg_logprob": settings.voice_min_avg_logprob,
+        "voice_max_no_speech_prob": settings.voice_max_no_speech_prob,
+        "voice_tts_voice": settings.voice_tts_voice,
+        "tts_max_chars": TTS_MAX_CHARS,
+        "wake_words": wake_words,
+        "last_capture": last_cap,
+    }
+
+
+@router.get("/debug/voices", dependencies=[Depends(verify_device_key)])
+async def debug_voice_presets():
+    """Return preset edge-tts voices and the current default voice."""
+    return {
+        "default_voice": settings.voice_tts_voice,
+        "voices": DEBUG_VOICE_PRESETS,
+    }
+
+
+@router.post("/debug/transcribe", dependencies=[Depends(verify_device_key)])
+async def debug_transcribe(
+    request: Request,
+    language: str | None = Query(None),
+    skip_pitch_fix: bool = Query(False),
+    skip_denoise: bool = Query(False),
+    skip_rms_gate: bool = Query(False),
+    skip_confidence_gate: bool = Query(False),
+    save_capture: bool = Query(False),
+):
+    """
+    Debug STT endpoint: accepts raw PCM/WAV upload OR JSON {"use_last_capture": true, ...}.
+    Returns full acoustic & Whisper confidence diagnostics without altering /api/voice/transcribe.
+    """
+    t0 = time.perf_counter()
+    ctype = (request.headers.get("content-type") or "").lower()
+    body = await request.body()
+
+    use_last_capture = False
+    if "application/json" in ctype:
+        try:
+            payload = json.loads(body.decode("utf-8") or "{}")
+        except Exception as e:
+            raise HTTPException(400, f"Invalid JSON payload: {e}")
+        use_last_capture = bool(payload.get("use_last_capture", False))
+        if "language" in payload:
+            language = payload.get("language")
+        skip_pitch_fix = bool(payload.get("skip_pitch_fix", skip_pitch_fix))
+        skip_denoise = bool(payload.get("skip_denoise", skip_denoise))
+        skip_rms_gate = bool(payload.get("skip_rms_gate", skip_rms_gate))
+        skip_confidence_gate = bool(payload.get("skip_confidence_gate", skip_confidence_gate))
+        save_capture = bool(payload.get("save_capture", save_capture))
+
+    if use_last_capture:
+        wav_path = Path("data/last_capture.wav")
+        if not wav_path.exists():
+            raise HTTPException(404, "No data/last_capture.wav recorded yet")
+        pcm = wav_bytes_to_pcm16(wav_path.read_bytes())
+        # last_capture.wav was already saved post-upsample/denoise; default to not double-upsampling
+        pitch_upsampled = False
+    else:
+        if not body:
+            raise HTTPException(400, "empty audio body")
+        if len(body) > 6_000_000:
+            raise HTTPException(413, "audio too large")
+        try:
+            raw_rate = int(request.headers.get("x-audio-rate") or ESP_SAMPLE_RATE)
+        except ValueError:
+            raw_rate = ESP_SAMPLE_RATE
+        rate = raw_rate if raw_rate > 0 else ESP_SAMPLE_RATE
+
+        if "wav" in ctype or body[:4] == b"RIFF":
+            pcm = wav_bytes_to_pcm16(body)
+        else:
+            raw = np.frombuffer(body[: len(body) // 2 * 2], dtype="<i2").copy()
+            pcm = resample_to_16k(raw, rate) if rate != ESP_SAMPLE_RATE else raw
+
+        pitch_upsampled = False
+        if not skip_pitch_fix:
+            pcm, pitch_upsampled = check_and_fix_pitch(pcm, ESP_SAMPLE_RATE)
+
+    raw_stats = _audio_stats(pcm)
+    lang_override = None if (not language or language == "auto") else language.strip().lower()
+    if lang_override is None and not language:
+        lang_override = settings.voice_language
+
+    if not skip_rms_gate and raw_stats["rms"] < settings.voice_min_rms:
+        return {
+            "ok": True,
+            "text": "",
+            "raw_text": "",
+            "wake_matched": False,
+            "wake_word": "",
+            "avg_logprob": 0.0,
+            "no_speech_prob": 1.0,
+            "confidence_rejected": False,
+            "detected_language": "",
+            "language_prob": 0.0,
+            "rms_raw": raw_stats["rms"],
+            "rms_processed": raw_stats["rms"],
+            "peak": raw_stats["peak"],
+            "dc_offset": raw_stats["dc_offset"],
+            "samples": raw_stats["samples"],
+            "duration_s": raw_stats["duration_s"],
+            "pitch_upsampled": pitch_upsampled,
+            "skipped_reason": f"rms_below_threshold ({raw_stats['rms']} < {settings.voice_min_rms})",
+            "latency_ms": round((time.perf_counter() - t0) * 1000, 1),
+        }
+
+    stt_res = await asyncio.to_thread(
+        _transcribe_pcm_impl,
+        pcm,
+        lang_override,
+        apply_denoise=not skip_denoise,
+        save_capture=save_capture,
+    )
+    text = stt_res["text"]
+    avg_logprob = stt_res["avg_logprob"]
+    no_speech_prob = stt_res["no_speech_prob"]
+
+    wake_list = [w.strip() for w in settings.voice_wake_words.split(",") if w.strip()]
+    wake_matched, wake_word, cmd = check_wake_word(text, wake_list)
+
+    confidence_rejected = False
+    if wake_matched and not skip_confidence_gate and (
+        avg_logprob < settings.voice_min_avg_logprob
+        or no_speech_prob > settings.voice_max_no_speech_prob
+    ):
+        confidence_rejected = True
+        wake_matched, wake_word, cmd = False, "", ""
+
+    return {
+        "ok": True,
+        "text": cmd if wake_matched else "",
+        "raw_text": text,
+        "wake_matched": wake_matched,
+        "wake_word": wake_word,
+        "avg_logprob": round(avg_logprob, 3),
+        "no_speech_prob": round(no_speech_prob, 3),
+        "confidence_rejected": confidence_rejected,
+        "detected_language": stt_res["detected_language"],
+        "language_prob": round(stt_res["language_prob"], 3),
+        "rms_raw": raw_stats["rms"],
+        "rms_processed": round(stt_res["rms_processed"], 2),
+        "peak": raw_stats["peak"],
+        "dc_offset": raw_stats["dc_offset"],
+        "samples": raw_stats["samples"],
+        "duration_s": raw_stats["duration_s"],
+        "pitch_upsampled": pitch_upsampled,
+        "skipped_reason": "",
+        "latency_ms": round((time.perf_counter() - t0) * 1000, 1),
+    }
+
+
+@router.post("/debug/tts", dependencies=[Depends(verify_device_key)])
+async def debug_tts(req: TTSRequest):
+    """Synthesize speech with timing + WAV contract headers for the /stt debug bench."""
+    t0 = time.perf_counter()
+    text = sanitize_tts_text(req.text.strip())
+    if not text:
+        raise HTTPException(400, "text is empty after sanitization (emoji-only reply?)")
+    if len(text) > 2000:
+        raise HTTPException(413, "text too long for voice playback (max 2000 chars)")
+
+    voice = (req.voice or "").strip() or settings.voice_tts_voice
+    try:
+        wav = await _tts_to_wav(text, voice)
+        line1, line2 = extract_oled_keywords(req.text)
+        wav_info = _inspect_wav_header(wav)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Debug TTS synthesis failed")
+        raise HTTPException(500, f"tts failed: {e}")
+
+    latency_ms = round((time.perf_counter() - t0) * 1000, 1)
+    headers = {
+        "X-OLED-Line1": line1,
+        "X-OLED-Line2": line2,
+        "X-TTS-Latency-Ms": str(latency_ms),
+        "X-WAV-Bytes": str(wav_info["bytes"]),
+        "X-WAV-Duration-Ms": str(wav_info["duration_ms"]),
+        "X-WAV-Sample-Rate": str(wav_info["sample_rate"]),
+        "X-WAV-Channels": str(wav_info["channels"]),
+        "X-WAV-Bits": str(wav_info["bits_per_sample"]),
+        "X-Voice-Used": voice,
+        "X-Sanitized-Len": str(len(text)),
+        "Access-Control-Expose-Headers": (
+            "X-OLED-Line1, X-OLED-Line2, X-TTS-Latency-Ms, X-WAV-Bytes, "
+            "X-WAV-Duration-Ms, X-WAV-Sample-Rate, X-WAV-Channels, X-WAV-Bits, "
+            "X-Voice-Used, X-Sanitized-Len"
+        ),
+    }
+    return Response(content=wav, media_type="audio/wav", headers=headers)
+
+
+class RegressionRequest(BaseModel):
+    include_tts: bool = True
+    include_loopback: bool = True
+    voice: str | None = None
+
+
+@router.post("/debug/regression", dependencies=[Depends(verify_device_key)])
+async def debug_regression(req: RegressionRequest | None = None):
+    """
+    Non-destructive automated regression suite for STT, TTS, DSP, and wake-word logic.
+    Runs strictly in-memory / temp files and never overwrites data/last_capture.wav.
+    """
+    cfg = req or RegressionRequest()
+    t_suite0 = time.perf_counter()
+    cases: list[dict] = []
+    wake_list = [w.strip() for w in settings.voice_wake_words.split(",") if w.strip()]
+
+    def _run_sync_case(name: str, fn):
+        t0 = time.perf_counter()
+        try:
+            detail = fn()
+            cases.append({
+                "name": name,
+                "passed": True,
+                "duration_ms": round((time.perf_counter() - t0) * 1000, 1),
+                "detail": detail,
+            })
+        except Exception as exc:
+            cases.append({
+                "name": name,
+                "passed": False,
+                "duration_ms": round((time.perf_counter() - t0) * 1000, 1),
+                "detail": f"{type(exc).__name__}: {exc}",
+            })
+
+    def _case_wake_en():
+        matched, word, cmd = check_wake_word("Hey Mimi turn on the white LED", wake_list)
+        assert matched and word == "hey mimi" and cmd == "turn on the white LED", (matched, word, cmd)
+        return f"matched='{word}', cmd='{cmd}'"
+
+    def _case_wake_zh():
+        matched, word, cmd = check_wake_word("米米 你好", wake_list)
+        assert matched and word == "米米" and cmd == "你好", (matched, word, cmd)
+        return f"matched='{word}', cmd='{cmd}'"
+
+    def _case_wake_negative():
+        for phrase in ("Thanks for watching!", "the weather is sunny", ""):
+            matched, word, cmd = check_wake_word(phrase, wake_list)
+            assert not matched, f"False positive on '{phrase}': {(matched, word, cmd)}"
+        return "3 negative phrases rejected"
+
+    def _case_pcm_wav_roundtrip():
+        samples = np.array([0, 1200, -1200, 32767, -32768, 42], dtype=np.int16)
+        wav = pcm_to_wav_bytes(samples, ESP_SAMPLE_RATE)
+        info = _inspect_wav_header(wav)
+        out = wav_bytes_to_pcm16(wav)
+        assert info["sample_rate"] == 16000 and info["channels"] == 1 and info["bits_per_sample"] == 16, info
+        assert np.array_equal(samples, out), "PCM roundtrip mismatch"
+        return f"RIFF/WAVE 16kHz 1ch 16-bit verified ({len(wav)} bytes)"
+
+    def _case_resample_8k():
+        src = np.zeros(8000, dtype=np.int16)
+        dst = resample_to_16k(src, 8000)
+        assert len(dst) == 16000, len(dst)
+        return "8000 -> 16000 samples"
+
+    def _case_denoise_notch():
+        t = np.arange(ESP_SAMPLE_RATE) / float(ESP_SAMPLE_RATE)
+        # 169.2 Hz OLED ripple + DC offset 2000
+        sig = (2000.0 + 1500.0 * np.sin(2.0 * np.pi * 169.2 * t)).astype(np.int16)
+        cleaned = denoise_and_boost_audio(sig, ESP_SAMPLE_RATE)
+        dc_after = abs(float(np.mean(cleaned.astype(np.float64))))
+        assert dc_after < 50.0, f"DC offset remained high: {dc_after}"
+        return f"DC offset reduced 2000 -> {dc_after:.1f}"
+
+    def _case_silence_gate():
+        quiet = np.full(16000, 10, dtype=np.int16)
+        rms = float(np.sqrt(np.mean(quiet.astype(np.float64) ** 2)))
+        assert rms < settings.voice_min_rms, (rms, settings.voice_min_rms)
+        return f"RMS {rms:.1f} < gate {settings.voice_min_rms}"
+
+    def _case_stt_synthetic():
+        rng = np.random.default_rng(42)
+        noise = rng.normal(0, 100, 16000).astype(np.int16)
+        res = _transcribe_pcm_impl(noise, "en", apply_denoise=True, save_capture=False)
+        matched, word, _ = check_wake_word(res["text"], wake_list)
+        if matched and (
+            res["avg_logprob"] < settings.voice_min_avg_logprob
+            or res["no_speech_prob"] > settings.voice_max_no_speech_prob
+        ):
+            matched = False
+        assert not matched, f"Synthetic noise triggered wake word '{word}' ({res})"
+        return f"model ok, text='{res['text']}', logp={res['avg_logprob']:.2f}, nsp={res['no_speech_prob']:.2f}"
+
+    def _case_tts_sanitize_and_oled():
+        clean = sanitize_tts_text("LED is on! 🎉🔥✅")
+        assert "🎉" not in clean and "LED is on!" in clean, clean
+        l1, l2 = extract_oled_keywords("Turned on the white LED")
+        assert len(l1) <= 16 and len(l2) <= 16 and l1.isascii() and l2.isascii(), (l1, l2)
+        return f"sanitized='{clean}', oled=('{l1}', '{l2}')"
+
+    _run_sync_case("wake_word_positive_en", _case_wake_en)
+    _run_sync_case("wake_word_positive_zh", _case_wake_zh)
+    _run_sync_case("wake_word_negative_hallucination", _case_wake_negative)
+    _run_sync_case("pcm_wav_roundtrip", _case_pcm_wav_roundtrip)
+    _run_sync_case("resample_8k_to_16k", _case_resample_8k)
+    _run_sync_case("denoise_dc_and_notch", _case_denoise_notch)
+    _run_sync_case("stt_silence_gate", _case_silence_gate)
+    await asyncio.to_thread(_run_sync_case, "stt_synthetic_no_wake_hallucination", _case_stt_synthetic)
+    _run_sync_case("tts_sanitize_and_oled", _case_tts_sanitize_and_oled)
+
+    if cfg.include_tts:
+        voice = (cfg.voice or "").strip() or settings.voice_tts_voice
+        t_tts0 = time.perf_counter()
+        tts_wav: bytes | None = None
+        try:
+            tts_wav = await _tts_to_wav("Hey Mimi, turn on the white light.", voice)
+            info = _inspect_wav_header(tts_wav)
+            assert info["sample_rate"] == 16000 and info["channels"] == 1 and info["bits_per_sample"] == 16, info
+            assert info["bytes"] > 44 and info["duration_ms"] > 300, info
+            cases.append({
+                "name": "tts_wav_contract",
+                "passed": True,
+                "duration_ms": round((time.perf_counter() - t_tts0) * 1000, 1),
+                "detail": f"{info['bytes']}B, {info['duration_ms']}ms @ {info['sample_rate']}Hz {info['channels']}ch",
+            })
+        except Exception as exc:
+            cases.append({
+                "name": "tts_wav_contract",
+                "passed": False,
+                "duration_ms": round((time.perf_counter() - t_tts0) * 1000, 1),
+                "detail": f"{type(exc).__name__}: {exc}",
+            })
+
+        if cfg.include_loopback and tts_wav is not None:
+            def _case_loopback():
+                pcm = wav_bytes_to_pcm16(tts_wav)
+                res = _transcribe_pcm_impl(pcm, "en", apply_denoise=False, save_capture=False)
+                assert res["text"].strip(), "Empty loopback transcription"
+                matched, word, cmd = check_wake_word(res["text"], wake_list)
+                return f"raw='{res['text']}', wake={matched} ('{word}'), cmd='{cmd}'"
+
+            await asyncio.to_thread(_run_sync_case, "tts_to_stt_loopback", _case_loopback)
+
+    passed = sum(1 for c in cases if c["passed"])
+    failed = len(cases) - passed
+    return {
+        "ok": failed == 0,
+        "passed": passed,
+        "failed": failed,
+        "total": len(cases),
+        "duration_ms": round((time.perf_counter() - t_suite0) * 1000, 1),
+        "cases": cases,
+    }

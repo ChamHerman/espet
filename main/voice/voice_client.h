@@ -42,17 +42,6 @@ void voice_client_set_listen(bool enable);
 bool voice_client_is_listen_enabled(void);
 
 /**
- * @brief Voice interruption / barge-in control.
- *
- * Allows a newly recognized wake-word command to abort any in-flight
- * LLM query or ReAct tool execution so the agent can switch immediately
- * to the new user request.
- */
-void voice_client_request_abort(void);
-bool voice_client_is_abort_requested(void);
-void voice_client_clear_abort(void);
-
-/**
  * @brief Speak a reply: fetch TTS audio from the backend and play it.
  *
  * Called by the outbound dispatcher for system:"voice" replies. Blocking

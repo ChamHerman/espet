@@ -109,26 +109,9 @@ static volatile bool        s_running        = false;
 static volatile bool        s_listen_enabled = true;  /* autonomous VAD listener toggle (always on by default) */
 static volatile bool        s_busy           = false;  /* pipeline in flight */
 static int64_t              s_busy_start_ms  = 0;      /* watchdog timer for agent thinking */
-static volatile bool        s_abort_requested = false; /* interruption flag */
 static volatile int64_t     s_mic_guard_until_ms = 0;  /* post-playback echo guard deadline */
 static uint8_t             *s_ack_wav        = NULL;   /* "Yes?" cache */
 static size_t               s_ack_wav_len    = 0;
-
-void voice_client_request_abort(void)
-{
-    s_abort_requested = true;
-    ESP_LOGW(TAG, "Voice interruption requested — aborting current agent turn");
-}
-
-bool voice_client_is_abort_requested(void)
-{
-    return s_abort_requested;
-}
-
-void voice_client_clear_abort(void)
-{
-    s_abort_requested = false;
-}
 
 /* -----------------------------------------------------------------------
  * Signal Processing Helpers
@@ -666,10 +649,6 @@ static uint8_t *voice_tts_fetch(const char *text, size_t *out_len,
 
 static void voice_speak_internal(const char *text, const char *display_l1, const char *display_l2)
 {
-    if (voice_client_is_abort_requested()) {
-        ESP_LOGI(TAG, "voice_speak_internal: skipping playback (turn aborted by user)");
-        return;
-    }
     tool_audio_speaker_session_begin();
     size_t wav_len = 0;
     char fetched_l1[17] = {0};
@@ -678,12 +657,6 @@ static void voice_speak_internal(const char *text, const char *display_l1, const
     if (!wav) {
         tool_audio_speaker_session_end();
         tool_audio_beep(BEEP_ERR_HZ, BEEP_MS * 2, BEEP_VOL);
-        return;
-    }
-    if (voice_client_is_abort_requested()) {
-        ESP_LOGI(TAG, "voice_speak_internal: dropping fetched WAV (turn aborted by user)");
-        free(wav);
-        tool_audio_speaker_session_end();
         return;
     }
     if ((display_l1 && display_l1[0]) || (display_l2 && display_l2[0])) {
@@ -779,12 +752,6 @@ static void voice_run_command(void)
             return;
         }
 
-        /* Check for barge-in / abort */
-        if (voice_client_is_abort_requested()) {
-            ESP_LOGI(TAG, "[CMD] command window aborted by user interruption");
-            break;
-        }
-
         /* 2. Trailing silence cutoff (speech ended with >= 1.2s silence) */
         if (heard_speech && (speech_ms >= CMD_MIN_SPEECH_MS) && (now - last_speech_ms >= CMD_SILENCE_MS)) {
             ESP_LOGI(TAG, "[CMD] speech ended with %lld ms trailing silence (speech_ms=%u)",
@@ -800,14 +767,6 @@ static void voice_run_command(void)
     }
 
     tool_audio_capture_disarm();
-    if (voice_client_is_abort_requested()) {
-        ESP_LOGI(TAG, "[CMD] abort flag set — discarding captured command");
-        tool_audio_clear_cache();
-        s_busy = false;
-        s_busy_start_ms = 0;
-        display_status_idle();
-        return;
-    }
     uint32_t dur = (uint32_t)(esp_timer_get_time() / 1000) - (uint32_t)start_ms;
     ESP_LOGI(TAG, "[CMD] captured %u samples (%u ms)", (unsigned)total, (unsigned)dur);
 
@@ -962,11 +921,9 @@ static void voice_task(void *arg)
             }
         }
 
-        /* Pause while speaker plays, an audio recording session is active, or the
-         * post-playback echo guard is still active (amp tail + room reverb).
-         * NOTE: We do NOT pause merely because the agent is thinking/running tools (s_busy),
-         * allowing hands-free voice commands to be heard and to interrupt long operations! */
-        if (tool_audio_is_speaker_busy() || mic_guard_active() || tool_audio_is_busy()) {
+        /* Pause while speaker plays, agent is thinking/replying (half-duplex turn-taking),
+         * an audio recording session is active, or the post-playback echo guard is still active. */
+        if (s_busy || tool_audio_is_speaker_busy() || mic_guard_active() || tool_audio_is_busy()) {
             dbg_empties++;
             was_paused = true;
             consec_speech = 0;
@@ -1129,11 +1086,6 @@ static void voice_task(void *arg)
                      stt_res.wake_word ? stt_res.wake_word : "",
                      stt_res.raw_text ? stt_res.raw_text : "");
 
-            if (s_busy) {
-                ESP_LOGW(TAG, "*** WAKE WORD INTERRUPT: In-flight agent turn detected — requesting abort ***");
-                voice_client_request_abort();
-            }
-
             /* Feedback will be sent below depending on one-shot vs wake-only */
             display_status_set("Listening...", "");
 
@@ -1161,6 +1113,7 @@ static void voice_task(void *arg)
                     display_status_idle();
                 } else {
                     ESP_LOGI(TAG, "one-shot command queued to agent: %.60s", stt_res.text);
+                    tool_audio_ring_flush();
                     s_busy = true;
                     s_busy_start_ms = esp_timer_get_time() / 1000;
                     ESP_LOGI(TAG, "mic paused while agent is thinking/replying");
@@ -1203,13 +1156,6 @@ bool voice_client_speak(const char *text)
 
 bool voice_client_speak_with_display(const char *text, const char *line1, const char *line2)
 {
-    if (voice_client_is_abort_requested()) {
-        ESP_LOGI(TAG, "Skipping voice speak — aborted by user interruption");
-        tool_audio_clear_cache();
-        s_busy = false;
-        s_busy_start_ms = 0;
-        return false;
-    }
     if (!text || !*text) {
         tool_audio_clear_cache();
         s_busy = false;
