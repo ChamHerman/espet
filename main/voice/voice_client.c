@@ -843,7 +843,7 @@ static void voice_run_command(void)
     bool heard_speech = false;
 
     bool capturing = true;
-    while (capturing && s_running && !tool_audio_is_manual_active()) {
+    while (capturing && s_running && !tool_audio_is_manual_active() && !tool_audio_is_speaker_busy()) {
         size_t written = 0;
         bool full = false;
         capturing = tool_audio_rx_read(scratch, VAD_CHUNK_SAMPLES, &written,
@@ -893,6 +893,13 @@ static void voice_run_command(void)
     }
 
     tool_audio_capture_disarm();
+    if (tool_audio_was_capture_preempted()) {
+        ESP_LOGI(TAG, "[CMD] preempted by speaker playback — discarding partial command capture");
+        tool_audio_clear_cache();
+        s_vad_busy = false;
+        display_status_idle();
+        return;
+    }
     uint32_t dur = (uint32_t)(esp_timer_get_time() / 1000) - (uint32_t)start_ms;
     ESP_LOGI(TAG, "[CMD] captured %u samples (%u ms)", (unsigned)total, (unsigned)dur);
 
@@ -1147,7 +1154,7 @@ static void voice_task(void *arg)
             int64_t start_ms = last_voice_ms;
 
             bool capturing = true;
-            while (capturing && s_running) {
+            while (capturing && s_running && !tool_audio_is_speaker_busy()) {
                 size_t written = 0;
                 bool full = false;
                 capturing = tool_audio_rx_read(scratch, VAD_CHUNK_SAMPLES, &written,
@@ -1176,6 +1183,11 @@ static void voice_task(void *arg)
             }
 
             tool_audio_capture_disarm();
+            if (tool_audio_was_capture_preempted()) {
+                ESP_LOGI(TAG, "[utterance] preempted by speaker playback — discarding partial capture");
+                s_vad_busy = false;
+                continue;
+            }
             uint32_t dur = (uint32_t)(esp_timer_get_time() / 1000) - (uint32_t)start_ms;
             ESP_LOGI(TAG, "[utterance] captured %u samples (%u ms)", (unsigned)total, (unsigned)dur);
 

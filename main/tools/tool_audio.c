@@ -131,6 +131,8 @@ static portMUX_TYPE      s_audio_mux            = portMUX_INITIALIZER_UNLOCKED;
 static SemaphoreHandle_t s_tx_mutex             = NULL; /* serializes I2S TX only */
 static volatile bool     s_recording            = false;
 static volatile bool     s_manual_owner         = false;
+static volatile bool     s_timed_capture        = false;
+static volatile bool     s_vad_aborted          = false;
 static volatile bool     s_pcm_locked           = false;
 static volatile uint32_t s_pcm_lock_ms          = 0;
 static volatile bool     s_playing              = false;
@@ -465,6 +467,32 @@ static void audio_tx_drain_dma(int32_t *zero_chunk)
     }
 }
 
+static bool audio_preempt_vad_if_needed(const char *caller)
+{
+    bool busy = false;
+    bool preempted = false;
+    taskENTER_CRITICAL(&s_audio_mux);
+    if (s_recording) {
+        if (s_manual_owner || s_timed_capture) {
+            busy = true;
+        } else {
+            s_recording = false;
+            s_vad_aborted = true;
+            s_capture_max = AUDIO_MAX_SAMPLES;
+            preempted = true;
+        }
+    }
+    taskEXIT_CRITICAL(&s_audio_mux);
+
+    if (preempted) {
+        s_record_duration_ms = (uint32_t)(esp_timer_get_time() / 1000) - s_record_start_ms;
+        ESP_LOGW(TAG, "%s: preempted background VAD capture for speaker playback", caller);
+    } else if (busy) {
+        ESP_LOGW(TAG, "%s: busy (manual=%d timed=%d)", caller, s_manual_owner, s_timed_capture);
+    }
+    return !busy;
+}
+
 /* Generate and play a sine tone. Blocking for duration_ms.
  * Serialized by s_tx_mutex and gated via s_audio_mux so concurrent callers
  * cannot interleave writes or clobber an active speaker session. */
@@ -489,8 +517,7 @@ static esp_err_t play_tone_wait(uint32_t freq_hz, uint32_t duration_ms,
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (s_recording) {
-        ESP_LOGW(TAG, "play_tone: busy (recording=1)");
+    if (!audio_preempt_vad_if_needed("play_tone")) {
         xSemaphoreGive(s_tx_mutex);
         return ESP_ERR_INVALID_STATE;
     }
@@ -863,10 +890,12 @@ static esp_err_t timed_capture(uint32_t duration_ms, size_t *out_n, uint32_t *ou
     s_capture_max = (duration_ms * (AUDIO_SAMPLE_RATE / 1000));
     if (s_capture_max > AUDIO_MAX_SAMPLES) s_capture_max = AUDIO_MAX_SAMPLES;
     s_record_start_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    s_timed_capture = true;
     s_recording = true;
 
     vTaskDelay(pdMS_TO_TICKS(duration_ms));
     s_recording = false;
+    s_timed_capture = false;
     s_record_duration_ms = (uint32_t)(esp_timer_get_time() / 1000) - s_record_start_ms;
 
     size_t n = s_pcm_samples_captured;
@@ -940,6 +969,7 @@ bool tool_audio_capture_arm_preroll(size_t max_samples, size_t preroll_samples)
     if (!s_i2s_initialized || s_recording || s_playing || s_speaker_busy || s_manual_owner || s_pcm_locked) {
         return false;
     }
+    s_vad_aborted = false;
     s_pcm_samples_captured = 0;
     s_capture_max = (max_samples > AUDIO_MAX_SAMPLES) ? AUDIO_MAX_SAMPLES : max_samples;
     s_record_start_ms = (uint32_t)(esp_timer_get_time() / 1000);
@@ -958,7 +988,14 @@ bool tool_audio_capture_arm_preroll(size_t max_samples, size_t preroll_samples)
         }
         s_rx_ring_r = s_rx_ring_w;
     }
+    taskENTER_CRITICAL(&s_audio_mux);
+    if (s_playing || s_speaker_busy || s_manual_owner || s_timed_capture) {
+        taskEXIT_CRITICAL(&s_audio_mux);
+        return false;
+    }
+    s_vad_aborted = false;
     s_recording = true;
+    taskEXIT_CRITICAL(&s_audio_mux);
     return true;
 }
 
@@ -972,6 +1009,9 @@ bool tool_audio_rx_read(int16_t *out, size_t max_out, size_t *out_written,
 {
     *out_written = 0;
     if (out_full) *out_full = false;
+    if (s_vad_aborted) {
+        return false;
+    }
     if (!s_rx_ring) {
         return s_recording;
     }
@@ -980,7 +1020,7 @@ bool tool_audio_rx_read(int16_t *out, size_t max_out, size_t *out_written,
      * owner (direct DMA reads here used to race it: dual consumers each got
      * half the audio). Armed mode additionally mirrors into s_pcm_buf. */
     int64_t deadline = (int64_t)(esp_timer_get_time() / 1000) + timeout_ms;
-    while (*out_written < max_out) {
+    while (*out_written < max_out && !s_vad_aborted) {
         if (s_rx_ring_w == s_rx_ring_r) {
             if (*out_written > 0 ||
                 (int64_t)(esp_timer_get_time() / 1000) >= deadline) {
@@ -1005,6 +1045,9 @@ bool tool_audio_rx_read(int16_t *out, size_t max_out, size_t *out_written,
             *captured_total = 0;
         }
     }
+    if (s_vad_aborted) {
+        return false;
+    }
     if (s_recording && captured_total) {
         *captured_total = s_pcm_samples_captured;
     }
@@ -1021,6 +1064,11 @@ void tool_audio_capture_disarm(void)
     s_recording = false;
     s_record_duration_ms = (uint32_t)(esp_timer_get_time() / 1000) - s_record_start_ms;
     s_capture_max = AUDIO_MAX_SAMPLES;
+}
+
+bool tool_audio_was_capture_preempted(void)
+{
+    return s_vad_aborted;
 }
 
 /* =======================================================================
@@ -1241,7 +1289,9 @@ static esp_err_t audio_play_tone_execute(const char *input_json, char *output, s
         }
     }
 
+    tool_audio_speaker_session_begin();
     esp_err_t err = play_tone(freq_hz, duration_ms, vol);
+    tool_audio_speaker_session_end();
     if (err == ESP_OK) {
         snprintf(output, output_size,
                  "Tone played: %lu Hz for %lu ms (volume %.2f) on MAX98357A (GPIO %d).",
@@ -1398,9 +1448,8 @@ esp_err_t tool_audio_play_wav_turn(const uint8_t *wav, size_t len, uint32_t turn
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (s_recording) {
+    if (!audio_preempt_vad_if_needed("play_wav")) {
         xSemaphoreGive(s_tx_mutex);
-        ESP_LOGW(TAG, "play_wav: busy (recording=1)");
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -1568,8 +1617,8 @@ static esp_err_t audio_spktest_execute(const char *input_json, char *output, siz
         snprintf(output, output_size, "Error: audio not initialized.");
         return ESP_FAIL;
     }
-    if (s_recording || s_playing) {
-        snprintf(output, output_size, "Error: audio busy (recording or playing).");
+    if (s_playing || s_speaker_busy || s_manual_owner || s_timed_capture) {
+        snprintf(output, output_size, "Error: audio busy (manual/test recording or speaker already active).");
         return ESP_ERR_INVALID_STATE;
     }
 

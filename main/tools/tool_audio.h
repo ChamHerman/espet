@@ -120,6 +120,11 @@ bool tool_audio_rx_read(int16_t *out, size_t max_out, size_t *out_written,
  */
 void tool_audio_capture_disarm(void);
 
+/**
+ * @brief Return true if the most recent armed capture was preempted by speaker playback.
+ */
+bool tool_audio_was_capture_preempted(void);
+
 /* -----------------------------------------------------------------------
  * RX stream (ring buffer) — feeds the WakeNet listener gap-free audio
  * --------------------------------------------------------------------- */
