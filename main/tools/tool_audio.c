@@ -52,6 +52,7 @@
 #include "driver/i2s_std.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "cJSON.h"
 #include "voice/voice_client.h"
 
@@ -104,6 +105,9 @@ static const char *TAG = "tool_audio";
 #define AUDIO_TX_CHUNK_FRAMES   256     /* 16 ms per write chunk */
 #define AUDIO_TX_CHUNK_BYTES    (AUDIO_TX_CHUNK_FRAMES * 2 * sizeof(int32_t))
 #define AUDIO_TX_WRITE_TIMEOUT_MS 1000
+#define AUDIO_TX_DRAIN_CHUNKS   10      /* 10 x 16 ms = 160 ms (> 4x512=128 ms DMA ring) */
+#define AUDIO_TX_WAIT_WAV_MS    10000
+#define AUDIO_TX_WAIT_TONE_MS   1500
 
 #define TONE_DEFAULT_FREQ_HZ    440
 #define TONE_MIN_FREQ_HZ        20
@@ -123,13 +127,21 @@ static bool              s_i2s_initialized = false;
 /* -----------------------------------------------------------------------
  * Capture / playback state
  * --------------------------------------------------------------------- */
-static volatile bool s_recording              = false;
-static volatile bool s_playing                = false;
-/* Whole speaker-session gate: set BEFORE the TTS HTTP download and cleared
- * after playback. The RX feeder parks for the entire session — racing only
- * the playback phase still corrupted TX (field: noise burst instead of
- * speech, "ESPeting..."). */
+static portMUX_TYPE      s_audio_mux            = portMUX_INITIALIZER_UNLOCKED;
+static SemaphoreHandle_t s_tx_mutex             = NULL; /* serializes I2S TX only */
+static volatile bool     s_recording            = false;
+static volatile bool     s_playing              = false;
+static int               s_speaker_session_depth = 0;   /* refcounted session gate */
+static bool              s_cache_clearing       = false;
+/* Whole speaker-session gate: derived from s_speaker_session_depth, s_playing,
+ * and s_cache_clearing under s_audio_mux. The RX feeder parks for the entire
+ * session (TTS download + playback + DMA tail). */
 static volatile bool s_speaker_busy           = false;
+
+static inline void audio_sync_speaker_busy_locked(void)
+{
+    s_speaker_busy = (s_speaker_session_depth > 0) || s_playing || s_cache_clearing;
+}
 static int16_t      *s_pcm_buf                = NULL; /* PSRAM — mono 16-bit */
 static size_t        s_pcm_samples_captured   = 0;
 static size_t        s_capture_max            = 0; /* armed capture limit */
@@ -417,6 +429,16 @@ esp_err_t tool_audio_init(void)
         i2s_channel_disable(s_tx_handle);
         goto fail;
     }
+    if (!s_tx_mutex) {
+        s_tx_mutex = xSemaphoreCreateMutex();
+        if (!s_tx_mutex) {
+            ESP_LOGE(TAG, "Failed to create TX mutex");
+            i2s_channel_disable(s_rx_handle);
+            i2s_channel_disable(s_tx_handle);
+            err = ESP_ERR_NO_MEM;
+            goto fail;
+        }
+    }
     s_i2s_initialized = true;
     ESP_LOGI(TAG, "[4/4] tool_audio_init COMPLETE — TX and RX enabled");
     ESP_LOGI(TAG, "  Say \"Hi ESP\" to wake the voice assistant.");
@@ -450,15 +472,30 @@ static void tone_fill_chunk(int32_t *chunk, size_t frames,
     }
 }
 
-/* Generate and play a sine tone. Blocking for duration_ms.
- * Guarded by s_playing so concurrent callers can't interleave writes. */
-static esp_err_t play_tone(uint32_t freq_hz, uint32_t duration_ms, float vol)
+/* Drain TX DMA ring with silence so mic_feeder_task never unparks while
+ * the final audio descriptors are still shifting out to MAX98357A. */
+static void audio_tx_drain_dma(int32_t *zero_chunk)
 {
-    if (!s_i2s_initialized || !s_tx_handle) {
-        return ESP_ERR_INVALID_STATE;
+    if (!s_tx_handle || !zero_chunk) {
+        return;
     }
-    if (s_playing || s_recording) {
-        ESP_LOGW(TAG, "play_tone: busy (recording=%d playing=%d)", (int)s_recording, (int)s_playing);
+    memset(zero_chunk, 0, AUDIO_TX_CHUNK_BYTES);
+    for (int i = 0; i < AUDIO_TX_DRAIN_CHUNKS; i++) {
+        size_t written = 0;
+        if (i2s_channel_write(s_tx_handle, zero_chunk, AUDIO_TX_CHUNK_BYTES,
+                              &written, AUDIO_TX_WRITE_TIMEOUT_MS) != ESP_OK) {
+            break;
+        }
+    }
+}
+
+/* Generate and play a sine tone. Blocking for duration_ms.
+ * Serialized by s_tx_mutex and gated via s_audio_mux so concurrent callers
+ * cannot interleave writes or clobber an active speaker session. */
+static esp_err_t play_tone_wait(uint32_t freq_hz, uint32_t duration_ms,
+                                float vol, uint32_t wait_ms)
+{
+    if (!s_i2s_initialized || !s_tx_handle || !s_tx_mutex) {
         return ESP_ERR_INVALID_STATE;
     }
     if (freq_hz < TONE_MIN_FREQ_HZ || freq_hz > TONE_MAX_FREQ_HZ) {
@@ -467,17 +504,33 @@ static esp_err_t play_tone(uint32_t freq_hz, uint32_t duration_ms, float vol)
     if (duration_ms == 0 || duration_ms > TONE_MAX_MS) {
         return ESP_ERR_INVALID_ARG;
     }
+    if (!(vol > 0.0f && vol <= TONE_MAX_VOL)) {
+        return ESP_ERR_INVALID_ARG;
+    }
 
+    if (xSemaphoreTake(s_tx_mutex, pdMS_TO_TICKS(wait_ms)) != pdTRUE) {
+        ESP_LOGW(TAG, "play_tone: TX mutex busy (wait=%lu ms)", (unsigned long)wait_ms);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (s_recording) {
+        ESP_LOGW(TAG, "play_tone: busy (recording=1)");
+        xSemaphoreGive(s_tx_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    taskENTER_CRITICAL(&s_audio_mux);
     s_playing = true;
-    /* Gate the mic for the whole tone: the feeder parks via s_speaker_busy.
-     * (Ungated beeps raced the mic feeder — field: the 220 Hz error beep came
-     * out as a blur of noise instead of a tone.) */
-    s_speaker_busy = true;
+    audio_sync_speaker_busy_locked();
+    taskEXIT_CRITICAL(&s_audio_mux);
 
     int32_t *chunk = (int32_t *)malloc(AUDIO_TX_CHUNK_BYTES);
     if (!chunk) {
+        taskENTER_CRITICAL(&s_audio_mux);
         s_playing = false;
-        s_speaker_busy = false;
+        audio_sync_speaker_busy_locked();
+        taskEXIT_CRITICAL(&s_audio_mux);
+        xSemaphoreGive(s_tx_mutex);
         return ESP_ERR_NO_MEM;
     }
 
@@ -508,14 +561,26 @@ static esp_err_t play_tone(uint32_t freq_hz, uint32_t duration_ms, float vol)
         played_frames += written / (2 * sizeof(int32_t));
     }
 
+    if (err == ESP_OK) {
+        audio_tx_drain_dma(chunk);
+    }
+
     free(chunk);
+    taskENTER_CRITICAL(&s_audio_mux);
     s_playing = false;
-    s_speaker_busy = false;
+    audio_sync_speaker_busy_locked();
+    taskEXIT_CRITICAL(&s_audio_mux);
+    xSemaphoreGive(s_tx_mutex);
 
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "[SPK] Tone done (%u frames)", (unsigned)played_frames);
     }
     return err;
+}
+
+static esp_err_t play_tone(uint32_t freq_hz, uint32_t duration_ms, float vol)
+{
+    return play_tone_wait(freq_hz, duration_ms, vol, AUDIO_TX_WAIT_TONE_MS);
 }
 
 /* Capture is handled directly by mic_feeder_task (single I2S DMA reader) */
@@ -761,24 +826,44 @@ void tool_audio_clear_cache(void)
     if (!s_i2s_initialized) {
         return;
     }
-    bool was_busy = s_speaker_busy;
-    s_speaker_busy = true;
+    taskENTER_CRITICAL(&s_audio_mux);
+    s_cache_clearing = true;
+    audio_sync_speaker_busy_locked();
+    taskEXIT_CRITICAL(&s_audio_mux);
+
     vTaskDelay(pdMS_TO_TICKS(15));
     tool_audio_rx_flush();
     tool_audio_ring_flush();
-    s_speaker_busy = was_busy;
+
+    taskENTER_CRITICAL(&s_audio_mux);
+    s_cache_clearing = false;
+    audio_sync_speaker_busy_locked();
+    taskEXIT_CRITICAL(&s_audio_mux);
 }
 
 void tool_audio_speaker_session_begin(void)
 {
-    s_speaker_busy = true;
+    taskENTER_CRITICAL(&s_audio_mux);
+    s_speaker_session_depth++;
+    audio_sync_speaker_busy_locked();
+    taskEXIT_CRITICAL(&s_audio_mux);
 }
 
 void tool_audio_speaker_session_end(void)
 {
-    tool_audio_rx_flush();
-    tool_audio_ring_flush();
-    s_speaker_busy = false;
+    bool reached_zero = false;
+    taskENTER_CRITICAL(&s_audio_mux);
+    if (s_speaker_session_depth > 0) {
+        s_speaker_session_depth--;
+    }
+    reached_zero = (s_speaker_session_depth == 0);
+    audio_sync_speaker_busy_locked();
+    taskEXIT_CRITICAL(&s_audio_mux);
+
+    if (reached_zero) {
+        tool_audio_rx_flush();
+        tool_audio_ring_flush();
+    }
 }
 
 /* =======================================================================
@@ -844,7 +929,11 @@ bool tool_audio_is_busy(void)
 
 bool tool_audio_is_speaker_busy(void)
 {
-    return s_playing || s_speaker_busy;
+    bool busy;
+    taskENTER_CRITICAL(&s_audio_mux);
+    busy = s_playing || s_speaker_busy;
+    taskEXIT_CRITICAL(&s_audio_mux);
+    return busy;
 }
 
 
@@ -1213,16 +1302,16 @@ static esp_err_t audio_record_test_execute(const char *input_json, char *output,
  * must go on, but the log tells you why it sounds funny.
  * ===================================================================== */
 
-esp_err_t tool_audio_play_wav(const uint8_t *wav, size_t len)
+esp_err_t tool_audio_play_wav_turn(const uint8_t *wav, size_t len, uint32_t turn_gen)
 {
-    if (!s_i2s_initialized || !s_tx_handle) {
+    if (!s_i2s_initialized || !s_tx_handle || !s_tx_mutex) {
         return ESP_ERR_INVALID_STATE;
     }
     if (!wav || len < 44) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (s_playing || s_recording) {
-        ESP_LOGW(TAG, "play_wav: busy (recording=%d playing=%d)", (int)s_recording, (int)s_playing);
+    if (turn_gen != 0 && voice_client_is_turn_aborted(turn_gen)) {
+        ESP_LOGW(TAG, "play_wav: skipping already-aborted turn gen=%lu", (unsigned long)turn_gen);
         return ESP_ERR_INVALID_STATE;
     }
     if (memcmp(wav, "RIFF", 4) != 0 || memcmp(wav + 8, "WAVE", 4) != 0) {
@@ -1239,7 +1328,7 @@ esp_err_t tool_audio_play_wav(const uint8_t *wav, size_t len)
     while (idx + 8 <= len) {
         uint32_t clen;
         memcpy(&clen, wav + idx + 4, 4);
-        if (memcmp(wav + idx, "fmt ", 4) == 0 && idx + 16 + 4 <= len) {
+        if (memcmp(wav + idx, "fmt ", 4) == 0 && idx + 24 <= len) {
             uint16_t audio_fmt;
             memcpy(&audio_fmt, wav + idx + 8, 2);
             memcpy(&channels,  wav + idx + 10, 2);
@@ -1263,6 +1352,10 @@ esp_err_t tool_audio_play_wav(const uint8_t *wav, size_t len)
         ESP_LOGE(TAG, "play_wav: no data chunk found");
         return ESP_ERR_INVALID_ARG;
     }
+    if (channels != 1 && channels != 2) {
+        ESP_LOGE(TAG, "play_wav: unsupported channel count %u (need 1 or 2)", channels);
+        return ESP_ERR_INVALID_ARG;
+    }
     if (bits != 16) {
         ESP_LOGE(TAG, "play_wav: unsupported bit depth %u (need 16)", bits);
         return ESP_ERR_INVALID_ARG;
@@ -1272,12 +1365,32 @@ esp_err_t tool_audio_play_wav(const uint8_t *wav, size_t len)
                  (unsigned long)sample_rate, AUDIO_SAMPLE_RATE);
     }
 
+    if (xSemaphoreTake(s_tx_mutex, pdMS_TO_TICKS(AUDIO_TX_WAIT_WAV_MS)) != pdTRUE) {
+        ESP_LOGW(TAG, "play_wav: TX mutex busy (timeout %d ms)", AUDIO_TX_WAIT_WAV_MS);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (turn_gen != 0 && voice_client_is_turn_aborted(turn_gen)) {
+        xSemaphoreGive(s_tx_mutex);
+        ESP_LOGW(TAG, "play_wav: turn gen=%lu aborted while waiting for TX", (unsigned long)turn_gen);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (s_recording) {
+        xSemaphoreGive(s_tx_mutex);
+        ESP_LOGW(TAG, "play_wav: busy (recording=1)");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    taskENTER_CRITICAL(&s_audio_mux);
     s_playing = true;
     /* Gate the mic for the whole playback (feeder parks via s_speaker_busy).
      * voice_client wraps TTS in a wider session (download + play), but the
      * ack/beeps/other callers relied on this alone — ungated playback raced
      * the mic feeder (field: noise burst instead of speech). */
-    s_speaker_busy = true;
+    audio_sync_speaker_busy_locked();
+    taskEXIT_CRITICAL(&s_audio_mux);
+
     ESP_LOGI(TAG, "[SPK] WAV playback: data=%u bytes (~%lu ms), %lu Hz, %u ch, %u bit",
              (unsigned)data_len,
              (unsigned long)((uint64_t)data_len / (channels * 2) * 1000 / sample_rate),
@@ -1289,14 +1402,26 @@ esp_err_t tool_audio_play_wav(const uint8_t *wav, size_t len)
     /* --- stream frames: mono duplicated to both slots, stereo → left --- */
     int32_t *chunk = (int32_t *)malloc(AUDIO_TX_CHUNK_BYTES);
     if (!chunk) {
+        taskENTER_CRITICAL(&s_audio_mux);
         s_playing = false;
-        s_speaker_busy = false;
+        audio_sync_speaker_busy_locked();
+        taskEXIT_CRITICAL(&s_audio_mux);
+        xSemaphoreGive(s_tx_mutex);
         return ESP_ERR_NO_MEM;
     }
 
     size_t played = 0;
+    bool aborted = false;
     esp_err_t err = ESP_OK;
     while (played < data_len) {
+        if (turn_gen != 0 && voice_client_is_turn_aborted(turn_gen)) {
+            ESP_LOGW(TAG, "[SPK] WAV playback interrupted (turn gen=%lu aborted)",
+                     (unsigned long)turn_gen);
+            aborted = true;
+            err = ESP_ERR_INVALID_STATE;
+            break;
+        }
+
         size_t frames = AUDIO_TX_CHUNK_FRAMES;
         size_t need;
         if (channels == 2) {
@@ -1315,9 +1440,8 @@ esp_err_t tool_audio_play_wav(const uint8_t *wav, size_t len)
 
         const int16_t *src = (const int16_t *)(wav + data_off + played);
         for (size_t f = 0; f < frames; f++) {
-            int32_t v = (channels == 2)
-                            ? ((int32_t)src[f * 2]) << 16          /* left slot */
-                            : ((int32_t)src[f]) << 16;
+            int16_t sample = (channels == 2) ? src[f * 2] : src[f];
+            int32_t v = (int32_t)((uint32_t)(uint16_t)sample << 16);
             chunk[f * 2]     = v;
             chunk[f * 2 + 1] = v;
         }
@@ -1334,18 +1458,30 @@ esp_err_t tool_audio_play_wav(const uint8_t *wav, size_t len)
                                   : frames * sizeof(int16_t);
     }
 
+    if (!aborted && err == ESP_OK) {
+        audio_tx_drain_dma(chunk);
+    }
+
     free(chunk);
+    taskENTER_CRITICAL(&s_audio_mux);
     s_playing = false;
-    s_speaker_busy = false;
+    audio_sync_speaker_busy_locked();
+    taskEXIT_CRITICAL(&s_audio_mux);
+    xSemaphoreGive(s_tx_mutex);
     ESP_LOGI(TAG, "[SPK] WAV done (%u bytes played)", (unsigned)played);
     return err;
+}
+
+esp_err_t tool_audio_play_wav(const uint8_t *wav, size_t len)
+{
+    return tool_audio_play_wav_turn(wav, len, 0);
 }
 
 /* Public beep helper — short feedback cue (record start / pipeline states).
  * Safe no-op when the bus is busy. */
 void tool_audio_beep(uint32_t freq_hz, uint32_t duration_ms, float vol)
 {
-    play_tone(freq_hz, duration_ms, vol);
+    play_tone_wait(freq_hz, duration_ms, vol, 0);
 }
 
 /* =======================================================================
@@ -1418,6 +1554,8 @@ static esp_err_t audio_spktest_execute(const char *input_json, char *output, siz
     bool s1 = false, s2 = false, s4 = false;
     esp_err_t err;
 
+    tool_audio_speaker_session_begin();
+
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "╔══════════ SPEAKER TEST — 4 STAGES ══════════╗");
     ESP_LOGI(TAG, "╚══════════════════════════════════════════════╝");
@@ -1461,6 +1599,8 @@ static esp_err_t audio_spktest_execute(const char *input_json, char *output, siz
     if (!s4) {
         ESP_LOGE(TAG, "  stage 4 could not start (pipeline busy) — see voice: logs");
     }
+
+    tool_audio_speaker_session_end();
 
     /* ---- verdict guidance ---- */
     const char *verdict;

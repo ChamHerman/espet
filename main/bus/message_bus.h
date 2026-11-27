@@ -17,6 +17,7 @@ typedef struct {
     char channel[16];       /* "telegram", "websocket", "cli" */
     char chat_id[96];       /* Telegram/Feishu chat_id, open_id, or WS client id */
     char *content;          /* Heap-allocated message text (caller must free) */
+    uint32_t turn_gen;      /* 0 = non-cancellable; >0 = monotonic turn generation */
 } mimi_msg_t;
 
 /**

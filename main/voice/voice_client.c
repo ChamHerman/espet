@@ -107,11 +107,113 @@ static StackType_t         *s_voice_stack    = NULL;  /* PSRAM-allocated */
 static StaticTask_t        *s_voice_tcb      = NULL;  /* internal RAM */
 static volatile bool        s_running        = false;
 static volatile bool        s_listen_enabled = true;  /* autonomous VAD listener toggle (always on by default) */
-static volatile bool        s_busy           = false;  /* pipeline in flight */
-static int64_t              s_busy_start_ms  = 0;      /* watchdog timer for agent thinking */
-static volatile int64_t     s_mic_guard_until_ms = 0;  /* post-playback echo guard deadline */
-static uint8_t             *s_ack_wav        = NULL;   /* "Yes?" cache */
+static portMUX_TYPE         s_voice_mux      = portMUX_INITIALIZER_UNLOCKED;
+static volatile bool        s_vad_busy       = false; /* VAD capture / STT / command window in flight */
+static volatile bool        s_agent_turn_active = false; /* agent/outbound turn in flight */
+static int64_t              s_turn_start_ms  = 0;     /* watchdog timer for active agent turn */
+static uint32_t             s_next_turn_gen  = 0;     /* monotonic turn generation generator */
+static uint32_t             s_active_turn_gen = 0;    /* currently active turn generation */
+static volatile uint32_t    s_aborted_gen    = 0;     /* highest aborted turn generation */
+static volatile bool        s_has_aborted    = false; /* true once an abort has been issued */
+static volatile int64_t     s_mic_guard_until_ms = 0; /* post-playback echo guard deadline */
+static uint8_t             *s_ack_wav        = NULL;  /* "Yes?" cache */
 static size_t               s_ack_wav_len    = 0;
+
+static uint32_t voice_next_turn_gen_locked(void)
+{
+    s_next_turn_gen++;
+    if (s_next_turn_gen == 0) {
+        s_next_turn_gen = 1;
+    }
+    return s_next_turn_gen;
+}
+
+uint32_t voice_client_turn_begin(uint32_t turn_gen)
+{
+    int64_t now = esp_timer_get_time() / 1000;
+    taskENTER_CRITICAL(&s_voice_mux);
+    if (turn_gen == 0) {
+        turn_gen = voice_next_turn_gen_locked();
+    }
+    bool already_aborted = s_has_aborted && ((int32_t)(s_aborted_gen - turn_gen) >= 0);
+    if (!already_aborted) {
+        if (!s_agent_turn_active || (int32_t)(turn_gen - s_active_turn_gen) >= 0) {
+            s_agent_turn_active = true;
+            s_active_turn_gen = turn_gen;
+            s_turn_start_ms = now;
+        }
+    }
+    taskEXIT_CRITICAL(&s_voice_mux);
+    return turn_gen;
+}
+
+void voice_client_turn_finished(uint32_t turn_gen)
+{
+    if (turn_gen == 0) {
+        return;
+    }
+    taskENTER_CRITICAL(&s_voice_mux);
+    if (s_agent_turn_active && s_active_turn_gen == turn_gen) {
+        s_agent_turn_active = false;
+        s_active_turn_gen = 0;
+        s_turn_start_ms = 0;
+    }
+    taskEXIT_CRITICAL(&s_voice_mux);
+}
+
+void voice_client_request_abort(uint32_t turn_gen)
+{
+    if (turn_gen == 0) {
+        return;
+    }
+    bool updated = false;
+    taskENTER_CRITICAL(&s_voice_mux);
+    if (!s_has_aborted || (int32_t)(turn_gen - s_aborted_gen) > 0) {
+        s_aborted_gen = turn_gen;
+        s_has_aborted = true;
+        updated = true;
+    }
+    if (s_agent_turn_active && (int32_t)(s_aborted_gen - s_active_turn_gen) >= 0) {
+        s_agent_turn_active = false;
+        s_active_turn_gen = 0;
+        s_turn_start_ms = 0;
+    }
+    taskEXIT_CRITICAL(&s_voice_mux);
+    if (updated) {
+        ESP_LOGW(TAG, "Voice interruption requested — aborting turn gen=%lu",
+                 (unsigned long)turn_gen);
+    }
+}
+
+bool voice_client_is_turn_aborted(uint32_t turn_gen)
+{
+    if (turn_gen == 0) {
+        return false;
+    }
+    bool aborted;
+    taskENTER_CRITICAL(&s_voice_mux);
+    aborted = s_has_aborted && ((int32_t)(s_aborted_gen - turn_gen) >= 0);
+    taskEXIT_CRITICAL(&s_voice_mux);
+    return aborted;
+}
+
+static uint32_t voice_abort_if_turn_active(void)
+{
+    uint32_t aborted_gen = 0;
+    taskENTER_CRITICAL(&s_voice_mux);
+    if (s_agent_turn_active && s_active_turn_gen != 0) {
+        aborted_gen = s_active_turn_gen;
+        if (!s_has_aborted || (int32_t)(aborted_gen - s_aborted_gen) > 0) {
+            s_aborted_gen = aborted_gen;
+            s_has_aborted = true;
+        }
+        s_agent_turn_active = false;
+        s_active_turn_gen = 0;
+        s_turn_start_ms = 0;
+    }
+    taskEXIT_CRITICAL(&s_voice_mux);
+    return aborted_gen;
+}
 
 /* -----------------------------------------------------------------------
  * Signal Processing Helpers
@@ -647,8 +749,13 @@ static uint8_t *voice_tts_fetch(const char *text, size_t *out_len,
     return wav;
 }
 
-static void voice_speak_internal(const char *text, const char *display_l1, const char *display_l2)
+static void voice_speak_internal(const char *text, const char *display_l1,
+                                 const char *display_l2, uint32_t turn_gen)
 {
+    if (turn_gen != 0 && voice_client_is_turn_aborted(turn_gen)) {
+        return;
+    }
+
     tool_audio_speaker_session_begin();
     size_t wav_len = 0;
     char fetched_l1[17] = {0};
@@ -656,7 +763,14 @@ static void voice_speak_internal(const char *text, const char *display_l1, const
     uint8_t *wav = voice_tts_fetch(text, &wav_len, fetched_l1, sizeof(fetched_l1), fetched_l2, sizeof(fetched_l2));
     if (!wav) {
         tool_audio_speaker_session_end();
-        tool_audio_beep(BEEP_ERR_HZ, BEEP_MS * 2, BEEP_VOL);
+        if (turn_gen == 0 || !voice_client_is_turn_aborted(turn_gen)) {
+            tool_audio_beep(BEEP_ERR_HZ, BEEP_MS * 2, BEEP_VOL);
+        }
+        return;
+    }
+    if (turn_gen != 0 && voice_client_is_turn_aborted(turn_gen)) {
+        free(wav);
+        tool_audio_speaker_session_end();
         return;
     }
     if ((display_l1 && display_l1[0]) || (display_l2 && display_l2[0])) {
@@ -671,10 +785,15 @@ static void voice_speak_internal(const char *text, const char *display_l1, const
             display_status_set_text_timed(l1, l2, 8000);
         }
     }
-    esp_err_t perr = tool_audio_play_wav(wav, wav_len);
+    esp_err_t perr = tool_audio_play_wav_turn(wav, wav_len, turn_gen);
     free(wav);
     tool_audio_speaker_session_end();
     if (perr != ESP_OK) {
+        if (turn_gen != 0 && voice_client_is_turn_aborted(turn_gen)) {
+            ESP_LOGW(TAG, "WAV playback interrupted for aborted turn gen=%lu",
+                     (unsigned long)turn_gen);
+            return;
+        }
         ESP_LOGE(TAG, "WAV playback failed: %s", esp_err_to_name(perr));
     }
     /* Extend hold for 5 seconds after speech completes (Speech Duration + 5s buffer) */
@@ -699,8 +818,7 @@ static void voice_run_command(void)
     if (!tool_audio_capture_arm(CMD_MAX_SAMPLES)) {
         ESP_LOGW(TAG, "command capture could not arm (bus busy)");
         tool_audio_clear_cache();
-        s_busy = false;
-        s_busy_start_ms = 0;
+        s_vad_busy = false;
         display_status_idle();
         return;
     }
@@ -746,8 +864,7 @@ static void voice_run_command(void)
             telegram_send_to_last_chat("⏱️ Listening timed out (no speech heard).");
             tool_audio_beep(BEEP_TIMEOUT_HZ, BEEP_MS, BEEP_VOL);
             tool_audio_clear_cache();
-            s_busy = false;
-            s_busy_start_ms = 0;
+            s_vad_busy = false;
             display_status_idle();
             return;
         }
@@ -775,8 +892,7 @@ static void voice_run_command(void)
         telegram_send_to_last_chat("⚠️ Command too short or unclear.");
         tool_audio_beep(BEEP_TIMEOUT_HZ, BEEP_MS, BEEP_VOL);
         tool_audio_clear_cache();
-        s_busy = false;
-        s_busy_start_ms = 0;
+        s_vad_busy = false;
         display_status_idle();
         return;
     }
@@ -785,8 +901,7 @@ static void voice_run_command(void)
     const int16_t *pcm = tool_audio_get_last_capture(&samples, &dur);
     if (!pcm) {
         tool_audio_clear_cache();
-        s_busy = false;
-        s_busy_start_ms = 0;
+        s_vad_busy = false;
         display_status_idle();
         return;
     }
@@ -801,8 +916,7 @@ static void voice_run_command(void)
         telegram_send_to_last_chat("⚠️ Speech recognition failed or backend unavailable.");
         tool_audio_beep(BEEP_TIMEOUT_HZ, BEEP_MS, BEEP_VOL);
         tool_audio_clear_cache();
-        s_busy = false;
-        s_busy_start_ms = 0;
+        s_vad_busy = false;
         display_status_idle();
         return;
     }
@@ -836,8 +950,7 @@ static void voice_run_command(void)
         telegram_send_to_last_chat("⚠️ Didn't catch that. Please speak again.");
         tool_audio_beep(BEEP_TIMEOUT_HZ, BEEP_MS, BEEP_VOL);
         tool_audio_clear_cache();
-        s_busy = false;
-        s_busy_start_ms = 0;
+        s_vad_busy = false;
         display_status_idle();
         return;
     }
@@ -847,24 +960,25 @@ static void voice_run_command(void)
     snprintf(you_msg, sizeof(you_msg), "🗣️ You: \"%s\"", cmd_text);
     telegram_send_to_last_chat(you_msg);
 
+    uint32_t new_gen = voice_client_turn_begin(0);
     mimi_msg_t msg = {0};
     strlcpy(msg.channel, MIMI_CHAN_SYSTEM, sizeof(msg.channel));
     strlcpy(msg.chat_id, "voice", sizeof(msg.chat_id));
     msg.content = cmd_text;                    /* bus takes ownership */
+    msg.turn_gen = new_gen;
     esp_err_t perr = message_bus_push_inbound(&msg);
     if (perr != ESP_OK) {
         ESP_LOGE(TAG, "inbound push failed: %s", esp_err_to_name(perr));
         free(cmd_text);
+        voice_client_turn_finished(new_gen);
         tool_audio_clear_cache();
-        s_busy = false;
-        s_busy_start_ms = 0;
+        s_vad_busy = false;
         display_status_idle();
     } else {
-        ESP_LOGI(TAG, "transcript queued to agent: %.60s", cmd_text);
-        s_busy = true;
-        s_busy_start_ms = esp_timer_get_time() / 1000;
+        ESP_LOGI(TAG, "transcript queued to agent (gen=%lu): %.60s",
+                 (unsigned long)new_gen, cmd_text);
+        s_vad_busy = false;
         display_status_set("Thinking...", "");
-        ESP_LOGI(TAG, "mic paused while agent is thinking/replying");
     }
 }
 
@@ -902,28 +1016,39 @@ static void voice_task(void *arg)
         int64_t now = esp_timer_get_time() / 1000;
         if (now - dbg_last_report_ms >= 5000) {
             uint32_t avg = dbg_frames ? (uint32_t)(dbg_rms_sum / dbg_frames) : 0;
+            bool turn_active_snap = false;
+            uint32_t active_gen_snap = 0;
+            int64_t turn_start_snap = 0;
+            taskENTER_CRITICAL(&s_voice_mux);
+            turn_active_snap = s_agent_turn_active;
+            active_gen_snap = s_active_turn_gen;
+            turn_start_snap = s_turn_start_ms;
+            taskEXIT_CRITICAL(&s_voice_mux);
+
             ESP_LOGI(TAG, "[listen] 5s: frames=%u avg_rms=%u peak_rms=%d loud=%u paused/empty=%u",
                      (unsigned)dbg_frames, avg, (int)dbg_rms_peak,
                      (unsigned)dbg_loud, (unsigned)dbg_empties);
-            ESP_LOGI(TAG, "[debug] feeder: dma_reads=%u zero_reads=%u ring_written=%u | busy=%d audio_busy=%d spk_busy=%d",
+            ESP_LOGI(TAG, "[debug] feeder: dma_reads=%u zero_reads=%u ring_written=%u | vad_busy=%d turn_active=%d(gen=%lu) audio_busy=%d spk_busy=%d",
                      (unsigned)s_feeder_reads, (unsigned)s_feeder_zeros,
                      (unsigned)s_ring_written,
-                     s_busy, tool_audio_is_busy(), tool_audio_is_speaker_busy());
+                     s_vad_busy, turn_active_snap, (unsigned long)active_gen_snap,
+                     tool_audio_is_busy(), tool_audio_is_speaker_busy());
             dbg_frames = 0; dbg_rms_sum = 0; dbg_rms_peak = 0; dbg_loud = 0; dbg_empties = 0;
             dbg_last_report_ms = now;
 
-            /* Auto-recover if agent turn dropped without clearing s_busy */
-            if (s_busy && s_busy_start_ms > 0 && (now - s_busy_start_ms >= 35000)) {
-                ESP_LOGW(TAG, "agent thinking watchdog (35s) — clearing busy flag");
-                s_busy = false;
-                s_busy_start_ms = 0;
+            /* Auto-recover if an agent turn dropped without calling voice_client_turn_finished() */
+            if (turn_active_snap && turn_start_snap > 0 && (now - turn_start_snap >= 60000)) {
+                ESP_LOGW(TAG, "agent thinking watchdog (60s, gen=%lu) — clearing turn active flag",
+                         (unsigned long)active_gen_snap);
+                voice_client_turn_finished(active_gen_snap);
                 display_status_idle();
             }
         }
 
-        /* Pause while speaker plays, agent is thinking/replying (half-duplex turn-taking),
-         * an audio recording session is active, or the post-playback echo guard is still active. */
-        if (s_busy || tool_audio_is_speaker_busy() || mic_guard_active() || tool_audio_is_busy()) {
+        /* Pause while speaker plays, own VAD capture is active, another audio recording
+         * session is active, or the post-playback echo guard is still active.
+         * s_agent_turn_active does NOT pause listening so wake-word barge-in works. */
+        if (s_vad_busy || tool_audio_is_speaker_busy() || mic_guard_active() || tool_audio_is_busy()) {
             dbg_empties++;
             was_paused = true;
             consec_speech = 0;
@@ -992,13 +1117,13 @@ static void voice_task(void *arg)
         /* Need N consecutive frames (~96 ms) above the adaptive threshold */
         if (consec_speech >= VAD_TRIGGER_CONSEC) {
             consec_speech = 0;
-            s_busy = true;
+            s_vad_busy = true;
             ESP_LOGI(TAG, ">>> SPEECH DETECTED (rms=%d) — capturing utterance with 250ms pre-roll...", rms);
 
             /* Arm capture with 250ms (4000 samples) pre-roll from the ring */
             if (!tool_audio_capture_arm_preroll(CMD_MAX_SAMPLES, VAD_PREROLL_SAMPLES)) {
                 ESP_LOGW(TAG, "could not arm capture (bus busy)");
-                s_busy = false;
+                s_vad_busy = false;
                 continue;
             }
 
@@ -1048,7 +1173,7 @@ static void voice_task(void *arg)
             /* If captured audio is too short (< 0.25s), discard */
             if (total < TOOL_AUDIO_SAMPLE_RATE / 4) {
                 ESP_LOGI(TAG, "[utterance] too short (< 250ms), ignoring");
-                s_busy = false;
+                s_vad_busy = false;
                 continue;
             }
 
@@ -1056,7 +1181,7 @@ static void voice_task(void *arg)
             uint32_t cap_dur = 0;
             const int16_t *pcm = tool_audio_get_last_capture(&cap_samples, &cap_dur);
             if (!pcm || cap_samples == 0) {
-                s_busy = false;
+                s_vad_busy = false;
                 continue;
             }
 
@@ -1064,7 +1189,7 @@ static void voice_task(void *arg)
             bool ok = voice_client_transcribe_full(pcm, cap_samples, &stt_res);
             if (!ok) {
                 ESP_LOGW(TAG, "[utterance] STT failed or backend unavailable");
-                s_busy = false;
+                s_vad_busy = false;
                 continue;
             }
 
@@ -1077,7 +1202,7 @@ static void voice_task(void *arg)
                 tool_audio_ring_flush();
                 consec_speech = 0;
                 vad_filled = 0;
-                s_busy = false;
+                s_vad_busy = false;
                 continue;
             }
 
@@ -1085,6 +1210,12 @@ static void voice_task(void *arg)
             ESP_LOGI(TAG, "*** WAKE WORD MATCHED: '%s' (raw='%.60s') ***",
                      stt_res.wake_word ? stt_res.wake_word : "",
                      stt_res.raw_text ? stt_res.raw_text : "");
+
+            uint32_t aborted_gen = voice_abort_if_turn_active();
+            if (aborted_gen != 0) {
+                ESP_LOGW(TAG, "*** WAKE WORD INTERRUPT: In-flight turn gen=%lu aborted ***",
+                         (unsigned long)aborted_gen);
+            }
 
             /* Feedback will be sent below depending on one-shot vs wake-only */
             display_status_set("Listening...", "");
@@ -1098,26 +1229,25 @@ static void voice_task(void *arg)
                          stt_res.wake_word ? stt_res.wake_word : "ESPET", stt_res.text);
                 telegram_send_to_last_chat(notif);
 
-
+                uint32_t new_gen = voice_client_turn_begin(0);
                 mimi_msg_t msg = {0};
                 strlcpy(msg.channel, MIMI_CHAN_SYSTEM, sizeof(msg.channel));
                 strlcpy(msg.chat_id, "voice", sizeof(msg.chat_id));
                 msg.content = strdup(stt_res.text);
-                esp_err_t perr = message_bus_push_inbound(&msg);
+                msg.turn_gen = new_gen;
+                esp_err_t perr = msg.content ? message_bus_push_inbound(&msg) : ESP_ERR_NO_MEM;
                 if (perr != ESP_OK) {
                     ESP_LOGE(TAG, "inbound push failed: %s", esp_err_to_name(perr));
                     free(msg.content);
+                    voice_client_turn_finished(new_gen);
                     tool_audio_clear_cache();
-                    s_busy = false;
-                    s_busy_start_ms = 0;
                     display_status_idle();
                 } else {
-                    ESP_LOGI(TAG, "one-shot command queued to agent: %.60s", stt_res.text);
+                    ESP_LOGI(TAG, "one-shot command queued to agent (gen=%lu): %.60s",
+                             (unsigned long)new_gen, stt_res.text);
                     tool_audio_ring_flush();
-                    s_busy = true;
-                    s_busy_start_ms = esp_timer_get_time() / 1000;
-                    ESP_LOGI(TAG, "mic paused while agent is thinking/replying");
                 }
+                s_vad_busy = false;
             } else {
                 /* Case 2: Wake word only! E.g. "Mimi" or "Hey Mimi" */
                 ESP_LOGI(TAG, "*** WAKE WORD ONLY — playing 'Yes?' and listening for command ***");
@@ -1129,12 +1259,12 @@ static void voice_task(void *arg)
                 tool_audio_clear_cache();
 
                 voice_run_command();
+                s_vad_busy = false;
             }
 
             free(stt_res.text);
             free(stt_res.raw_text);
             free(stt_res.wake_word);
-            /* Note: s_busy remains true until voice_client_speak finishes */
         }
 
         vTaskDelay(1);
@@ -1151,20 +1281,36 @@ static void voice_task(void *arg)
 
 bool voice_client_speak(const char *text)
 {
-    return voice_client_speak_with_display(text, NULL, NULL);
+    return voice_client_speak_with_display_turn(text, NULL, NULL, 0);
+}
+
+bool voice_client_speak_turn(const char *text, uint32_t turn_gen)
+{
+    return voice_client_speak_with_display_turn(text, NULL, NULL, turn_gen);
 }
 
 bool voice_client_speak_with_display(const char *text, const char *line1, const char *line2)
 {
+    return voice_client_speak_with_display_turn(text, line1, line2, 0);
+}
+
+bool voice_client_speak_with_display_turn(const char *text, const char *line1,
+                                          const char *line2, uint32_t turn_gen)
+{
     if (!text || !*text) {
-        tool_audio_clear_cache();
-        s_busy = false;
-        s_busy_start_ms = 0;
-        display_status_idle();
+        voice_client_turn_finished(turn_gen);
+        if (turn_gen != 0) {
+            display_status_idle();
+        }
         return false;
     }
-    s_busy = true;
-    voice_speak_internal(text, line1, line2);
+    if (turn_gen != 0 && voice_client_is_turn_aborted(turn_gen)) {
+        ESP_LOGW(TAG, "Skipping aborted TTS reply (gen=%lu)", (unsigned long)turn_gen);
+        voice_client_turn_finished(turn_gen);
+        return false;
+    }
+
+    voice_speak_internal(text, line1, line2, turn_gen);
     /* Echo guard: drop mic input for ECHO_GUARD_MS after playback. The amp
      * tail + room reverb outlive the WAV by hundreds of ms; without this the
      * VAD re-triggered 330 ms after TTS end and Whisper hallucinated the wake
@@ -1172,11 +1318,14 @@ bool voice_client_speak_with_display(const char *text, const char *line1, const 
     mic_guard_start(ECHO_GUARD_MS);
     /* Clear cache so wake listener starts completely fresh */
     tool_audio_clear_cache();
-    s_busy = false;
-    s_busy_start_ms = 0;
-    display_status_idle();
-    ESP_LOGI(TAG, "voice reply complete — %d ms echo guard, listening for wake up again", ECHO_GUARD_MS);
-    return true;
+    voice_client_turn_finished(turn_gen);
+
+    bool aborted = (turn_gen != 0 && voice_client_is_turn_aborted(turn_gen));
+    if (!aborted) {
+        display_status_idle();
+        ESP_LOGI(TAG, "voice reply complete — %d ms echo guard, listening for wake up again", ECHO_GUARD_MS);
+    }
+    return !aborted;
 }
 
 esp_err_t voice_client_start(void)

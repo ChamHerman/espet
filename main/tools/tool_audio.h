@@ -159,9 +159,9 @@ void tool_audio_ring_flush(void);
 void tool_audio_clear_cache(void);
 
 /**
- * @brief Begin/end a speaker session: the RX feeder parks for the whole
- *        window (TTS download + playback), keeping the I2S TX path clean.
- *        Session audio otherwise corrupted (field-verified).
+ * @brief Begin/end a speaker session: refcounted gate so the RX feeder parks
+ *        for the whole window (TTS download + playback), keeping the I2S TX
+ *        path clean. Safe for nested or concurrent callers.
  */
 void tool_audio_speaker_session_begin(void);
 void tool_audio_speaker_session_end(void);
@@ -199,19 +199,22 @@ esp_err_t tool_audio_manual_record_stop(size_t *out_samples, uint32_t *out_dur_m
  * --------------------------------------------------------------------- */
 
 /**
- * @brief Play a full WAV blob through the MAX98357A speaker (blocking).
+ * @brief Play a full WAV blob through the MAX98357A speaker (blocking),
+ *        optionally bound to a cancellable turn generation.
  *
- * Expects the format served by the backend POST /api/voice/tts endpoint:
- * PCM WAV, 16 kHz, mono, 16-bit. A proper RIFF chunk walk locates the
- * data chunk, so extra leading chunks are tolerated. Stereo input plays
- * its left slot; other sample rates play pitch-shifted with a warning.
+ * @param wav       Pointer to the WAV blob (PSRAM recommended for large files).
+ * @param len       Blob length in bytes.
+ * @param turn_gen  0 for non-cancellable playback (e.g., ack/diagnostics),
+ *                  or >0 to abort cleanly if that voice turn was superseded.
+ * @return ESP_OK on full playback, ESP_ERR_INVALID_STATE if aborted or busy,
+ *         driver/argument errors otherwise.
+ */
+esp_err_t tool_audio_play_wav_turn(const uint8_t *wav, size_t len, uint32_t turn_gen);
+
+/**
+ * @brief Play a full WAV blob through the MAX98357A speaker (non-cancellable).
  *
- * Fails politely with ESP_ERR_INVALID_STATE if a capture or another
- * playback is already running.
- *
- * @param wav  Pointer to the WAV blob (PSRAM recommended for large files).
- * @param len  Blob length in bytes.
- * @return ESP_OK on success, driver/argument errors otherwise.
+ * Equivalent to tool_audio_play_wav_turn(wav, len, 0).
  */
 esp_err_t tool_audio_play_wav(const uint8_t *wav, size_t len);
 

@@ -292,11 +292,20 @@ static void outbound_dispatch_task(void *arg)
         mimi_msg_t msg;
         if (message_bus_pop_outbound(&msg, UINT32_MAX) != ESP_OK) continue;
 
+        if (msg.turn_gen != 0 && voice_client_is_turn_aborted(msg.turn_gen)) {
+            ESP_LOGW(TAG, "Skipping aborted outbound response (gen=%lu, %s:%s)",
+                     (unsigned long)msg.turn_gen, msg.channel, msg.chat_id);
+            voice_client_turn_finished(msg.turn_gen);
+            free(msg.content);
+            continue;
+        }
+
         ESP_LOGI(TAG, "Dispatching response to %s:%s", msg.channel, msg.chat_id);
 
         if (strcmp(msg.channel, MIMI_CHAN_TELEGRAM) == 0) {
             if (msg.chat_id[0] == '\0') {
                 ESP_LOGW(TAG, "Skipping Telegram send: chat_id is empty");
+                voice_client_turn_finished(msg.turn_gen);
             } else {
                 esp_err_t send_err = ESP_FAIL;
                 for (int attempt = 1; attempt <= TG_SEND_RETRIES; attempt++) {
@@ -315,12 +324,15 @@ static void outbound_dispatch_task(void *arg)
                     ESP_LOGE(TAG, "Telegram send failed for %s after %d attempts: %s",
                              msg.chat_id, TG_SEND_RETRIES,
                              esp_err_to_name(send_err));
+                    voice_client_turn_finished(msg.turn_gen);
                 } else {
                     ESP_LOGI(TAG, "Telegram send success for %s (%d bytes)", msg.chat_id, (int)strlen(msg.content));
                     /* Final agent replies are spoken too (user request):
                      * every text answer also comes out of the speaker. */
                     if (should_speak_reply(msg.content)) {
-                        voice_client_speak(msg.content);
+                        voice_client_speak_turn(msg.content, msg.turn_gen);
+                    } else {
+                        voice_client_turn_finished(msg.turn_gen);
                     }
                 }
             }
@@ -330,6 +342,7 @@ static void outbound_dispatch_task(void *arg)
              * through the gateway. Same retry discipline as Telegram sends. */
             if (msg.chat_id[0] == '\0') {
                 ESP_LOGW(TAG, "Skipping cloud send: chat_id is empty");
+                voice_client_turn_finished(msg.turn_gen);
             } else {
                 esp_err_t send_err = ESP_FAIL;
                 for (int attempt = 1; attempt <= TG_SEND_RETRIES; attempt++) {
@@ -348,12 +361,15 @@ static void outbound_dispatch_task(void *arg)
                     ESP_LOGE(TAG, "Cloud send failed for %s after %d attempts: %s",
                              msg.chat_id, TG_SEND_RETRIES,
                              esp_err_to_name(send_err));
+                    voice_client_turn_finished(msg.turn_gen);
                 } else {
                     ESP_LOGI(TAG, "Cloud send success for %s (%d bytes)",
                              msg.chat_id, (int)strlen(msg.content));
                     /* Final agent replies are spoken too (user request) */
                     if (should_speak_reply(msg.content)) {
-                        voice_client_speak(msg.content);
+                        voice_client_speak_turn(msg.content, msg.turn_gen);
+                    } else {
+                        voice_client_turn_finished(msg.turn_gen);
                     }
                 }
             }
@@ -367,6 +383,7 @@ static void outbound_dispatch_task(void *arg)
             } else {
                 ESP_LOGI(TAG, "Feishu send success for %s (%d bytes)", msg.chat_id, (int)strlen(msg.content));
             }
+            voice_client_turn_finished(msg.turn_gen);
         }
 #endif
         else if (strcmp(msg.channel, MIMI_CHAN_WEBSOCKET) == 0) {
@@ -374,6 +391,7 @@ static void outbound_dispatch_task(void *arg)
             if (ws_err != ESP_OK) {
                 ESP_LOGW(TAG, "WS send failed for %s: %s", msg.chat_id, esp_err_to_name(ws_err));
             }
+            voice_client_turn_finished(msg.turn_gen);
         } else if (strcmp(msg.channel, MIMI_CHAN_SYSTEM) == 0) {
             ESP_LOGI(TAG, "System message [%s]: %.128s", msg.chat_id, msg.content);
             /* Voice pipeline output: bridge to Telegram chat so user sees output
@@ -381,21 +399,28 @@ static void outbound_dispatch_task(void *arg)
             if (strcmp(msg.chat_id, "voice") == 0) {
                 /* Audio-First: speak through MAX98357A speaker immediately without waiting for Telegram HTTP roundtrip */
                 if (msg.content) {
-                    voice_client_speak(msg.content);
+                    voice_client_speak_turn(msg.content, msg.turn_gen);
+                } else {
+                    voice_client_turn_finished(msg.turn_gen);
                 }
-                size_t prefix_len = strlen("🤖 ESPET: ");
-                size_t content_len = msg.content ? strlen(msg.content) : 0;
-                char *tlg_msg = (char *)malloc(prefix_len + content_len + 1);
-                if (tlg_msg) {
-                    snprintf(tlg_msg, prefix_len + content_len + 1, "🤖 ESPET: %s", msg.content ? msg.content : "");
-                    telegram_send_to_last_chat(tlg_msg);
-                    free(tlg_msg);
-                } else if (msg.content) {
-                    telegram_send_to_last_chat(msg.content);
+                if (msg.turn_gen == 0 || !voice_client_is_turn_aborted(msg.turn_gen)) {
+                    size_t prefix_len = strlen("🤖 ESPET: ");
+                    size_t content_len = msg.content ? strlen(msg.content) : 0;
+                    char *tlg_msg = (char *)malloc(prefix_len + content_len + 1);
+                    if (tlg_msg) {
+                        snprintf(tlg_msg, prefix_len + content_len + 1, "🤖 ESPET: %s", msg.content ? msg.content : "");
+                        telegram_send_to_last_chat(tlg_msg);
+                        free(tlg_msg);
+                    } else if (msg.content) {
+                        telegram_send_to_last_chat(msg.content);
+                    }
                 }
+            } else {
+                voice_client_turn_finished(msg.turn_gen);
             }
         } else {
             ESP_LOGW(TAG, "Unknown channel: %s", msg.channel);
+            voice_client_turn_finished(msg.turn_gen);
         }
 
         free(msg.content);
