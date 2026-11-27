@@ -77,7 +77,9 @@ static esp_err_t custom_config_prov_handler(uint32_t session_id, const uint8_t *
                 const char *url = item->valuestring;
                 nvs_handle_t nvs;
                 if (url[0] != '\0') {
-                    if (strlen(url) < 96 && (strncmp(url, "http://", 7) == 0 || strncmp(url, "https://", 8) == 0)) {
+                    if (backend_discovery_is_loopback_url(url)) {
+                        ESP_LOGW(TAG, "Rejecting loopback backend URL '%s' (localhost refers to ESP32 itself)", url);
+                    } else if (strlen(url) < 96 && (strncmp(url, "http://", 7) == 0 || strncmp(url, "https://", 8) == 0)) {
                         if (nvs_open(MIMI_NVS_BACKEND, NVS_READWRITE, &nvs) == ESP_OK) {
                             nvs_set_str(nvs, MIMI_NVS_KEY_BACKEND_URL, url);
                             nvs_commit(nvs);

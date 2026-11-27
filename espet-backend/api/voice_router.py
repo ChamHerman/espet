@@ -15,6 +15,7 @@ TTS:  edge-tts (Microsoft Edge neural voices, free, no API key) + ffmpeg
 """
 
 import asyncio
+from collections import deque
 import json
 import logging
 import math
@@ -22,7 +23,9 @@ import os
 import struct
 import sys
 import tempfile
+import threading
 import time
+import uuid
 from pathlib import Path
 import subprocess
 import numpy as np
@@ -42,6 +45,63 @@ _stt_model = None
 
 # Sample rate the ESP32 I2S pipeline runs at — keep this contract fixed
 ESP_SAMPLE_RATE = 16000
+
+# Bounded atomic capture ring so /stt always plays & inspects the exact WAV
+# produced by a given transcribe call, immune to concurrent VAD overwrites.
+_MAX_DEBUG_CAPTURES = 12
+_capture_lock = threading.Lock()
+_capture_ring: deque[dict] = deque(maxlen=_MAX_DEBUG_CAPTURES)
+_capture_by_id: dict[str, dict] = {}
+_latest_capture_meta: dict | None = None
+
+
+def _atomic_write_bytes(target: Path, data: bytes) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(f".{target.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, target)
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+
+
+def _store_debug_capture(wav_bytes: bytes, meta: dict, write_last_capture: bool = True) -> dict:
+    """Save capture WAV in bounded memory ring and optionally update data/last_capture.wav atomically."""
+    global _latest_capture_meta
+    cid = uuid.uuid4().hex[:12]
+    full_meta = {
+        **meta,
+        "capture_id": cid,
+        "audio_url": f"/api/voice/captures/{cid}",
+        "ts": time.time(),
+    }
+    entry = {"capture_id": cid, "wav_bytes": wav_bytes, "meta": full_meta}
+    with _capture_lock:
+        if len(_capture_ring) == _capture_ring.maxlen:
+            evicted = _capture_ring.popleft()
+            _capture_by_id.pop(evicted["capture_id"], None)
+        _capture_ring.append(entry)
+        _capture_by_id[cid] = entry
+        _latest_capture_meta = full_meta
+
+    if write_last_capture:
+        try:
+            _atomic_write_bytes(Path("data/last_capture.wav"), wav_bytes)
+        except Exception:
+            pass
+    return full_meta
+
+
+def get_latest_capture_meta() -> dict | None:
+    with _capture_lock:
+        return dict(_latest_capture_meta) if _latest_capture_meta else None
+
+
+def get_capture_wav(capture_id: str) -> bytes | None:
+    with _capture_lock:
+        entry = _capture_by_id.get(capture_id)
+        return entry["wav_bytes"] if entry else None
 
 
 # ---------------------------------------------------------------------------
@@ -202,12 +262,12 @@ def detect_pitch_f0(data: np.ndarray, fs: int = ESP_SAMPLE_RATE) -> float:
 
 def check_and_fix_pitch(pcm16: np.ndarray, sample_rate: int = ESP_SAMPLE_RATE) -> tuple[np.ndarray, bool]:
     """
-    Restore natural human voice pitch and normal 1x playback speed.
-    Because the ESP32 mic DMA slot mask captures at 8,000 samples/sec into a 16 kHz buffer,
-    audio arrives at 2x playback speed (Minion/chipmunk voice).
-    Upsamples 8k -> 16k so duration, tempo, and pitch are 100% natural.
+    Upsample legacy 8 kHz half-rate ESP32 captures to 16 kHz when voice_hw_rate_8k=True.
+    Full-duplex firmware (I2S_STD_SLOT_BOTH) captures genuine 16 kHz directly, so
+    when voice_hw_rate_8k=False we pass PCM through untouched to avoid misclassifying
+    normal higher-pitched voices (>170 Hz) as 8 kHz.
     """
-    if getattr(settings, "voice_hw_rate_8k", True):
+    if getattr(settings, "voice_hw_rate_8k", False):
         logger.info(
             "Restoring normal 1x tempo and pitch (resampling 8k -> 16k, %d -> %d samples)",
             len(pcm16), len(pcm16) * 2
@@ -215,17 +275,6 @@ def check_and_fix_pitch(pcm16: np.ndarray, sample_rate: int = ESP_SAMPLE_RATE) -
         corrected = resample_to_16k(pcm16, 8000)
         return corrected, True
 
-    # Fallback to pitch-based gate if voice_hw_rate_8k is disabled
-    f0 = detect_pitch_f0(pcm16, sample_rate)
-    if f0 > 170.0:
-        logger.info(
-            "Speech pitch is %.1f Hz (> 170 Hz) — restoring normal pitch (resampling 8k -> 16k)",
-            f0
-        )
-        corrected = resample_to_16k(pcm16, 8000)
-        new_f0 = detect_pitch_f0(corrected, sample_rate)
-        logger.info("Normal voice pitch restored: %.1f Hz", new_f0)
-        return corrected, True
     return pcm16, False
 
 
@@ -335,16 +384,14 @@ def _transcribe_pcm_impl(
     rms_processed = float(np.sqrt(np.mean(pcm16.astype(np.float64) ** 2))) if len(pcm16) else 0.0
 
     model = _get_stt_model()
+    wav_bytes = pcm_to_wav_bytes(pcm16)
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-        wav_bytes = pcm_to_wav_bytes(pcm16)
         f.write(wav_bytes)
         tmp_path = f.name
-    # Save last audio capture for inspection (never clobber during synthetic regression runs)
+    # Save last audio capture atomically (never clobber during synthetic regression runs)
     if save_capture:
         try:
-            debug_file = Path("data/last_capture.wav")
-            debug_file.parent.mkdir(parents=True, exist_ok=True)
-            debug_file.write_bytes(wav_bytes)
+            _atomic_write_bytes(Path("data/last_capture.wav"), wav_bytes)
         except Exception:
             pass
     allowed_langs = [
@@ -471,6 +518,8 @@ def _transcribe_pcm_impl(
             "language_prob": float(info.language_probability or 0.0),
             "duration_s": float(info.duration or 0.0),
             "rms_processed": rms_processed,
+            "wav_bytes": wav_bytes,
+            "samples_out": int(len(pcm16)),
         }
     finally:
         Path(tmp_path).unlink(missing_ok=True)
@@ -600,6 +649,7 @@ async def transcribe(request: Request):
     Accept raw 16 kHz mono 16-bit PCM (Content-Type: application/octet-stream,
     the ESP32's native capture format) or a WAV blob. Returns transcript JSON.
     """
+    t0 = time.perf_counter()
     body = await request.body()
     if not body:
         raise HTTPException(400, "empty body")
@@ -619,22 +669,33 @@ async def transcribe(request: Request):
             raw = np.frombuffer(body[: len(body) // 2 * 2], dtype="<i2").copy()
             pcm = resample_to_16k(raw, rate) if rate != ESP_SAMPLE_RATE else raw
 
+        samples_in = int(len(pcm))
         # Check and restore natural voice pitch if audio was decimated by DMA slot mask (8k -> 16k)
-        pcm, _ = check_and_fix_pitch(pcm, ESP_SAMPLE_RATE)
-
-        rms = float(np.sqrt(np.mean(pcm.astype(np.float64) ** 2))) if len(pcm) else 0.0
+        pcm, pitch_upsampled = check_and_fix_pitch(pcm, ESP_SAMPLE_RATE)
+        raw_stats = _audio_stats(pcm)
+        rms = raw_stats["rms"]
         logger.info("STT request: %d bytes (%.2fs @ %dHz), RMS=%.1f (threshold=%.1f)",
                     len(pcm) * 2, len(pcm) / ESP_SAMPLE_RATE, rate, rms, settings.voice_min_rms)
         if rms < settings.voice_min_rms:
-            # Pure silence / faint electrical noise: skip Whisper entirely.
+            # Pure silence / faint electrical noise: skip Whisper entirely (do NOT clobber last valid capture).
             logger.info("STT skipped: rms=%.0f < voice_min_rms=%.0f", rms, settings.voice_min_rms)
             return {"text": "", "raw_text": "", "wake_matched": False, "wake_word": ""}
-        text, avg_logprob, no_speech_prob = await _run_stt(pcm)
+        stt_res = await asyncio.to_thread(
+            _transcribe_pcm_impl,
+            pcm,
+            settings.voice_language,
+            apply_denoise=True,
+            save_capture=False,
+        )
     except HTTPException:
         raise
     except Exception as e:
         logger.exception("STT failed")
         raise HTTPException(500, f"transcription failed: {e}")
+
+    text = stt_res["text"]
+    avg_logprob = stt_res["avg_logprob"]
+    no_speech_prob = stt_res["no_speech_prob"]
 
     wake_list = [w.strip() for w in settings.voice_wake_words.split(",") if w.strip()]
     wake_matched, wake_word, cmd = check_wake_word(text, wake_list)
@@ -643,6 +704,7 @@ async def transcribe(request: Request):
     # phrases on noise/TTS-echo; measured on this pipeline, genuine wake
     # utterances have avg_logprob > -1.0 while hallucinations sit near/below
     # it with high no_speech_prob. Keep the device from self-waking forever.
+    confidence_rejected = False
     if wake_matched and (
         avg_logprob < settings.voice_min_avg_logprob
         or no_speech_prob > settings.voice_max_no_speech_prob
@@ -650,10 +712,38 @@ async def transcribe(request: Request):
         logger.warning(
             "wake word REJECTED by confidence gate: word='%s' logp=%.2f nsp=%.2f raw='%.60s'",
             wake_word, avg_logprob, no_speech_prob, text)
+        confidence_rejected = True
         wake_matched, wake_word, cmd = False, "", ""
 
     logger.info("STT: raw='%s' | wake_matched=%s (word='%s') | cmd='%s'",
                 text, wake_matched, wake_word, cmd)
+
+    wav_bytes = stt_res.get("wav_bytes")
+    if wav_bytes:
+        _store_debug_capture(
+            wav_bytes,
+            {
+                "text": cmd if wake_matched else "",
+                "raw_text": text,
+                "wake_matched": wake_matched,
+                "wake_word": wake_word,
+                "avg_logprob": round(avg_logprob, 3),
+                "no_speech_prob": round(no_speech_prob, 3),
+                "confidence_rejected": confidence_rejected,
+                "detected_language": stt_res.get("detected_language", ""),
+                "language_prob": round(stt_res.get("language_prob", 0.0), 3),
+                "rms_raw": raw_stats["rms"],
+                "rms_processed": round(stt_res.get("rms_processed", 0.0), 2),
+                "peak": raw_stats["peak"],
+                "dc_offset": raw_stats["dc_offset"],
+                "samples_in": samples_in,
+                "samples": int(stt_res.get("samples_out", len(pcm))),
+                "duration_s": round(len(pcm) / ESP_SAMPLE_RATE, 3),
+                "pitch_upsampled": pitch_upsampled,
+                "latency_ms": round((time.perf_counter() - t0) * 1000, 1),
+            },
+            write_last_capture=bool(text.strip()),
+        )
 
     return {
         "text": cmd if wake_matched else "",
@@ -707,8 +797,36 @@ async def get_last_capture_audio():
     return Response(
         content=wav_path.read_bytes(),
         media_type="audio/wav",
-        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+        },
     )
+
+
+@router.get("/captures/{capture_id}")
+async def get_capture_audio_by_id(capture_id: str):
+    """Serves the exact WAV blob from a specific transcribe capture in the bounded ring."""
+    wav = get_capture_wav(capture_id)
+    if wav is None:
+        raise HTTPException(404, "Capture not found or evicted")
+    return Response(
+        content=wav,
+        media_type="audio/wav",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+        },
+    )
+
+
+@router.get("/debug/last-result", dependencies=[Depends(verify_device_key)])
+async def debug_last_result():
+    """Return full diagnostic metadata + audio_url for the most recent /transcribe call."""
+    meta = get_latest_capture_meta()
+    if not meta:
+        return {"exists": False}
+    return {"exists": True, **meta}
 
 
 # ---------------------------------------------------------------------------

@@ -9,6 +9,7 @@
  */
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 
 #ifdef __cplusplus
@@ -32,6 +33,14 @@ void backend_discovery_start(void);
  * (like camera_stream_task or agent_loop_task) to safely retrieve the backend URL.
  */
 void backend_discovery_init(void);
+
+/**
+ * @brief Return true if @p url points to a loopback address (localhost, 127.x, ::1, 0.0.0.0).
+ *
+ * On ESP32, loopback refers to the microcontroller itself and can never reach
+ * the host PC running espet-backend.
+ */
+bool backend_discovery_is_loopback_url(const char *url);
 
 /**
  * @brief Update in-memory backend URL immediately (called e.g. after BLE provisioning).

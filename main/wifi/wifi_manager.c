@@ -62,15 +62,26 @@ static void event_handler(void *arg, esp_event_base_t event_base,
         if (disc) {
             ESP_LOGW(TAG, "Disconnected (reason=%d:%s)", disc->reason, wifi_reason_to_str(disc->reason));
         }
-        if (s_reconnect_enabled && s_retry_count < MIMI_WIFI_MAX_RETRY) {
-            /* Exponential backoff: 1s, 2s, 4s, 8s, ... capped at 30s */
-            uint32_t delay_ms = MIMI_WIFI_RETRY_BASE_MS << s_retry_count;
-            if (delay_ms > MIMI_WIFI_RETRY_MAX_MS) {
-                delay_ms = MIMI_WIFI_RETRY_MAX_MS;
+        if (s_reconnect_enabled && (s_runtime_connected || s_retry_count < MIMI_WIFI_MAX_RETRY)) {
+            /* Exponential backoff: 1s, 2s, 4s, 8s, ... capped at 10s on boot
+             * and 30s during continuous runtime recovery. */
+            uint32_t shift = (s_retry_count < 6) ? (uint32_t)s_retry_count : 6U;
+            uint32_t delay_ms = (uint32_t)MIMI_WIFI_RETRY_BASE_MS << shift;
+            uint32_t max_ms = s_runtime_connected ? MIMI_WIFI_RUNTIME_RETRY_MAX_MS : MIMI_WIFI_RETRY_MAX_MS;
+            if (delay_ms > max_ms) {
+                delay_ms = max_ms;
             }
-            ESP_LOGW(TAG, "Disconnected, retry %d/%d in %" PRIu32 "ms",
-                     s_retry_count + 1, MIMI_WIFI_MAX_RETRY, delay_ms);
+            if (s_runtime_connected) {
+                ESP_LOGW(TAG, "Disconnected, runtime reconnect #%d in %" PRIu32 "ms",
+                         s_retry_count + 1, delay_ms);
+            } else {
+                ESP_LOGW(TAG, "Disconnected, retry %d/%d in %" PRIu32 "ms",
+                         s_retry_count + 1, MIMI_WIFI_MAX_RETRY, delay_ms);
+            }
             s_retry_count++;
+            if (s_runtime_connected) {
+                display_status_set("WiFi lost", "Reconnecting...");
+            }
             if (s_reconnect_timer) {
                 esp_timer_stop(s_reconnect_timer);
                 esp_timer_start_once(s_reconnect_timer, (uint64_t)delay_ms * 1000);
@@ -78,14 +89,9 @@ static void event_handler(void *arg, esp_event_base_t event_base,
                 esp_wifi_connect();
             }
         } else {
-            ESP_LOGE(TAG, "Failed to connect after %d retries", MIMI_WIFI_MAX_RETRY);
+            ESP_LOGE(TAG, "Failed to connect on boot after %d retries", MIMI_WIFI_MAX_RETRY);
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
-            if (s_runtime_connected) {
-                ESP_LOGW(TAG, "Wi-Fi connection lost at runtime. Triggering BLE onboarding fallback...");
-                wifi_manager_trigger_ble_prov();
-            } else {
-                display_status_set("WiFi FAILED", "check router");
-            }
+            display_status_set("WiFi FAILED", "Starting BLE...");
         }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         if (s_reconnect_timer) {
@@ -164,7 +170,7 @@ esp_err_t wifi_manager_start(void)
             .sort_method = WIFI_CONNECT_AP_BY_SIGNAL,
             .threshold.authmode = WIFI_AUTH_WPA_PSK,
             .pmf_cfg = {
-                .capable = false,
+                .capable = true,
                 .required = false,
             },
         },

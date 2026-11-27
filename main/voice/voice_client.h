@@ -44,17 +44,53 @@ bool voice_client_is_listen_enabled(void);
 /**
  * @brief Speak a reply: fetch TTS audio from the backend and play it.
  *
- * Called by the outbound dispatcher for system:"voice" replies. Blocking
- * for the duration of fetch+playback (runs on the dispatcher's context);
- * returns false if the pipeline is already busy.
+ * Called by the outbound dispatcher for system:"voice" replies or standalone
+ * callers. Blocking for the duration of fetch+playback; serializes I2S TX
+ * safely across concurrent callers.
  */
 bool voice_client_speak(const char *text);
+
+/**
+ * @brief Turn-scoped variant of voice_client_speak(). If turn_gen > 0 and that
+ *        turn was superseded by a wake-word barge-in, skips fetch/playback and
+ *        finalizes turn state cleanly.
+ */
+bool voice_client_speak_turn(const char *text, uint32_t turn_gen);
 
 /**
  * @brief Speak text while showing explicit OLED lines instead of auto-splitting
  *        the spoken text. Useful for event alerts like Owner Detected.
  */
 bool voice_client_speak_with_display(const char *text, const char *line1, const char *line2);
+
+/**
+ * @brief Turn-scoped variant of voice_client_speak_with_display().
+ */
+bool voice_client_speak_with_display_turn(const char *text, const char *line1,
+                                          const char *line2, uint32_t turn_gen);
+
+/**
+ * @brief Register or retrieve a monotonic turn generation for an inbound turn.
+ *
+ * If turn_gen == 0, allocates a new generation (>0) and marks it active.
+ * If turn_gen > 0 and not already aborted, marks/refreshes it as active.
+ */
+uint32_t voice_client_turn_begin(uint32_t turn_gen);
+
+/**
+ * @brief Mark a completed/dropped turn finished so active-turn state is freed.
+ */
+void voice_client_turn_finished(uint32_t turn_gen);
+
+/**
+ * @brief Request abort of the specified active turn generation.
+ */
+void voice_client_request_abort(uint32_t turn_gen);
+
+/**
+ * @brief True if turn_gen (>0) has been superseded by a barge-in abort.
+ */
+bool voice_client_is_turn_aborted(uint32_t turn_gen);
 
 /**
  * @brief Structured STT result including wake word match status.

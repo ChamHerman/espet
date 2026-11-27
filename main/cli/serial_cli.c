@@ -14,6 +14,7 @@
 #include "cron/cron_service.h"
 #include "heartbeat/heartbeat.h"
 #include "skills/skill_loader.h"
+#include "sync/backend_discovery.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -69,6 +70,58 @@ static int cmd_wifi_prov(int argc, char **argv)
     wifi_manager_clear_credentials();
     vTaskDelay(pdMS_TO_TICKS(500));
     esp_restart();
+    return 0;
+}
+
+/* --- set_backend command --- */
+static struct {
+    struct arg_str *url;
+    struct arg_end *end;
+} backend_args;
+
+static int cmd_set_backend(int argc, char **argv)
+{
+    int nerrors = arg_parse(argc, argv, (void **)&backend_args);
+    if (nerrors != 0) {
+        arg_print_errors(stderr, backend_args.end, argv[0]);
+        return 1;
+    }
+
+    char url[96];
+    strlcpy(url, backend_args.url->sval[0], sizeof(url));
+    size_t len = strlen(url);
+    while (len > 0 && url[len - 1] == '/') {
+        url[--len] = '\0';
+    }
+
+    nvs_handle_t nvs;
+    if (strcmp(url, "clear") == 0 || url[0] == '\0') {
+        if (nvs_open(MIMI_NVS_BACKEND, NVS_READWRITE, &nvs) == ESP_OK) {
+            nvs_erase_key(nvs, MIMI_NVS_KEY_BACKEND_URL);
+            nvs_commit(nvs);
+            nvs_close(nvs);
+        }
+        backend_discovery_set_url("");
+        backend_discovery_invalidate();
+        printf("Cleared NVS backend URL override. Using mDNS / compiled fallback.\n");
+        return 0;
+    }
+
+    if (strncmp(url, "http://", 7) != 0 && strncmp(url, "https://", 8) != 0) {
+        printf("Error: URL must start with http:// or https:// (or 'clear').\n");
+        return 1;
+    }
+    if (backend_discovery_is_loopback_url(url)) {
+        printf("Error: '%s' is a loopback address (points to ESP32 itself). Use your PC LAN IP (e.g. http://192.168.0.34:8000).\n", url);
+        return 1;
+    }
+
+    ESP_ERROR_CHECK(nvs_open(MIMI_NVS_BACKEND, NVS_READWRITE, &nvs));
+    ESP_ERROR_CHECK(nvs_set_str(nvs, MIMI_NVS_KEY_BACKEND_URL, url));
+    ESP_ERROR_CHECK(nvs_commit(nvs));
+    nvs_close(nvs);
+    backend_discovery_set_url(url);
+    printf("Backend URL saved to NVS: %s\n", url);
     return 0;
 }
 
@@ -583,6 +636,11 @@ static int cmd_config_show(int argc, char **argv)
     print_config_u16("Proxy Port", MIMI_NVS_PROXY, MIMI_NVS_KEY_PROXY_PORT, MIMI_SECRET_PROXY_PORT);
     print_config("Search Key", MIMI_NVS_SEARCH, MIMI_NVS_KEY_API_KEY,  MIMI_SECRET_SEARCH_KEY, true);
     print_config("Tavily Key", MIMI_NVS_SEARCH, MIMI_NVS_KEY_TAVILY_KEY, MIMI_SECRET_TAVILY_KEY, true);
+    {
+        char cur_backend[96] = {0};
+        backend_discovery_base_url(cur_backend, sizeof(cur_backend));
+        print_config("Backend NVS", MIMI_NVS_BACKEND, MIMI_NVS_KEY_BACKEND_URL, cur_backend, false);
+    }
     printf("=============================\n");
     return 0;
 }
@@ -591,9 +649,9 @@ static int cmd_config_show(int argc, char **argv)
 static int cmd_config_reset(int argc, char **argv)
 {
     const char *namespaces[] = {
-        MIMI_NVS_WIFI, MIMI_NVS_TG, MIMI_NVS_LLM, MIMI_NVS_PROXY, MIMI_NVS_SEARCH
+        MIMI_NVS_WIFI, MIMI_NVS_TG, MIMI_NVS_LLM, MIMI_NVS_PROXY, MIMI_NVS_SEARCH, MIMI_NVS_BACKEND
     };
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 6; i++) {
         nvs_handle_t nvs;
         if (nvs_open(namespaces[i], NVS_READWRITE, &nvs) == ESP_OK) {
             nvs_erase_all(nvs);
@@ -601,6 +659,7 @@ static int cmd_config_reset(int argc, char **argv)
             nvs_close(nvs);
         }
     }
+    backend_discovery_set_url("");
     printf("All NVS config cleared. Build-time defaults will be used on restart.\n");
     return 0;
 }
@@ -852,6 +911,17 @@ esp_err_t serial_cli_init(void)
         .func = &cmd_wifi_prov,
     };
     esp_console_cmd_register(&wifi_prov_cmd);
+
+    /* set_backend */
+    backend_args.url = arg_str1(NULL, NULL, "<url|clear>", "Backend URL (http://<PC_LAN_IP>:8000) or 'clear'");
+    backend_args.end = arg_end(1);
+    esp_console_cmd_t set_backend_cmd = {
+        .command = "set_backend",
+        .help = "Set or clear backend server URL (e.g. set_backend http://192.168.0.34:8000)",
+        .func = &cmd_set_backend,
+        .argtable = &backend_args,
+    };
+    esp_console_cmd_register(&set_backend_cmd);
 
     /* set_tg_token */
     tg_token_args.token = arg_str1(NULL, NULL, "<token>", "Telegram bot token");

@@ -15,7 +15,7 @@ esp_err_t tool_gpio_init(void)
 {
     ESP_LOGI(TAG, "GPIO tool initialized (setting output pins to OFF on 1st init)");
 
-    /* Reset and set output GPIO pins (White LED pin 40, etc.) to LOW/OFF */
+    /* Reset and set output GPIO pins (White LED pin 42, etc.) to LOW/OFF */
     const int output_pins[] = { MIMI_GPIO_LED_WHITE };
     for (size_t i = 0; i < sizeof(output_pins) / sizeof(output_pins[0]); i++) {
         int pin = output_pins[i];
@@ -116,11 +116,8 @@ esp_err_t tool_gpio_read_execute(const char *input_json, char *output, size_t ou
         return ESP_ERR_INVALID_ARG;
     }
 
-    /* Enable input path with pull-up for buttons, then read level */
+    /* Enable input path, then read level */
     gpio_set_direction(pin, GPIO_MODE_INPUT);
-    if (pin == 38 || pin == 39) {
-        gpio_set_pull_mode((gpio_num_t)pin, GPIO_PULLUP_ONLY);
-    }
     int level = gpio_get_level(pin);
 
     snprintf(output, output_size, "Pin %d = %s", pin, level ? "HIGH" : "LOW");
@@ -170,9 +167,6 @@ esp_err_t tool_gpio_read_all_execute(const char *input_json, char *output, size_
             }
 
             gpio_set_direction((int)value, GPIO_MODE_INPUT);
-            if ((int)value == 38 || (int)value == 39) {
-                gpio_set_pull_mode((gpio_num_t)value, GPIO_PULLUP_ONLY);
-            }
             int level = gpio_get_level((int)value);
 
             written = snprintf(cursor, remaining, "%s%d=%s",

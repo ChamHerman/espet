@@ -1,8 +1,7 @@
 # ESP32-S3 Hardware Pin Map (Authoritative — 2026-09 remap)
 
 Source of truth for GPIO assignments on the ESP32-S3-WROOM-1-N16R8.
-The firmware `#define`s (`main/mimi_config.h`) and all skills/docs **still carry
-the pre-remap numbers and must be migrated** — see `.agent/NEXT_PLAN_BACKEND.MD`.
+`main/mimi_config.h` and `main/tools/gpio_policy.h` are aligned to this remap.
 
 ## User-Facing Peripherals
 
@@ -38,5 +37,5 @@ D0 **11** · VSYNC **6** · HREF **7** · PCLK **13**
 | UART0 Console | 43 (TX), 44 (RX) | Serial REPL (115200) |
 | Camera DVP bus | 4–18 | Camera-only |
 
-Post-migration user-GPIO allowlist should be `1,2,21,38,39,40,41,42` (47 is
-released; 38 is no longer a button).
+Active user-GPIO allowlist in `main/tools/gpio_policy.h` is `"41,42"` (Green Button
+and White LED only; I2S, OLED I2C, and Camera DVP pins are protected).

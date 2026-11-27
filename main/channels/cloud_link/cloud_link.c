@@ -168,19 +168,52 @@ typedef struct {
     double rms;
 } transcribe_req_t;
 
+#define CLOUD_WORKER_STACK_WORDS (8192 / sizeof(StackType_t))
+static StackType_t *s_trans_stack = NULL;
+static StaticTask_t s_trans_tcb;
+static volatile bool s_trans_active = false;
+
 static void transcribe_task_fn(void *arg)
 {
     transcribe_req_t *req = (transcribe_req_t *)arg;
     const int16_t *pcm = tool_audio_get_last_capture(&req->samples, &req->dur);
-    char *transcript = (pcm && req->samples > 0) ? voice_client_transcribe(pcm, req->samples) : NULL;
-    char resp[512];
-    snprintf(resp, sizeof(resp),
-             "{\"type\":\"record_result\",\"ok\":true,\"samples\":%u,\"duration_ms\":%u,\"rms\":%.1f,\"transcript\":\"%s\"}",
-             (unsigned)req->samples, (unsigned)req->dur, req->rms,
-             transcript ? transcript : "");
-    send_json(resp);
-    if (transcript) free(transcript);
+    voice_stt_result_t stt_res = {0};
+    bool ok = (pcm && req->samples > 0) ? voice_client_transcribe_full(pcm, req->samples, &stt_res) : false;
+    tool_audio_manual_capture_release();
+
+    const char *text_out = "";
+    if (ok) {
+        if (stt_res.raw_text && stt_res.raw_text[0] != '\0') {
+            text_out = stt_res.raw_text;
+        } else if (stt_res.text && stt_res.text[0] != '\0') {
+            text_out = stt_res.text;
+        }
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    if (root) {
+        cJSON_AddStringToObject(root, "type", "record_result");
+        cJSON_AddBoolToObject(root, "ok", true);
+        cJSON_AddNumberToObject(root, "samples", (double)req->samples);
+        cJSON_AddNumberToObject(root, "duration_ms", (double)req->dur);
+        cJSON_AddNumberToObject(root, "rms", req->rms);
+        cJSON_AddStringToObject(root, "transcript", text_out);
+        if (!ok) {
+            cJSON_AddStringToObject(root, "error", "stt_failed");
+        }
+        char *rendered = cJSON_PrintUnformatted(root);
+        cJSON_Delete(root);
+        if (rendered) {
+            send_json(rendered);
+            free(rendered);
+        }
+    }
+
+    free(stt_res.text);
+    free(stt_res.raw_text);
+    free(stt_res.wake_word);
     free(req);
+    s_trans_active = false;
     vTaskDelete(NULL);
 }
 
@@ -189,6 +222,10 @@ typedef struct {
     char *line1;
     char *line2;
 } tts_say_req_t;
+
+static StackType_t *s_tts_stack = NULL;
+static StaticTask_t s_tts_tcb;
+static volatile bool s_tts_active = false;
 
 static void tts_say_task_fn(void *arg)
 {
@@ -200,6 +237,7 @@ static void tts_say_task_fn(void *arg)
         free(req->line2);
         free(req);
     }
+    s_tts_active = false;
     vTaskDelete(NULL);
 }
 
@@ -285,25 +323,39 @@ static void handle_frame(char *json_str)
         double rms = 0.0;
         esp_err_t err = tool_audio_manual_record_stop(&samples, &dur, &rms);
         if (err != ESP_OK || samples == 0) {
-            char resp[128];
-            snprintf(resp, sizeof(resp),
-                     "{\"type\":\"record_result\",\"ok\":false,\"error\":\"no_audio\"}");
-            send_json(resp);
+            tool_audio_manual_capture_release();
+            send_json("{\"type\":\"record_result\",\"ok\":false,\"error\":\"no_audio\"}");
+        } else if (s_trans_active) {
+            tool_audio_manual_capture_release();
+            send_json("{\"type\":\"record_result\",\"ok\":false,\"error\":\"stt_busy\"}");
         } else {
+            if (!s_trans_stack) {
+                s_trans_stack = heap_caps_malloc(CLOUD_WORKER_STACK_WORDS * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+            }
             transcribe_req_t *req = malloc(sizeof(transcribe_req_t));
-            if (req) {
+            if (req && s_trans_stack) {
                 req->samples = samples;
                 req->dur = dur;
                 req->rms = rms;
-                if (xTaskCreate(transcribe_task_fn, "stt_trans", 8192, req, 5, NULL) != pdPASS) {
+                s_trans_active = true;
+                TaskHandle_t h = xTaskCreateStatic(transcribe_task_fn, "stt_trans",
+                                                   CLOUD_WORKER_STACK_WORDS, req, 5,
+                                                   s_trans_stack, &s_trans_tcb);
+                if (!h) {
+                    s_trans_active = false;
                     free(req);
-                    char resp[128];
-                    snprintf(resp, sizeof(resp),
-                             "{\"type\":\"record_result\",\"ok\":false,\"error\":\"task_fail\"}");
-                    send_json(resp);
+                    tool_audio_manual_capture_release();
+                    send_json("{\"type\":\"record_result\",\"ok\":false,\"error\":\"task_fail\"}");
                 }
+            } else {
+                free(req);
+                tool_audio_manual_capture_release();
+                send_json("{\"type\":\"record_result\",\"ok\":false,\"error\":\"oom\"}");
             }
         }
+    } else if (strcmp(type_str, "record_abort") == 0) {
+        tool_audio_manual_record_abort();
+        send_json("{\"type\":\"record_status\",\"status\":\"aborted\",\"ok\":true}");
     } else if (strcmp(type_str, "voice_listen") == 0) {
         const cJSON *en = cJSON_GetObjectItem(root, "enabled");
         bool enable = cJSON_IsBool(en) ? cJSON_IsTrue(en) : false;
@@ -319,19 +371,36 @@ static void handle_frame(char *json_str)
         const cJSON *line2 = cJSON_GetObjectItem(root, "display_body");
         const char *s = cJSON_IsString(text) ? text->valuestring : "";
         if (s[0] != '\0') {
-            tts_say_req_t *req = calloc(1, sizeof(tts_say_req_t));
-            if (req) {
-                req->text = strdup(s);
-                req->line1 = cJSON_IsString(line1) ? strdup(line1->valuestring) : NULL;
-                req->line2 = cJSON_IsString(line2) ? strdup(line2->valuestring) : NULL;
-                if (!req->text || xTaskCreate(tts_say_task_fn, "tts_say", 8192, req, 4, NULL) != pdPASS) {
-                    free(req->text);
-                    free(req->line1);
-                    free(req->line2);
-                    free(req);
-                    send_json("{\"type\":\"tts_say_status\",\"ok\":false,\"error\":\"task_fail\"}");
+            if (s_tts_active) {
+                send_json("{\"type\":\"tts_say_status\",\"ok\":false,\"error\":\"tts_busy\"}");
+            } else {
+                if (!s_tts_stack) {
+                    s_tts_stack = heap_caps_malloc(CLOUD_WORKER_STACK_WORDS * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+                }
+                tts_say_req_t *req = calloc(1, sizeof(tts_say_req_t));
+                if (req && s_tts_stack) {
+                    req->text = strdup(s);
+                    req->line1 = cJSON_IsString(line1) ? strdup(line1->valuestring) : NULL;
+                    req->line2 = cJSON_IsString(line2) ? strdup(line2->valuestring) : NULL;
+                    s_tts_active = true;
+                    TaskHandle_t h = req->text
+                        ? xTaskCreateStatic(tts_say_task_fn, "tts_say",
+                                            CLOUD_WORKER_STACK_WORDS, req, 4,
+                                            s_tts_stack, &s_tts_tcb)
+                        : NULL;
+                    if (!h) {
+                        s_tts_active = false;
+                        free(req->text);
+                        free(req->line1);
+                        free(req->line2);
+                        free(req);
+                        send_json("{\"type\":\"tts_say_status\",\"ok\":false,\"error\":\"task_fail\"}");
+                    } else {
+                        send_json("{\"type\":\"tts_say_status\",\"ok\":true}");
+                    }
                 } else {
-                    send_json("{\"type\":\"tts_say_status\",\"ok\":true}");
+                    free(req);
+                    send_json("{\"type\":\"tts_say_status\",\"ok\":false,\"error\":\"oom\"}");
                 }
             }
         }

@@ -65,3 +65,4 @@ references/
 .venv/
 /.reasonix
 .playwright-mcp/
+/.agents/skills

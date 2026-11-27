@@ -6,6 +6,7 @@
 #include "memory/session_mgr.h"
 #include "mimi_config.h"
 #include "tools/tool_registry.h"
+#include "voice/voice_client.h"
 
 
 #include "cJSON.h"
@@ -314,7 +315,17 @@ static void agent_loop_task(void *arg) {
     if (err != ESP_OK)
       continue;
 
-    ESP_LOGI(TAG, "Processing message from %s:%s", msg.channel, msg.chat_id);
+    if (msg.turn_gen != 0 && voice_client_is_turn_aborted(msg.turn_gen)) {
+      ESP_LOGW(TAG, "Skipping already-aborted turn gen=%lu from %s:%s",
+               (unsigned long)msg.turn_gen, msg.channel, msg.chat_id);
+      free(msg.content);
+      continue;
+    }
+
+    msg.turn_gen = voice_client_turn_begin(msg.turn_gen);
+
+    ESP_LOGI(TAG, "Processing message from %s:%s (gen=%lu)", msg.channel,
+             msg.chat_id, (unsigned long)msg.turn_gen);
     display_status_set("Msg received", msg.channel);
 
     /* Check for /clear or /reset command */
@@ -323,9 +334,11 @@ static void agent_loop_task(void *arg) {
       mimi_msg_t out = {0};
       strncpy(out.channel, msg.channel, sizeof(out.channel) - 1);
       strncpy(out.chat_id, msg.chat_id, sizeof(out.chat_id) - 1);
+      out.turn_gen = msg.turn_gen;
       out.content = strdup("Chat memory cleared! I'm ready for a fresh start.");
-      if (out.content) {
-        message_bus_push_outbound(&out);
+      if (!out.content || message_bus_push_outbound(&out) != ESP_OK) {
+        free(out.content);
+        voice_client_turn_finished(msg.turn_gen);
       }
       free(msg.content);
       continue;
@@ -358,8 +371,14 @@ static void agent_loop_task(void *arg) {
     char *final_text = NULL;
     int iteration = 0;
     bool sent_working_status = false;
+    bool turn_aborted = false;
 
     while (iteration < MIMI_AGENT_MAX_TOOL_ITER) {
+      if (voice_client_is_turn_aborted(msg.turn_gen)) {
+        turn_aborted = true;
+        break;
+      }
+
       /* Send "working" indicator before each API call */
 #if MIMI_AGENT_SEND_WORKING_STATUS
       if (!sent_working_status && msg.chat_id[0] != '\0' && strcmp(msg.channel, MIMI_CHAN_SYSTEM) != 0) {
@@ -381,6 +400,14 @@ static void agent_loop_task(void *arg) {
       display_status_set("Thinking...", "");
       llm_response_t resp;
       err = llm_chat_tools(system_prompt, messages, tools_json, &resp);
+
+      if (voice_client_is_turn_aborted(msg.turn_gen)) {
+        if (err == ESP_OK) {
+          llm_response_free(&resp);
+        }
+        turn_aborted = true;
+        break;
+      }
 
       if (err != ESP_OK) {
         ESP_LOGE(TAG, "LLM call failed: %s", esp_err_to_name(err));
@@ -416,13 +443,23 @@ static void agent_loop_task(void *arg) {
       cJSON_AddItemToArray(messages, result_msg);
 
       llm_response_free(&resp);
+      if (voice_client_is_turn_aborted(msg.turn_gen)) {
+        turn_aborted = true;
+        break;
+      }
       iteration++;
     }
 
     cJSON_Delete(messages);
 
     /* 5. Send response */
-    if (final_text && final_text[0]) {
+    if (turn_aborted || voice_client_is_turn_aborted(msg.turn_gen)) {
+      turn_aborted = true;
+      ESP_LOGW(TAG, "Turn gen=%lu aborted by user — skipping session save & outbound reply",
+               (unsigned long)msg.turn_gen);
+      free(final_text);
+      voice_client_turn_finished(msg.turn_gen);
+    } else if (final_text && final_text[0]) {
       /* Extract OLED summary tag and update screen immediately with timed hold */
       char oled_l1[17] = {0};
       char oled_l2[17] = {0};
@@ -451,12 +488,14 @@ static void agent_loop_task(void *arg) {
       mimi_msg_t out = {0};
       strncpy(out.channel, msg.channel, sizeof(out.channel) - 1);
       strncpy(out.chat_id, msg.chat_id, sizeof(out.chat_id) - 1);
+      out.turn_gen = msg.turn_gen;
       out.content = final_text; /* transfer ownership */
       ESP_LOGI(TAG, "Queue final response to %s:%s (%d bytes)", out.channel,
                out.chat_id, (int)strlen(final_text));
       if (message_bus_push_outbound(&out) != ESP_OK) {
         ESP_LOGW(TAG, "Outbound queue full, drop final response");
         free(final_text);
+        voice_client_turn_finished(msg.turn_gen);
       } else {
         final_text = NULL;
       }
@@ -466,6 +505,7 @@ static void agent_loop_task(void *arg) {
       mimi_msg_t out = {0};
       strncpy(out.channel, msg.channel, sizeof(out.channel) - 1);
       strncpy(out.chat_id, msg.chat_id, sizeof(out.chat_id) - 1);
+      out.turn_gen = msg.turn_gen;
       if (iteration > 0 && tool_output && (strstr(tool_output, "success") || strstr(tool_output, "displayed") || strstr(tool_output, "HIGH") || strstr(tool_output, "LOW"))) {
         out.content = strdup("Executed tool successfully.");
         display_status_set_text_timed("Action Executed", "Success", 8000);
@@ -473,18 +513,21 @@ static void agent_loop_task(void *arg) {
         out.content = strdup("Sorry, I encountered an error.");
         display_status_set_text_timed("Agent Error", "Please try again", 8000);
       }
-      if (out.content) {
-        if (message_bus_push_outbound(&out) != ESP_OK) {
+      if (!out.content || message_bus_push_outbound(&out) != ESP_OK) {
+        if (out.content) {
           ESP_LOGW(TAG, "Outbound queue full, drop response");
           free(out.content);
         }
+        voice_client_turn_finished(msg.turn_gen);
       }
     }
 
 
     /* Free inbound message content */
     free(msg.content);
-    display_status_idle();
+    if (!turn_aborted) {
+      display_status_idle();
+    }
 
     /* Log memory status */
     ESP_LOGI(TAG, "Free PSRAM: %d bytes",
