@@ -130,6 +130,9 @@ static bool              s_i2s_initialized = false;
 static portMUX_TYPE      s_audio_mux            = portMUX_INITIALIZER_UNLOCKED;
 static SemaphoreHandle_t s_tx_mutex             = NULL; /* serializes I2S TX only */
 static volatile bool     s_recording            = false;
+static volatile bool     s_manual_owner         = false;
+static volatile bool     s_pcm_locked           = false;
+static volatile uint32_t s_pcm_lock_ms          = 0;
 static volatile bool     s_playing              = false;
 static int               s_speaker_session_depth = 0;   /* refcounted session gate */
 static bool              s_cache_clearing       = false;
@@ -900,6 +903,20 @@ bool tool_audio_is_busy(void)
     return s_recording || s_playing;
 }
 
+bool tool_audio_is_manual_active(void)
+{
+    if (s_pcm_locked && s_pcm_lock_ms > 0) {
+        uint32_t elapsed_ms = (uint32_t)(esp_timer_get_time() / 1000) - s_pcm_lock_ms;
+        if (elapsed_ms > 35000) {
+            ESP_LOGW(TAG, "s_pcm_locked held for %u ms — auto-releasing", (unsigned)elapsed_ms);
+            s_pcm_locked = false;
+            s_manual_owner = false;
+            s_pcm_lock_ms = 0;
+        }
+    }
+    return s_manual_owner || s_pcm_locked;
+}
+
 bool tool_audio_is_speaker_busy(void)
 {
     bool busy;
@@ -920,7 +937,7 @@ bool tool_audio_capture_arm(size_t max_samples)
 
 bool tool_audio_capture_arm_preroll(size_t max_samples, size_t preroll_samples)
 {
-    if (!s_i2s_initialized || s_recording || s_playing) {
+    if (!s_i2s_initialized || s_recording || s_playing || s_speaker_busy || s_manual_owner || s_pcm_locked) {
         return false;
     }
     s_pcm_samples_captured = 0;
@@ -998,7 +1015,7 @@ bool tool_audio_rx_read(int16_t *out, size_t max_out, size_t *out_written,
  * tool_audio_get_last_capture). */
 void tool_audio_capture_disarm(void)
 {
-    if (!s_recording) {
+    if (!s_recording || s_manual_owner) {
         return;
     }
     s_recording = false;
@@ -1022,14 +1039,18 @@ esp_err_t tool_audio_manual_record_start(void)
     if (!s_i2s_initialized) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (s_playing) {
+    if (s_playing || s_speaker_busy || s_pcm_locked) {
+        ESP_LOGW(TAG, "Manual record rejected (playing=%d spk_busy=%d pcm_locked=%d)",
+                 s_playing, s_speaker_busy, s_pcm_locked);
         return ESP_ERR_INVALID_STATE;
     }
-    /* If background VAD/capture was active, disarm it so manual button record takes priority */
+    /* If background VAD/capture was active, disarm it so manual record takes priority */
     if (s_recording) {
+        s_manual_owner = false;
         tool_audio_capture_disarm();
     }
 
+    s_manual_owner = true;
     tool_audio_clear_cache();
     s_pcm_samples_captured = 0;
     s_capture_max = AUDIO_MAX_SAMPLES;
@@ -1042,6 +1063,7 @@ esp_err_t tool_audio_manual_record_start(void)
 esp_err_t tool_audio_manual_record_stop(size_t *out_samples, uint32_t *out_dur_ms, double *out_rms)
 {
     if (!s_recording) {
+        s_manual_owner = false;
         return ESP_ERR_INVALID_STATE;
     }
     s_recording = false;
@@ -1054,10 +1076,37 @@ esp_err_t tool_audio_manual_record_stop(size_t *out_samples, uint32_t *out_dur_m
         ssq += (int64_t)s * s;
     }
 
+    if (n > 0) {
+        s_pcm_locked = true;
+        s_pcm_lock_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    } else {
+        s_manual_owner = false;
+        s_pcm_locked = false;
+        s_pcm_lock_ms = 0;
+    }
+
     if (out_samples) *out_samples = n;
     if (out_dur_ms)  *out_dur_ms  = s_record_duration_ms;
     if (out_rms)     *out_rms     = (n > 0) ? sqrt((double)ssq / (double)n) : 0.0;
     return ESP_OK;
+}
+
+void tool_audio_manual_capture_release(void)
+{
+    s_pcm_locked = false;
+    s_manual_owner = false;
+    s_pcm_lock_ms = 0;
+}
+
+void tool_audio_manual_record_abort(void)
+{
+    s_recording = false;
+    s_pcm_locked = false;
+    s_manual_owner = false;
+    s_pcm_lock_ms = 0;
+    s_capture_max = AUDIO_MAX_SAMPLES;
+    tool_audio_ring_flush();
+    ESP_LOGW(TAG, "Manual recording aborted / reset");
 }
 
 /* =======================================================================

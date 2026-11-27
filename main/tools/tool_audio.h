@@ -191,8 +191,24 @@ esp_err_t tool_audio_manual_record_start(void);
 
 /**
  * @brief Stop manual recording and compute stats.
+ *        Holds PCM buffer lock until tool_audio_manual_capture_release() is called.
  */
 esp_err_t tool_audio_manual_record_stop(size_t *out_samples, uint32_t *out_dur_ms, double *out_rms);
+
+/**
+ * @brief Release PCM buffer ownership after manual upload/transcription finishes.
+ */
+void tool_audio_manual_capture_release(void);
+
+/**
+ * @brief Force-abort any active or locked manual recording state.
+ */
+void tool_audio_manual_record_abort(void);
+
+/**
+ * @brief True while a manual recording or its upload owns s_pcm_buf.
+ */
+bool tool_audio_is_manual_active(void);
 
 /* -----------------------------------------------------------------------
  * WAV playback — voice pipeline output [PIPELINE-4]

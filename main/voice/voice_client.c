@@ -116,6 +116,7 @@ static uint32_t             s_active_turn_gen = 0;    /* currently active turn g
 static volatile uint32_t    s_aborted_gen    = 0;     /* highest aborted turn generation */
 static volatile bool        s_has_aborted    = false; /* true once an abort has been issued */
 static volatile int64_t     s_mic_guard_until_ms = 0; /* post-playback echo guard deadline */
+static int                  s_consec_http_failures = 0; /* debounce backend_discovery_invalidate */
 static uint8_t             *s_ack_wav        = NULL;  /* "Yes?" cache */
 static size_t               s_ack_wav_len    = 0;
 
@@ -458,6 +459,7 @@ bool voice_client_transcribe_full(const int16_t *pcm, size_t samples, voice_stt_
             }
             cJSON_Delete(j);
             ok = true;
+            s_consec_http_failures = 0;
             ESP_LOGI(TAG, "STT %u ms, %u -> %u bytes: wake=%d ('%s'), cmd='%.60s', raw='%.60s'",
                      (unsigned)dt, (unsigned)body_len, (unsigned)rx->len,
                      out_res->wake_matched,
@@ -468,7 +470,10 @@ bool voice_client_transcribe_full(const int16_t *pcm, size_t samples, voice_stt_
     } else {
         ESP_LOGE(TAG, "STT FAILED: err=%s status=%d oom=%d len=%u (%u ms)",
                  esp_err_to_name(err), status, rx->oom, (unsigned)rx->len, (unsigned)dt);
-        backend_discovery_invalidate();
+        if (++s_consec_http_failures >= 3) {
+            s_consec_http_failures = 0;
+            backend_discovery_invalidate();
+        }
     }
 
     free(rx->buf);
@@ -722,6 +727,7 @@ static uint8_t *voice_tts_fetch(const char *text, size_t *out_len,
 
     uint8_t *wav = NULL;
     if (err == ESP_OK && status == 200 && !rx->oom && rx->len > 44) {
+        s_consec_http_failures = 0;
         *out_len = rx->len;
         wav = rx->buf;
         rx->buf = NULL; /* Transfer buffer ownership to caller */
@@ -740,7 +746,10 @@ static uint8_t *voice_tts_fetch(const char *text, size_t *out_len,
         ESP_LOGE(TAG, "TTS FAILED: err=%s status=%d oom=%d len=%u (%u ms)",
                  esp_err_to_name(err), status, rx->oom, (unsigned)rx->len, (unsigned)dt);
         display_status_set("Voice err", "check backend");
-        backend_discovery_invalidate();
+        if (++s_consec_http_failures >= 3) {
+            s_consec_http_failures = 0;
+            backend_discovery_invalidate();
+        }
     }
     if (rx->buf) {
         free(rx->buf);
@@ -834,7 +843,7 @@ static void voice_run_command(void)
     bool heard_speech = false;
 
     bool capturing = true;
-    while (capturing && s_running) {
+    while (capturing && s_running && !tool_audio_is_manual_active()) {
         size_t written = 0;
         bool full = false;
         capturing = tool_audio_rx_read(scratch, VAD_CHUNK_SAMPLES, &written,
@@ -1046,9 +1055,9 @@ static void voice_task(void *arg)
         }
 
         /* Pause while speaker plays, own VAD capture is active, another audio recording
-         * session is active, or the post-playback echo guard is still active.
+         * or manual upload session is active, or the post-playback echo guard is active.
          * s_agent_turn_active does NOT pause listening so wake-word barge-in works. */
-        if (s_vad_busy || tool_audio_is_speaker_busy() || mic_guard_active() || tool_audio_is_busy()) {
+        if (s_vad_busy || tool_audio_is_speaker_busy() || mic_guard_active() || tool_audio_is_busy() || tool_audio_is_manual_active()) {
             dbg_empties++;
             was_paused = true;
             consec_speech = 0;

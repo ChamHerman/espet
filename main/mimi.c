@@ -71,6 +71,7 @@ static void snap_process_task(void *arg)
 
     if (!fb || !fb->buf || fb->len == 0) {
         ESP_LOGE(TAG, "[SNAP-TASK] Invalid frame buffer");
+        tool_audio_manual_capture_release();
         if (fb) tool_camera_return_picture(fb);
         s_snap_in_flight = false;
         display_status_idle();
@@ -88,6 +89,7 @@ static void snap_process_task(void *arg)
             transcript = voice_client_transcribe(pcm, samples);
         }
     }
+    tool_audio_manual_capture_release();
 
     if (transcript && transcript[0] != '\0') {
         ESP_LOGI(TAG, "📸 Multimodal query: '%s'", transcript);
@@ -164,6 +166,7 @@ static void on_camera_button_up(uint32_t hold_duration_ms)
         uint32_t dummy_dur = 0;
         double dummy_rms = 0.0;
         tool_audio_manual_record_stop(&dummy_samples, &dummy_dur, &dummy_rms);
+        tool_audio_manual_capture_release();
 
         if (s_snap_fb) {
             ESP_LOGW(TAG, "📸 [CAM BTN] Noise/cancelled press — returning camera buffer");
@@ -180,6 +183,7 @@ static void on_camera_button_up(uint32_t hold_duration_ms)
         uint32_t dummy_dur = 0;
         double dummy_rms = 0.0;
         tool_audio_manual_record_stop(&dummy_samples, &dummy_dur, &dummy_rms);
+        tool_audio_manual_capture_release();
         display_status_idle();
         return;
     }
@@ -193,6 +197,7 @@ static void on_camera_button_up(uint32_t hold_duration_ms)
 
     snap_job_t *job = malloc(sizeof(snap_job_t));
     if (!job) {
+        tool_audio_manual_capture_release();
         tool_camera_return_picture(s_snap_fb);
         s_snap_fb = NULL;
         return;
@@ -208,6 +213,7 @@ static void on_camera_button_up(uint32_t hold_duration_ms)
 
     if (xTaskCreate(snap_process_task, "snap_proc", 16384, job, 5, NULL) != pdPASS) {
         ESP_LOGE(TAG, "Failed to create snap_process_task");
+        tool_audio_manual_capture_release();
         tool_camera_return_picture(job->fb);
         free(job);
         s_snap_in_flight = false;
