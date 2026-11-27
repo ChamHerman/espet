@@ -69,6 +69,7 @@ class TestVoiceDebugBench(unittest.TestCase):
         self.assertIn("text/html", resp.headers.get("content-type", ""))
         for marker in (
             "btn-hw-rec",
+            "btn-hw-abort",
             "btn-pc-rec",
             "btn-tts-browser",
             "btn-tts-esp32",
@@ -77,6 +78,8 @@ class TestVoiceDebugBench(unittest.TestCase):
             "/api/voice/debug/tts",
             "/api/voice/debug/regression",
             "/api/cloud/tts-say",
+            "/api/cloud/record/abort",
+            "loadAudioPreview",
         ):
             self.assertIn(marker, resp.text)
 
@@ -265,6 +268,46 @@ class TestVoiceDebugBench(unittest.TestCase):
         sdata = stt_resp.json()
         self.assertEqual(set(sdata.keys()), {"text", "raw_text", "wake_matched", "wake_word"})
         self.assertFalse(sdata["wake_matched"])
+
+    def test_capture_ring_isolation_and_last_result(self):
+        # Generate two distinct audible tones and POST to /api/voice/transcribe
+        t1 = np.arange(ESP_SAMPLE_RATE // 2) / float(ESP_SAMPLE_RATE)
+        pcm1 = (4000.0 * np.sin(2.0 * np.pi * 440.0 * t1)).astype(np.int16)
+        t2 = np.arange(ESP_SAMPLE_RATE) / float(ESP_SAMPLE_RATE)
+        pcm2 = (4000.0 * np.sin(2.0 * np.pi * 880.0 * t2)).astype(np.int16)
+
+        r1 = self.client.post(
+            "/api/voice/transcribe",
+            content=pcm1.tobytes(),
+            headers={**self.auth_headers, "Content-Type": "application/octet-stream", "X-Audio-Rate": "16000"},
+        )
+        self.assertEqual(r1.status_code, 200)
+        m1 = self.client.get("/api/voice/debug/last-result", headers=self.auth_headers).json()
+        self.assertTrue(m1.get("exists"))
+        cid1 = m1["capture_id"]
+
+        r2 = self.client.post(
+            "/api/voice/transcribe",
+            content=pcm2.tobytes(),
+            headers={**self.auth_headers, "Content-Type": "application/octet-stream", "X-Audio-Rate": "16000"},
+        )
+        self.assertEqual(r2.status_code, 200)
+        m2 = self.client.get("/api/voice/debug/last-result", headers=self.auth_headers).json()
+        cid2 = m2["capture_id"]
+        self.assertNotEqual(cid1, cid2)
+
+        # Fetch both captures by ID and verify distinct WAV lengths and no-store header
+        w1 = self.client.get(f"/api/voice/captures/{cid1}")
+        w2 = self.client.get(f"/api/voice/captures/{cid2}")
+        self.assertEqual(w1.status_code, 200)
+        self.assertEqual(w2.status_code, 200)
+        self.assertIn("no-store", w1.headers.get("cache-control", ""))
+        self.assertGreater(len(w2.content), len(w1.content))
+
+    def test_record_abort_endpoint(self):
+        r = self.client.post("/api/cloud/record/abort", json={}, headers=self.auth_headers)
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.json().get("ok"))
 
 
 if __name__ == "__main__":

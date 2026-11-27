@@ -305,6 +305,7 @@
           </div>
           <div class="row">
             <button id="btn-hw-rec" class="primary" type="button">Start HW Mic Capture</button>
+            <button id="btn-hw-abort" type="button" title="Cancel stuck recording state on UI & ESP32">Force Reset Mic</button>
             <button id="btn-rerun-last" type="button">Re-run STT on Last Capture</button>
             <span class="hint">Shortcut: Alt+R</span>
           </div>
@@ -583,17 +584,43 @@
       ctx.stroke();
     }
 
-    async function loadLastCaptureAudioPreview() {
-      const url = `/api/voice/last-capture-audio?t=${Date.now()}`;
-      $("stt-audio").src = url;
-      $("link-last-wav").href = url;
+    let lastSttBlobUrl = null;
+    let lastTtsBlobUrl = null;
+
+    function setSttAudioFromBuffer(wavArrayBuffer, downloadHref = null) {
+      drawWavWaveform("stt-wave", wavArrayBuffer);
+      if (lastSttBlobUrl) {
+        URL.revokeObjectURL(lastSttBlobUrl);
+        lastSttBlobUrl = null;
+      }
+      const blobUrl = URL.createObjectURL(new Blob([wavArrayBuffer], { type: "audio/wav" }));
+      lastSttBlobUrl = blobUrl;
+      const audioEl = $("stt-audio");
+      audioEl.pause();
+      audioEl.src = blobUrl;
+      audioEl.load();
+      $("link-last-wav").href = downloadHref || blobUrl;
+    }
+
+    async function loadAudioPreview(url = null) {
+      const targetUrl = url || `/api/voice/last-capture-audio?t=${Date.now()}`;
       try {
-        const res = await fetch(url);
-        if (res.ok) {
-          const buf = await res.arrayBuffer();
-          drawWavWaveform("stt-wave", buf);
+        const res = await fetch(targetUrl, { cache: "no-store" });
+        if (!res.ok) {
+          log(`Audio preview unavailable (${res.status}) for ${targetUrl}`, "WARN");
+          return false;
         }
-      } catch {}
+        const buf = await res.arrayBuffer();
+        setSttAudioFromBuffer(buf, targetUrl);
+        return true;
+      } catch (e) {
+        log(`Audio preview load error: ${e.message}`, "WARN");
+        return false;
+      }
+    }
+
+    async function loadLastCaptureAudioPreview() {
+      return loadAudioPreview(`/api/voice/last-capture-audio?t=${Date.now()}`);
     }
 
     // --- Status, Config & Voices ---
@@ -746,7 +773,9 @@
       $("stt-conf-badge").textContent = `Lang: ${d.detected_language || "--"} (${d.language_prob ?? "--"})`;
 
       $("m-stt-lat").textContent = d.latency_ms != null ? `${d.latency_ms} ms` : "--";
-      $("m-stt-dur").textContent = `${d.duration_s ?? "--"}s / ${(d.samples ?? 0).toLocaleString()}`;
+      const outSamp = d.samples_out ?? d.samples ?? 0;
+      const rawSamp = d.samples_in != null && d.samples_in !== outSamp ? ` (raw ${Number(d.samples_in).toLocaleString()})` : "";
+      $("m-stt-dur").textContent = `${d.duration_s ?? "--"}s / ${Number(outSamp).toLocaleString()}${rawSamp}`;
       $("m-stt-rms").textContent = `${d.rms_raw ?? "--"} / ${d.rms_processed ?? "--"}`;
       $("m-stt-peak").textContent = `${d.peak ?? "--"} / ${d.dc_offset ?? "--"}`;
       $("m-stt-logp").textContent = d.avg_logprob != null ? String(d.avg_logprob) : "--";
@@ -818,34 +847,61 @@
         });
         if (!resp.ok) throw new Error(resp.error || "Stop failed");
         const roundtripMs = Math.round(performance.now() - t0);
-        await loadLastCaptureAudioPreview();
+        // Fetch exact WAV for this capture first (if audio_url returned by backend), else fallback to last-capture-audio
+        const exactUrl = resp.audio_url ? `${resp.audio_url}?t=${Date.now()}` : null;
+        await loadAudioPreview(exactUrl);
         await refreshConfigAndVoices();
-        // Run debug inspect on last_capture to populate full acoustic & logprob telemetry
-        try {
-          const diag = await apiJSON("/api/voice/debug/transcribe", {
-            method: "POST",
-            body: JSON.stringify({
-              use_last_capture: true,
-              language: $("stt-lang").value || null,
-              skip_denoise: true, // already denoised when saved
-              skip_rms_gate: $("chk-skip-rms").checked,
-              skip_confidence_gate: $("chk-skip-conf").checked,
-            }),
-          });
-          diag.samples = resp.samples || diag.samples;
-          diag.rms_raw = Math.round(resp.rms || diag.rms_raw);
-          diag.latency_ms = roundtripMs;
-          if (resp.transcript && !diag.raw_text) diag.raw_text = resp.transcript;
-          renderSttDiag(diag, "ESP32-HW");
-        } catch {
+
+        if (resp.audio_url && resp.avg_logprob != null) {
+          // Single-pass diagnostics directly from the record/stop response (avoids double-Whisper & race)
           renderSttDiag({
-            raw_text: resp.transcript || "",
-            text: resp.transcript || "",
-            samples: resp.samples,
-            duration_s: ((resp.duration_ms || 0) / 1000).toFixed(2),
-            rms_raw: Math.round(resp.rms || 0),
+            raw_text: resp.raw_text || resp.transcript || "",
+            text: resp.text || "",
+            wake_matched: Boolean(resp.wake_matched),
+            wake_word: resp.wake_word || "",
+            avg_logprob: resp.avg_logprob,
+            no_speech_prob: resp.no_speech_prob,
+            confidence_rejected: Boolean(resp.confidence_rejected),
+            detected_language: resp.detected_language || "",
+            language_prob: resp.language_prob,
+            rms_raw: resp.rms_raw != null ? resp.rms_raw : Math.round(resp.rms || 0),
+            rms_processed: resp.rms_processed,
+            peak: resp.peak,
+            dc_offset: resp.dc_offset,
+            samples_in: resp.samples,
+            samples_out: resp.samples_out || resp.samples,
+            samples: resp.samples_out || resp.samples,
+            duration_s: resp.duration_s != null ? resp.duration_s : ((resp.duration_ms || 0) / 1000).toFixed(2),
             latency_ms: roundtripMs,
           }, "ESP32-HW");
+        } else {
+          // Fallback: inspect last_capture when server didn't attach capture metadata
+          try {
+            const diag = await apiJSON("/api/voice/debug/transcribe", {
+              method: "POST",
+              body: JSON.stringify({
+                use_last_capture: true,
+                language: $("stt-lang").value || null,
+                skip_denoise: true,
+                skip_rms_gate: $("chk-skip-rms").checked,
+                skip_confidence_gate: $("chk-skip-conf").checked,
+              }),
+            });
+            diag.samples_in = resp.samples;
+            diag.rms_raw = Math.round(resp.rms || diag.rms_raw);
+            diag.latency_ms = roundtripMs;
+            if (resp.transcript && !diag.raw_text) diag.raw_text = resp.transcript;
+            renderSttDiag(diag, "ESP32-HW");
+          } catch {
+            renderSttDiag({
+              raw_text: resp.transcript || "",
+              text: resp.transcript || "",
+              samples: resp.samples,
+              duration_s: ((resp.duration_ms || 0) / 1000).toFixed(2),
+              rms_raw: Math.round(resp.rms || 0),
+              latency_ms: roundtripMs,
+            }, "ESP32-HW");
+          }
         }
         $("stt-state-badge").className = "badge ok";
         $("stt-state-badge").textContent = "Done";
@@ -859,6 +915,26 @@
         $("btn-hw-rec").textContent = "Start HW Mic Capture";
       }
     }
+
+    $("btn-hw-abort").addEventListener("click", async () => {
+      clearInterval(hwTimer);
+      hwRecording = false;
+      $("hw-timer").textContent = "00:00";
+      $("btn-hw-rec").disabled = false;
+      $("btn-hw-rec").className = "primary";
+      $("btn-hw-rec").textContent = "Start HW Mic Capture";
+      try {
+        const resp = await apiJSON("/api/cloud/record/abort", {
+          method: "POST",
+          body: JSON.stringify({ device_id: selectedDeviceId() }),
+        });
+        $("stt-state-badge").className = "badge warn";
+        $("stt-state-badge").textContent = "Reset";
+        log(`Force reset mic state (pushed=${resp.pushed})`, "WARN");
+      } catch (e) {
+        log(`Force reset failed: ${e.message}`, "ERR");
+      }
+    });
 
     $("btn-hw-rec").addEventListener("click", () => {
       if (!hwRecording) startHwRecord();
@@ -940,9 +1016,7 @@
     async function sendWavBlobToDebugStt(arrayBuffer, sourceLabel, forceSkipPitch = true) {
       $("stt-state-badge").className = "badge warn";
       $("stt-state-badge").textContent = "Transcribing...";
-      drawWavWaveform("stt-wave", arrayBuffer);
-      const blobUrl = URL.createObjectURL(new Blob([arrayBuffer], { type: "audio/wav" }));
-      $("stt-audio").src = blobUrl;
+      setSttAudioFromBuffer(arrayBuffer);
 
       const qs = new URLSearchParams(sttDebugQueryParams());
       if (forceSkipPitch && !$("chk-skip-pitch").checked) {
@@ -960,9 +1034,26 @@
       return diag;
     }
 
+    async function cleanupPcAudio() {
+      if (pcProc) {
+        try { pcProc.disconnect(); } catch {}
+        pcProc.onaudioprocess = null;
+        pcProc = null;
+      }
+      if (pcStream) {
+        try { pcStream.getTracks().forEach((t) => t.stop()); } catch {}
+        pcStream = null;
+      }
+      if (pcCtx) {
+        try { await pcCtx.close(); } catch {}
+        pcCtx = null;
+      }
+    }
+
     $("btn-pc-rec").addEventListener("click", async () => {
       if (!pcRecording) {
         try {
+          await cleanupPcAudio();
           pcStream = await navigator.mediaDevices.getUserMedia({ audio: true });
           pcCtx = new (window.AudioContext || window.webkitAudioContext)();
           const src = pcCtx.createMediaStreamSource(pcStream);
@@ -980,14 +1071,13 @@
           $("stt-state-badge").textContent = "PC Mic Recording...";
           log("PC browser mic recording started...");
         } catch (e) {
+          await cleanupPcAudio();
           log(`PC mic error: ${e.message}`, "ERR");
         }
       } else {
         pcRecording = false;
-        const rate = pcCtx.sampleRate;
-        pcProc.disconnect();
-        pcStream.getTracks().forEach((t) => t.stop());
-        await pcCtx.close();
+        const rate = pcCtx ? pcCtx.sampleRate : 16000;
+        await cleanupPcAudio();
         $("btn-pc-rec").className = "";
         $("btn-pc-rec").textContent = "Record PC Mic (16kHz WAV)";
 
@@ -995,6 +1085,7 @@
         const merged = new Float32Array(total);
         let off = 0;
         for (const c of pcChunks) { merged.set(c, off); off += c.length; }
+        pcChunks = [];
         const wavBuf = encodeWav16kMono(merged, rate);
         try {
           await sendWavBlobToDebugStt(wavBuf, "PC-Mic", true);
@@ -1010,6 +1101,7 @@
     $("btn-upload-stt").addEventListener("click", async () => {
       const file = $("file-audio").files[0];
       if (!file) return log("Select an audio file first", "WARN");
+      let tmpCtx = null;
       try {
         const buf = await file.arrayBuffer();
         const isWav = buf.byteLength >= 12 &&
@@ -1026,17 +1118,20 @@
           renderSttDiag(diag, `PCM:${file.name}`);
         } else {
           // Decode MP3/OGG/WebM in browser -> 16 kHz mono WAV
-          const tmpCtx = new (window.AudioContext || window.webkitAudioContext)();
+          tmpCtx = new (window.AudioContext || window.webkitAudioContext)();
           const decoded = await tmpCtx.decodeAudioData(buf.slice(0));
           const ch0 = decoded.getChannelData(0);
           const wavBuf = encodeWav16kMono(ch0, decoded.sampleRate);
-          await tmpCtx.close();
           await sendWavBlobToDebugStt(wavBuf, `Decoded:${file.name}`, true);
         }
       } catch (e) {
         $("stt-state-badge").className = "badge err";
         $("stt-state-badge").textContent = "Error";
         log(`File STT error: ${e.message}`, "ERR");
+      } finally {
+        if (tmpCtx) {
+          try { await tmpCtx.close(); } catch {}
+        }
       }
     });
 
@@ -1086,9 +1181,16 @@
         $("m-tts-oled").textContent = `${l1} | ${l2}`;
 
         drawWavWaveform("tts-wave", wavBuf);
+        if (lastTtsBlobUrl) {
+          URL.revokeObjectURL(lastTtsBlobUrl);
+          lastTtsBlobUrl = null;
+        }
         const blobUrl = URL.createObjectURL(new Blob([wavBuf], { type: "audio/wav" }));
+        lastTtsBlobUrl = blobUrl;
         const audioEl = $("tts-audio");
+        audioEl.pause();
         audioEl.src = blobUrl;
+        audioEl.load();
         $("link-tts-wav").href = blobUrl;
         $("link-tts-wav").style.display = "inline";
         if (autoPlay) {

@@ -43,6 +43,7 @@ _pending_record_stop: dict[str, asyncio.Future] = {}
 _pending_voice_listen: dict[str, asyncio.Future] = {}
 _pending_tts_say: dict[str, asyncio.Future] = {}
 _voice_listen_state: dict[str, bool] = {}
+_record_session_start: dict[str, float] = {}
 
 # ---------------------------------------------------------------------------
 # Web Chat clients and history storage (channel: cloud_link, chat_id: dashboard)
@@ -898,6 +899,7 @@ async def start_recording(payload: dict | None = None, device_id: str | None = Q
     loop = asyncio.get_running_loop()
     fut = loop.create_future()
     _pending_record_start[did] = fut
+    _record_session_start[did] = time.time()
 
     try:
         await ws.send_text(json.dumps({"type": "record_start"}))
@@ -929,11 +931,12 @@ async def stop_recording(payload: dict | None = None, device_id: str | None = Qu
     loop = asyncio.get_running_loop()
     fut = loop.create_future()
     _pending_record_stop[did] = fut
+    session_start = _record_session_start.get(did, 0.0)
 
     try:
         await ws.send_text(json.dumps({"type": "record_stop"}))
         res = await asyncio.wait_for(fut, timeout=20.0)
-        return {
+        out: dict[str, Any] = {
             "ok": res.get("ok", False),
             "device_id": did,
             "samples": res.get("samples", 0),
@@ -942,12 +945,62 @@ async def stop_recording(payload: dict | None = None, device_id: str | None = Qu
             "transcript": res.get("transcript", ""),
             "error": res.get("error"),
         }
+        if res.get("ok"):
+            from api.voice_router import get_latest_capture_meta
+            meta = get_latest_capture_meta()
+            if meta and meta.get("ts", 0.0) >= session_start - 1.0:
+                out.update({
+                    "capture_id": meta.get("capture_id"),
+                    "audio_url": meta.get("audio_url"),
+                    "raw_text": meta.get("raw_text", out["transcript"]),
+                    "text": meta.get("text", ""),
+                    "wake_matched": meta.get("wake_matched", False),
+                    "wake_word": meta.get("wake_word", ""),
+                    "avg_logprob": meta.get("avg_logprob"),
+                    "no_speech_prob": meta.get("no_speech_prob"),
+                    "confidence_rejected": meta.get("confidence_rejected", False),
+                    "detected_language": meta.get("detected_language", ""),
+                    "language_prob": meta.get("language_prob"),
+                    "rms_raw": meta.get("rms_raw"),
+                    "rms_processed": meta.get("rms_processed"),
+                    "peak": meta.get("peak"),
+                    "dc_offset": meta.get("dc_offset"),
+                    "samples_out": meta.get("samples"),
+                    "duration_s": meta.get("duration_s"),
+                    "pitch_upsampled": meta.get("pitch_upsampled"),
+                    "stt_latency_ms": meta.get("latency_ms"),
+                })
+        return out
     except asyncio.TimeoutError:
         _pending_record_stop.pop(did, None)
         return {"ok": False, "error": "Timeout waiting for device transcription result"}
     except Exception as e:
         _pending_record_stop.pop(did, None)
         return {"ok": False, "error": str(e)}
+
+
+@router.post("/record/abort")
+async def abort_recording(
+    payload: dict | None = None,
+    device_id: str | None = Query(None),
+    _key: str = Depends(verify_device_key),
+):
+    """Cancel pending record futures and ask the ESP32 to abort/reset any stuck capture."""
+    req_did = (payload or {}).get("device_id") or device_id
+    did, ws = registry.get_connection(req_did)
+    if did:
+        for pmap in (_pending_record_start, _pending_record_stop):
+            fut = pmap.pop(did, None)
+            if fut and not fut.done():
+                fut.cancel()
+    pushed = False
+    if did and ws:
+        try:
+            await ws.send_text(json.dumps({"type": "record_abort"}))
+            pushed = True
+        except Exception:
+            pass
+    return {"ok": True, "device_id": did, "pushed": pushed}
 
 
 @router.post("/voice-listen")
